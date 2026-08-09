@@ -1,0 +1,11 @@
+[package]
+name = "ksearch_kernels"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+metal.workspace = true
+ksearch_ir.workspace = true
+ksearch_codegen.workspace = true
+ksearch_metal.workspace = true

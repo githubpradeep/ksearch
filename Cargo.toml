@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ksearch_ir",
+    "crates/ksearch_codegen",
+    "crates/ksearch_metal",
+    "crates/ksearch_gguf",
+    "crates/ksearch_kernels",
+    "crates/ksearch_gemma",
+    "crates/ksearch_cli",
+]
+default-members = ["crates/ksearch_cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "local"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+metal = "0.31"
+objc = "0.2"
+clap = { version = "4", features = ["derive"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ksearch_ir = { path = "crates/ksearch_ir" }
+ksearch_codegen = { path = "crates/ksearch_codegen" }
+ksearch_metal = { path = "crates/ksearch_metal" }
+ksearch_gguf = { path = "crates/ksearch_gguf" }
+ksearch_kernels = { path = "crates/ksearch_kernels" }
+ksearch_gemma = { path = "crates/ksearch_gemma" }

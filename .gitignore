@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.bak
+.DS_Store
+*.metallib
+.plan_cache/
+
+# Local third-party checkouts (own git histories); keep on disk for design/oracle.
+/reference/

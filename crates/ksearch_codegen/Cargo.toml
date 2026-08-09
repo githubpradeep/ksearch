@@ -1,0 +1,9 @@
+[package]
+name = "ksearch_codegen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ksearch_ir.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true

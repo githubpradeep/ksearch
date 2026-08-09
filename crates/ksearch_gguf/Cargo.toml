@@ -1,0 +1,9 @@
+[package]
+name = "ksearch_gguf"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memmap2 = "0.9"
+tokenizers = { workspace = true }
+ahash = "0.8"

@@ -1,0 +1,12 @@
+[package]
+name = "ksearch_gemma"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+metal.workspace = true
+ksearch_gguf = { path = "../ksearch_gguf" }
+ksearch_ir.workspace = true
+ksearch_metal.workspace = true
+ksearch_kernels = { path = "../ksearch_kernels" }
