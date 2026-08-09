@@ -9,7 +9,11 @@ use ksearch_gguf::{
 };
 use ksearch_ir::{DType, Graph, Shape};
 use ksearch_metal::MetalContext;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const DEFAULT_GGUF: &str = "~/models/gemma-4-e2b/gemma-4-E2B-it-Q4_K_M.gguf";
+const ESSAY_PROMPT: &str =
+    "Write a short essay about the benefits of exercise. Include an introduction, 3 key points, and a conclusion.";
 
 #[derive(Parser)]
 #[command(name = "ksearch", about = "Metal kernel compiler (Thesis A)")]
@@ -47,6 +51,26 @@ enum Cmd {
         #[arg(long, default_value_t = 512)]
         max_seq: usize,
     },
+    /// Regression bench: Hi gate + essay decode/prefill tok/s.
+    Bench {
+        #[arg(long, default_value = DEFAULT_GGUF)]
+        gguf: String,
+        #[arg(long, default_value_t = 32)]
+        n_predict_hi: usize,
+        #[arg(long, default_value_t = 512)]
+        n_predict_essay: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_seq: usize,
+    },
+}
+
+fn expand_home(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Path::new(&home).join(rest);
+        }
+    }
+    PathBuf::from(p)
 }
 
 fn main() -> Result<()> {
@@ -61,7 +85,62 @@ fn main() -> Result<()> {
             n_predict,
             max_seq,
         } => generate(gguf, prompt, tokens, n_predict, max_seq),
+        Cmd::Bench {
+            gguf,
+            n_predict_hi,
+            n_predict_essay,
+            max_seq,
+        } => bench(expand_home(&gguf), n_predict_hi, n_predict_essay, max_seq),
     }
+}
+
+fn encode_user_prompt(gguf: &Path, text: &str) -> Result<Vec<u32>> {
+    let g = Gguf::open(gguf);
+    let tok = build_tokenizer_from_gguf(&g).map_err(|e| anyhow::anyhow!(e))?;
+    let chat = gemma4_chat_prompt(text);
+    encode_prompt(&tok, &chat, true).map_err(|e| anyhow::anyhow!(e))
+}
+
+fn bench(
+    gguf: PathBuf,
+    n_predict_hi: usize,
+    n_predict_essay: usize,
+    max_seq: usize,
+) -> Result<()> {
+    eprintln!("bench gguf={}", gguf.display());
+    let hi_ids = encode_user_prompt(&gguf, "Hi")?;
+    let essay_ids = encode_user_prompt(&gguf, ESSAY_PROMPT)?;
+    let mut model = GemmaModel::load(&gguf, max_seq)?;
+
+    let hi = model.generate_timed(&hi_ids, n_predict_hi, false)?;
+    let hi_text = model
+        .vocab
+        .as_ref()
+        .map(|v| v.decode(&hi.tokens, true))
+        .unwrap_or_default();
+    let hi_pass = hi_text.contains("Hi!")
+        && hi_text.contains("help")
+        && !hi.tokens.is_empty();
+    println!(
+        "hi:     prefill={:.1} tok/s  decode={:.1} tok/s  pass={}  text={:?}",
+        hi.prefill_tok_s(),
+        hi.decode_tok_s(),
+        hi_pass,
+        hi_text.trim()
+    );
+
+    let essay = model.generate_timed(&essay_ids, n_predict_essay, false)?;
+    println!(
+        "essay:  prefill={:.1} tok/s  decode={:.1} tok/s  tokens={}",
+        essay.prefill_tok_s(),
+        essay.decode_tok_s(),
+        essay.tokens.len()
+    );
+
+    if !hi_pass {
+        bail!("Hi gate failed: {hi_text:?}");
+    }
+    Ok(())
 }
 
 fn generate(
@@ -72,11 +151,9 @@ fn generate(
     max_seq: usize,
 ) -> Result<()> {
     let prompt_ids = if let Some(text) = prompt {
-        let g = Gguf::open(&gguf);
-        let tok = build_tokenizer_from_gguf(&g).map_err(|e| anyhow::anyhow!(e))?;
-        let chat = gemma4_chat_prompt(&text);
-        eprintln!("prompt: {chat:?}");
-        encode_prompt(&tok, &chat, true).map_err(|e| anyhow::anyhow!(e))?
+        let ids = encode_user_prompt(&gguf, &text)?;
+        eprintln!("prompt tokens: {}", ids.len());
+        ids
     } else if let Some(tokens) = tokens {
         tokens
             .split(',')

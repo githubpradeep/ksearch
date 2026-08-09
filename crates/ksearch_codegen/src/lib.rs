@@ -28,6 +28,16 @@ pub enum LaunchHint {
     Rows { rows: usize, cols: usize },
     /// One threadgroup per row; `tg` threads cooperate on that row (matvec reduce).
     RowsParallel { rows: usize, tg: u64 },
+    /// 2D grid: `rows` × `batch` threadgroups (batch matvecs).
+    RowsParallel2D { rows: usize, batch: usize, tg: u64 },
+    /// llama.cpp mul_mm: grid `(tg_x, tg_y)`, threads `(tw, nsg)`, shared `smem` bytes.
+    MulMm {
+        tg_x: u64,
+        tg_y: u64,
+        tw: u64,
+        nsg: u64,
+        smem: u64,
+    },
 }
 
 /// Lower `out` and its dependencies into one Metal kernel.
@@ -42,9 +52,27 @@ pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource,
             lower_sum_last(graph, out, *inp)
         }
         Op::MatVecQ4K { w, x } => lower_matvec_q4k(graph, out, *w, *x),
+        Op::MatVecQ4KBatch { w, x, batch } => lower_matvec_q4k_batch(graph, out, *w, *x, *batch),
+        Op::MulMmQ4K {
+            w,
+            x,
+            rows,
+            cols,
+            batch,
+        } => lower_mul_mm_q4k(graph, out, *w, *x, *rows, *cols, *batch),
         Op::MatVecQ6K { w, x } => lower_matvec_q6k(graph, out, *w, *x),
+        Op::MatVecQ6KBatch { w, x, batch } => lower_matvec_q6k_batch(graph, out, *w, *x, *batch),
         Op::MatVecBF16 { w, x } => lower_matvec_bf16(graph, out, *w, *x),
+        Op::MatVecBF16Batch { w, x, batch } => {
+            lower_matvec_bf16_batch(graph, out, *w, *x, *batch)
+        }
         Op::MatVecQ4KGateUpGelu { gate, up, x } => lower_matvec_q4k_gate_up_gelu(graph, out, *gate, *up, *x),
+        Op::MatVecQ4KGateUpGeluBatch {
+            gate,
+            up,
+            x,
+            batch,
+        } => lower_matvec_q4k_gate_up_gelu_batch(graph, out, *gate, *up, *x, *batch),
         Op::MatVecQ4KRmsGateUpGelu { gate, up, x, w, inv, eps } => {
             lower_matvec_q4k_rms_gate_up_gelu(graph, out, *gate, *up, *x, *w, *inv, *eps)
         }
@@ -58,8 +86,28 @@ pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource,
         Op::GeluMul { gate, up, up_off } => lower_gelu_mul(graph, out, *gate, *up, *up_off),
         Op::ArgMax { x } => lower_argmax(graph, out, *x),
         Op::RmsNorm { x, w, eps } => lower_rmsnorm(graph, out, *x, *w, *eps),
+        Op::RmsNormBatch { x, w, n, batch, eps } => {
+            lower_rmsnorm_batch(graph, out, *x, *w, *n, *batch, *eps)
+        }
         Op::RmsNormAdd { x, w, residual, eps } => lower_rmsnorm_add(graph, out, *x, *w, *residual, *eps),
+        Op::RmsNormAddBatch {
+            x,
+            w,
+            residual,
+            n,
+            batch,
+            eps,
+        } => lower_rmsnorm_add_batch(graph, out, *x, *w, *residual, *n, *batch, *eps),
         Op::RmsNormAddScale { x, w, residual, eps, scale } => lower_rmsnorm_add_scale(graph, out, *x, *w, *residual, *eps, *scale),
+        Op::RmsNormAddScaleBatch {
+            x,
+            w,
+            residual,
+            n,
+            batch,
+            eps,
+            scale,
+        } => lower_rmsnorm_add_scale_batch(graph, out, *x, *w, *residual, *n, *batch, *eps, *scale),
         Op::RmsNormPerHead {
             x,
             w,
@@ -74,6 +122,13 @@ pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource,
             n_heads,
             hd,
         } => lower_rope(graph, out, *x, *cos_sin, *n_heads, *hd),
+        Op::RopeBatch {
+            x,
+            cos_sin,
+            n_heads,
+            hd,
+            batch,
+        } => lower_rope_batch(graph, out, *x, *cos_sin, *n_heads, *hd, *batch),
         Op::AttnGqa {
             q,
             k,
@@ -142,6 +197,13 @@ pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource,
             hd,
             max_t,
         } => lower_kv_append_q4(graph, out, *src, *pos, *hd, *max_t),
+        Op::KvAppendQ4Batch {
+            src,
+            start_pos,
+            hd,
+            max_t,
+            batch,
+        } => lower_kv_append_q4_batch(graph, out, *src, *start_pos, *hd, *max_t, *batch),
         Op::CopySlice {
             src,
             src_off,
@@ -181,11 +243,18 @@ fn push_deps(op: &Op, stack: &mut Vec<TensorId>) {
             stack.push(*left);
             stack.push(*row);
         }
-        Op::MatVecQ4K { w, x } | Op::MatVecQ6K { w, x } | Op::MatVecBF16 { w, x } => {
+        Op::MatVecQ4K { w, x }
+        | Op::MatVecQ6K { w, x }
+        | Op::MatVecBF16 { w, x }
+        | Op::MatVecQ4KBatch { w, x, .. }
+        | Op::MatVecQ6KBatch { w, x, .. }
+        | Op::MatVecBF16Batch { w, x, .. }
+        | Op::MulMmQ4K { w, x, .. } => {
             stack.push(*w);
             stack.push(*x);
         }
-        Op::MatVecQ4KGateUpGelu { gate, up, x } => {
+        Op::MatVecQ4KGateUpGelu { gate, up, x }
+        | Op::MatVecQ4KGateUpGeluBatch { gate, up, x, .. } => {
             stack.push(*gate);
             stack.push(*up);
             stack.push(*x);
@@ -213,11 +282,14 @@ fn push_deps(op: &Op, stack: &mut Vec<TensorId>) {
             stack.push(*gate);
             stack.push(*up);
         }
-        Op::RmsNorm { x, w, .. } => {
+        Op::RmsNorm { x, w, .. } | Op::RmsNormBatch { x, w, .. } => {
             stack.push(*x);
             stack.push(*w);
         }
-        Op::RmsNormAdd { x, w, residual, .. } | Op::RmsNormAddScale { x, w, residual, .. } => {
+        Op::RmsNormAdd { x, w, residual, .. }
+        | Op::RmsNormAddScale { x, w, residual, .. }
+        | Op::RmsNormAddBatch { x, w, residual, .. }
+        | Op::RmsNormAddScaleBatch { x, w, residual, .. } => {
             stack.push(*x);
             stack.push(*w);
             stack.push(*residual);
@@ -226,7 +298,7 @@ fn push_deps(op: &Op, stack: &mut Vec<TensorId>) {
             stack.push(*x);
             stack.push(*w);
         }
-        Op::Rope { x, cos_sin, .. } => {
+        Op::Rope { x, cos_sin, .. } | Op::RopeBatch { x, cos_sin, .. } => {
             stack.push(*x);
             stack.push(*cos_sin);
         }
@@ -273,7 +345,7 @@ fn push_deps(op: &Op, stack: &mut Vec<TensorId>) {
             stack.push(*v_cache);
             stack.push(*meta);
         }
-        Op::KvAppendQ4 { src, pos, .. } => {
+        Op::KvAppendQ4 { src, pos, .. } | Op::KvAppendQ4Batch { src, start_pos: pos, .. } => {
             stack.push(*src);
             stack.push(*pos);
         }
@@ -533,6 +605,76 @@ kernel void {name}(
     })
 }
 
+fn lower_matvec_bf16_batch(
+    graph: &Graph,
+    out: TensorId,
+    matrix: TensorId,
+    vector: TensorId,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    let (ms, md) = graph.shape_dtype(matrix)?;
+    let (_vs, vd) = graph.shape_dtype(vector)?;
+    if ms.rank() != 2 || md != DType::BF16 || vd != DType::F32 || batch == 0 {
+        return Err(CodegenError::Msg(
+            "matvec_bf16_batch shape/dtype error".into(),
+        ));
+    }
+    let rows = ms.0[0];
+    let cols = ms.0[1];
+    let name = format!("k_matvec_bf16_b{batch}_{}", out.0);
+    let tg = 32u64;
+    // Flattened 1D grid: flat = b * rows + row (one TG per output row).
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+
+inline float bf16_to_f32(ushort h) {{
+  return as_type<float>((uint)h << 16);
+}}
+
+kernel void {name}(
+  device const ushort* A [[buffer(0)]],
+  device const float* x [[buffer(1)]],
+  device float* y [[buffer(2)]],
+  uint flat [[threadgroup_position_in_grid]],
+  uint lid [[thread_index_in_threadgroup]]
+) {{
+  constexpr uint ROWS = {rows}u;
+  constexpr uint COLS = {cols}u;
+  const uint b = flat / ROWS;
+  const uint row = flat % ROWS;
+  if (b >= {batch}u) return;
+  device const ushort* a = A + row * COLS;
+  device const float* xb = x + b * COLS;
+  float acc = 0.0f;
+  uint k = lid * 4u;
+  for (; k + 3u < COLS; k += {tg}u * 4u) {{
+    ushort4 h = *(device const ushort4*)(a + k);
+    float4 av = float4(bf16_to_f32(h[0]), bf16_to_f32(h[1]), bf16_to_f32(h[2]), bf16_to_f32(h[3]));
+    float4 xv = *(device const float4*)(xb + k);
+    acc += dot(av, xv);
+  }}
+  for (; k < COLS; k += {tg}u) {{
+    acc += bf16_to_f32(a[k]) * xb[k];
+  }}
+  acc = simd_sum(acc);
+  if (lid == 0u) y[b * ROWS + row] = acc;
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel {
+            rows: rows * batch,
+            tg,
+        },
+    })
+}
+
 fn lower_matvec_q4k(
     graph: &Graph,
     out: TensorId,
@@ -675,6 +817,377 @@ kernel void {name}(
     })
 }
 
+fn lower_matvec_q4k_batch(
+    graph: &Graph,
+    out: TensorId,
+    matrix: TensorId,
+    vector: TensorId,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    let (ms, md) = graph.shape_dtype(matrix)?;
+    let (_vs, vd) = graph.shape_dtype(vector)?;
+    if ms.rank() != 2
+        || md != DType::Q4K
+        || vd != DType::F32
+        || ms.0[1] % 256 != 0
+        || batch == 0
+    {
+        return Err(CodegenError::Msg("matvec_q4k_batch shape/dtype error".into()));
+    }
+    let rows = ms.0[0];
+    let cols = ms.0[1];
+    let nb = cols / 256;
+    let name = format!("k_matvec_q4k_b{batch}_{}", out.0);
+    let nsg: u64 = 2;
+    let nr0: u64 = 4;
+    let tg = nsg * 32;
+    let rows_per_tg = nsg * nr0;
+    let n_tg = (rows as u64 + rows_per_tg - 1) / rows_per_tg;
+    let nb01 = nb * 144;
+    // Flattened 1D grid over (row_tg, batch): avoids uint2+simdgroup quirks on
+    // tall matrices (PLE 8960×1536). Index: flat = b * n_tg + row_tg.
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+  device const uchar* A [[buffer(0)]],
+  device const float* x [[buffer(1)]],
+  device float* y [[buffer(2)]],
+  uint tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr short NSG = {nsg};
+  constexpr short NR0 = {nr0};
+  constexpr uint QK = 256u;
+  constexpr uint ROW_BYTES = {nb01}u;
+  constexpr uint16_t kmask1 = 0x3f3fu;
+  constexpr uint16_t kmask2 = 0x0f0fu;
+  constexpr uint16_t kmask3 = 0xc0c0u;
+  constexpr uint COLS = {cols}u;
+  constexpr uint ROWS = {rows}u;
+  constexpr uint N_TG = {n_tg}u;
+
+  const uint row_tg = tgpig % N_TG;
+  const uint b = tgpig / N_TG;
+  device const float* xb = x + b * COLS;
+  device float* yb = y + b * ROWS;
+
+  const short ix = tiisg / 8;
+  const short it = tiisg % 8;
+  const short iq = it / 4;
+  const short ir = it % 4;
+
+  const int first_row = int((row_tg * NSG + sgitg) * NR0);
+  device const uchar* row0 = A + (ulong)first_row * ROW_BYTES;
+
+  float yl[16];
+  float yh[16];
+  float sumf[NR0] = {{0.f}};
+
+  device const float* y4 = xb + ix * QK + 64 * iq + 8 * ir;
+  uint16_t sc16[4];
+  thread const uchar* sc8 = (thread const uchar*)sc16;
+
+  for (int ib = ix; ib < {nb}; ib += 4) {{
+    float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
+    for (short i = 0; i < 8; ++i) {{
+      yl[i + 0] = y4[i + 0];
+      sumy[0] += yl[i + 0];
+      yl[i + 8] = y4[i + 32];
+      sumy[1] += yl[i + 8];
+      yh[i + 0] = y4[i + 128];
+      sumy[2] += yh[i + 0];
+      yh[i + 8] = y4[i + 160];
+      sumy[3] += yh[i + 8];
+    }}
+
+    device const uchar* blk = row0 + (ulong)ib * 144u;
+    device const uint16_t* sc = (device const uint16_t*)(blk + 4) + iq;
+    device const uint16_t* q1 = (device const uint16_t*)(blk + 16) + 16 * iq + 4 * ir;
+    device const half* dh = (device const half*)blk;
+
+    for (short row = 0; row < NR0; row++) {{
+      sc16[0] = sc[0] & kmask1;
+      sc16[1] = sc[2] & kmask1;
+      sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+      sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+      device const uint16_t* q2 = q1 + 32;
+
+      float4 acc1 = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc2 = {{0.f, 0.f, 0.f, 0.f}};
+      #pragma unroll
+      for (short i = 0; i < 4; ++i) {{
+        acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000Fu);
+        acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00u);
+        acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0u);
+        acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000u);
+        acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000Fu);
+        acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00u);
+        acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0u);
+        acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000u);
+      }}
+
+      sumf[row] += float(dh[0]) * ((acc1[0] + (1.f / 256.f) * acc1[1]) * float(sc8[0]) +
+                                   (acc1[2] + (1.f / 256.f) * acc1[3]) * float(sc8[1]) * (1.f / 16.f) +
+                                   (acc2[0] + (1.f / 256.f) * acc2[1]) * float(sc8[4]) +
+                                   (acc2[2] + (1.f / 256.f) * acc2[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                  float(dh[1]) * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                                  sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+      q1 += ROW_BYTES / 2u;
+      sc += ROW_BYTES / 2u;
+      dh += ROW_BYTES / 2u;
+    }}
+    y4 += 4 * QK;
+  }}
+
+  for (int row = 0; row < NR0; ++row) {{
+    if (first_row + row >= {rows}) break;
+    float sum_all = simd_sum(sumf[row]);
+    if (tiisg == 0) yb[first_row + row] = sum_all;
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel {
+            rows: (n_tg as usize) * batch,
+            tg,
+        },
+    })
+}
+
+/// llama.cpp-style Q4_K mul_mm (simdgroup MMA). Constexpr shapes; always boundary-safe
+/// load/store (no Metal function constants); smem=8192.
+fn lower_mul_mm_q4k(
+    graph: &Graph,
+    out: TensorId,
+    matrix: TensorId,
+    vector: TensorId,
+    rows: usize,
+    cols: usize,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    let (ms, md) = graph.shape_dtype(matrix)?;
+    let (_vs, vd) = graph.shape_dtype(vector)?;
+    if ms.rank() != 2
+        || md != DType::Q4K
+        || vd != DType::F32
+        || ms.0[0] != rows
+        || ms.0[1] != cols
+        || cols < 64
+        || cols % 32 != 0
+        || cols % 256 != 0
+        || batch == 0
+    {
+        return Err(CodegenError::Msg("mul_mm_q4k shape/dtype error".into()));
+    }
+    let nb01 = (cols / 256) * 144;
+    let name = format!("k_mul_mm_q4k_r{rows}_c{cols}_b{batch}_{}", out.0);
+    // Tiling matches ggml_mul_mm_q4.metal / llama.cpp kernel_mul_mm_q4_K_f32.
+    let nr0: u64 = 64;
+    let nr1: u64 = 32;
+    let tw: u64 = 32;
+    let nsg: u64 = 4;
+    let smem: u64 = 8192;
+    let tg_x = (batch as u64 + nr1 - 1) / nr1;
+    let tg_y = (rows as u64 + nr0 - 1) / nr0;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+
+#define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
+#define QK_K 256
+
+struct block_q4_K {{
+  half     d;
+  half     dmin;
+  uint8_t  scales[12];
+  uint8_t  qs[128];
+}};
+
+static inline uchar2 mul_mm_get_scale_min_k4(int j, int k, device const uchar * q) {{
+  return j < 4
+      ? uchar2{{uchar(q[j + 0 + k] & 63), uchar(q[j + 4 + k] & 63)}}
+      : uchar2{{
+            uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xc0) >> 2)),
+            uchar((q[j + 4 + k] >> 4) | ((q[j - 0 + k] & 0xc0) >> 2))}};
+}}
+
+static inline void mul_mm_dequantize_q4_K(device const block_q4_K * xb, short il, thread half4x4 & reg) {{
+  device const uchar * q = xb->qs;
+  short is = (il / 4) * 2;
+  q = q + (il / 4) * 32 + 16 * (il & 1);
+  il = il & 3;
+  const uchar2 sc = mul_mm_get_scale_min_k4(is, il / 2, xb->scales);
+  const float d = il < 2 ? xb->d : xb->d / 16.h;
+  const float min = xb->dmin;
+  const float dl = d * sc[0];
+  const float ml = min * sc[1];
+  const ushort mask = il < 2 ? 0x0F : 0xF0;
+  FOR_UNROLL(int i = 0; i < 16; ++i) {{
+    reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
+  }}
+}}
+
+kernel void {name}(
+  device const char * src0 [[buffer(0)]],
+  device const char * src1 [[buffer(1)]],
+  device char * dst [[buffer(2)]],
+  threadgroup char * shmem [[threadgroup(0)]],
+  uint3 tgpig [[threadgroup_position_in_grid]],
+  ushort tiitg [[thread_index_in_threadgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr short nl = QK_K / 16;
+  constexpr short NR0 = 64;
+  constexpr short NR1 = 32;
+  constexpr short NK = 32;
+  constexpr short NL0 = NK / 16;
+  constexpr short NL1 = NK / 8;
+  constexpr int ne0 = {rows};
+  constexpr int ne1 = {batch};
+  constexpr int ne00 = {cols};
+  constexpr ulong nb01 = {nb01}ul;
+  constexpr ulong nb10 = 4ul;
+  constexpr ulong nb11 = {cols}ul * 4ul;
+
+  threadgroup half * sa = (threadgroup half *)(shmem);
+  threadgroup half * sb = (threadgroup half *)(shmem + 4096);
+
+  const int r0 = tgpig.y * NR0;
+  const int r1 = tgpig.x * NR1;
+
+  const short nr0 = (ne0 - r0 < NR0) ? short(ne0 - r0) : NR0;
+  const short nr1 = (ne1 - r1 < NR1) ? short(ne1 - r1) : NR1;
+
+  const short lr0 = ((short)tiitg / NL0) < nr0 ? ((short)tiitg / NL0) : short(nr0 - 1);
+  const short lr1 = ((short)tiitg / NL1) < nr1 ? ((short)tiitg / NL1) : short(nr1 - 1);
+
+  const short il0 = tiitg % NL0;
+  short il = il0;
+
+  device const block_q4_K * x =
+      (device const block_q4_K *)(src0 + nb01 * (r0 + lr0));
+
+  const short iy = 8 * (tiitg % NL1);
+  device const float * y =
+      (device const float *)(src1 + nb11 * (r1 + lr1) + nb10 * iy);
+
+  simdgroup_half8x8 ma[4];
+  simdgroup_half8x8 mb[2];
+  simdgroup_float8x8 mc[8];
+
+  for (short i = 0; i < 8; i++) {{
+    mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+  }}
+
+  for (int loop_k = 0; loop_k < ne00; loop_k += NK) {{
+    {{
+      half4x4 temp_a;
+      mul_mm_dequantize_q4_K(x, il, temp_a);
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (short i = 0; i < 16; i++) {{
+        const short sx = 2 * il0 + i / 8;
+        const short sy = (tiitg / NL0) / 8;
+        const short lx = (tiitg / NL0) % 8;
+        const short ly = i % 8;
+        const short ib = 8 * sx + sy;
+        *(sa + 64 * ib + 8 * ly + lx) = temp_a[i / 4][i % 4];
+      }}
+    }}
+
+    // Boundary-safe B tile load (no FC_mul_mm_bc_inp).
+    {{
+      const short sx = (tiitg % NL1);
+      const short sy = (tiitg / NL1) / 8;
+      const short ly = (tiitg / NL1) % 8;
+      const short ib = 4 * sx + sy;
+      for (short i = 0; i < 8; ++i) {{
+        *(sb + 64 * ib + 8 * ly + i) = half(y[i]);
+      }}
+    }}
+
+    il = (il + 2 < nl) ? il + 2 : il % 2;
+    x = (il < 2) ? x + (2 + nl - 1) / nl : x;
+    y += NK;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup const half * lsma = sa + 4 * 64 * (sgitg % 2);
+    threadgroup const half * lsmb = sb + 2 * 64 * (sgitg / 2);
+
+    FOR_UNROLL(short ik = 0; ik < NK / 8; ik++) {{
+      simdgroup_barrier(mem_flags::mem_none);
+      FOR_UNROLL(short i = 0; i < 4; i++) {{
+        simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+      }}
+      simdgroup_barrier(mem_flags::mem_none);
+      FOR_UNROLL(short i = 0; i < 2; i++) {{
+        simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+      }}
+      simdgroup_barrier(mem_flags::mem_none);
+      FOR_UNROLL(short i = 0; i < 8; i++) {{
+        simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+      }}
+      lsma += 8 * 64;
+      lsmb += 4 * 64;
+    }}
+  }}
+
+  // Always boundary-safe store via shmem (no FC_mul_mm_bc_out); needs smem=8192.
+  {{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * temp_str =
+        ((threadgroup float *)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
+    for (short i = 0; i < 8; i++) {{
+      simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {{
+      for (int j = tiitg; j < nr1; j += NR1) {{
+        device float * D = (device float *)dst + r0 + (r1 + j) * ne0;
+        threadgroup float * C = ((threadgroup float *)shmem) + (j * NR0);
+        int i = 0;
+        for (; i < nr0 / 4; i++) {{
+          ((device float4 *)D)[i] = ((threadgroup float4 *)C)[i];
+        }}
+        i *= 4;
+        for (; i < nr0; i++) {{
+          D[i] = C[i];
+        }}
+      }}
+    }}
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::MulMm {
+            tg_x,
+            tg_y,
+            tw,
+            nsg,
+            smem,
+        },
+    })
+}
+
 fn lower_matvec_q6k(
     graph: &Graph,
     out: TensorId,
@@ -795,6 +1308,136 @@ kernel void {name}(
         },
     })
 }
+
+fn lower_matvec_q6k_batch(
+    graph: &Graph,
+    out: TensorId,
+    matrix: TensorId,
+    vector: TensorId,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    let (ms, md) = graph.shape_dtype(matrix)?;
+    let (_vs, vd) = graph.shape_dtype(vector)?;
+    if ms.rank() != 2
+        || md != DType::Q6K
+        || vd != DType::F32
+        || ms.0[1] % 256 != 0
+        || batch == 0
+    {
+        return Err(CodegenError::Msg("matvec_q6k_batch shape/dtype error".into()));
+    }
+    let rows = ms.0[0];
+    let cols = ms.0[1];
+    let nb = cols / 256;
+    let name = format!("k_matvec_q6k_b{batch}_{}", out.0);
+    let nsg: u64 = 2;
+    let nr0: u64 = 4;
+    let tg = nsg * 32;
+    let rows_per_tg = nsg * nr0;
+    let n_tg = (rows as u64 + rows_per_tg - 1) / rows_per_tg;
+    let nb01 = nb * 210;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+  device const uchar* A [[buffer(0)]],
+  device const float* x [[buffer(1)]],
+  device float* y [[buffer(2)]],
+  uint2 tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr short NSG = {nsg};
+  constexpr short NR0 = {nr0};
+  constexpr uint QK = 256u;
+  constexpr uint ROW_BYTES = {nb01}u;
+  constexpr uchar kmask1 = 0x03u;
+  constexpr uchar kmask2 = 0x0Cu;
+  constexpr uchar kmask3 = 0x30u;
+  constexpr uchar kmask4 = 0xC0u;
+  constexpr uint COLS = {cols}u;
+  constexpr uint ROWS = {rows}u;
+
+  const uint row_tg = tgpig.x;
+  const uint b = tgpig.y;
+  device const float* xb = x + b * COLS;
+  device float* yb = y + b * ROWS;
+
+  const int first_row = int((row_tg * NSG + sgitg) * NR0);
+  device const uchar* row0 = A + (ulong)first_row * ROW_BYTES;
+
+  float sumf[NR0] = {{0.f}};
+  float yl[16];
+
+  const short tid = tiisg / 2;
+  const short ix = tiisg % 2;
+  const short ip = tid / 8;
+  const short il = tid % 8;
+  const short l0 = 4 * il;
+  const short is = 8 * ip + l0 / 16;
+  const short y_offset = 128 * ip + l0;
+  const short q_offset_l = 64 * ip + l0;
+  const short q_offset_h = 32 * ip + l0;
+
+  for (int i = ix; i < {nb}; i += 2) {{
+    device const uchar* blk = row0 + (ulong)i * 210u;
+    device const uchar* q1 = blk + q_offset_l;
+    device const uchar* q2 = q1 + 32;
+    device const uchar* qh = blk + 128 + q_offset_h;
+    device const char* sc = (device const char*)(blk + 192) + is;
+    device const half* dh = (device const half*)(blk + 208);
+    device const float* yy = xb + i * QK + y_offset;
+
+    for (short l = 0; l < 4; ++l) {{
+      yl[4 * l + 0] = yy[l + 0];
+      yl[4 * l + 1] = yy[l + 32];
+      yl[4 * l + 2] = yy[l + 64];
+      yl[4 * l + 3] = yy[l + 96];
+    }}
+
+    for (short row = 0; row < NR0; ++row) {{
+      float4 sums = {{0.f, 0.f, 0.f, 0.f}};
+      #pragma unroll
+      for (short l = 0; l < 4; ++l) {{
+        sums[0] += yl[4 * l + 0] * float(char((q1[l] & 0xFu) | ((qh[l] & kmask1) << 4)) - 32);
+        sums[1] += yl[4 * l + 1] * float(char((q2[l] & 0xFu) | ((qh[l] & kmask2) << 2)) - 32);
+        sums[2] += yl[4 * l + 2] * float(char((q1[l] >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+        sums[3] += yl[4 * l + 3] * float(char((q2[l] >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+      }}
+      sumf[row] += float(dh[0]) * (sums[0] * float(sc[0]) + sums[1] * float(sc[2]) +
+                                   sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
+      q1 += ROW_BYTES;
+      q2 += ROW_BYTES;
+      qh += ROW_BYTES;
+      sc += ROW_BYTES;
+      dh += ROW_BYTES / 2u;
+    }}
+  }}
+
+  for (int row = 0; row < NR0; ++row) {{
+    if (first_row + row >= {rows}) break;
+    float sum_all = simd_sum(sumf[row]);
+    if (tiisg == 0) yb[first_row + row] = sum_all;
+  }}
+}}
+"#
+    );
+    let _ = cols;
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel2D {
+            rows: n_tg as usize,
+            batch,
+            tg,
+        },
+    })
+}
+
 
 
 fn lower_matvec_q4k_gate_up_gelu(
@@ -965,6 +1608,188 @@ kernel void {name}(
         out_dtype: DType::F32,
         launch: LaunchHint::RowsParallel {
             rows: n_tg as usize,
+            tg,
+        },
+    })
+}
+
+
+fn lower_matvec_q4k_gate_up_gelu_batch(
+    graph: &Graph,
+    out: TensorId,
+    gate: TensorId,
+    up: TensorId,
+    vector: TensorId,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    let (ms, md) = graph.shape_dtype(gate)?;
+    let (us, ud) = graph.shape_dtype(up)?;
+    let (_vs, vd) = graph.shape_dtype(vector)?;
+    if ms != us
+        || ms.rank() != 2
+        || md != DType::Q4K
+        || ud != DType::Q4K
+        || vd != DType::F32
+        || ms.0[1] % 256 != 0
+        || batch == 0
+    {
+        return Err(CodegenError::Msg("matvec_q4k_gate_up_gelu_batch shape/dtype".into()));
+    }
+    let rows = ms.0[0];
+    let cols = ms.0[1];
+    let nb = cols / 256;
+    let name = format!("k_mv_q4k_gug_b{batch}_{}", out.0);
+    let nsg: u64 = 2;
+    let nr0: u64 = 4;
+    let tg = nsg * 32;
+    let rows_per_tg = nsg * nr0;
+    let n_tg = (rows as u64 + rows_per_tg - 1) / rows_per_tg;
+    let nb01 = nb * 144;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+
+kernel void {name}(
+  device const uchar* Wg [[buffer(0)]],
+  device const uchar* Wu [[buffer(1)]],
+  device const float* x [[buffer(2)]],
+  device float* y [[buffer(3)]],
+  uint2 tgpig [[threadgroup_position_in_grid]],
+  ushort tiisg [[thread_index_in_simdgroup]],
+  ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {{
+  constexpr short NSG = {nsg};
+  constexpr short NR0 = {nr0};
+  constexpr uint QK = 256u;
+  constexpr uint ROW_BYTES = {nb01}u;
+  constexpr uint16_t kmask1 = 0x3f3fu;
+  constexpr uint16_t kmask2 = 0x0f0fu;
+  constexpr uint16_t kmask3 = 0xc0c0u;
+  constexpr uint COLS = {cols}u;
+  constexpr uint ROWS = {rows}u;
+
+  const uint row_tg = tgpig.x;
+  const uint b = tgpig.y;
+  device const float* xb = x + b * COLS;
+  device float* yb = y + b * ROWS;
+
+  const short ix = tiisg / 8;
+  const short it = tiisg % 8;
+  const short iq = it / 4;
+  const short ir = it % 4;
+
+  const int first_row = int((row_tg * NSG + sgitg) * NR0);
+  device const uchar* row_g = Wg + (ulong)first_row * ROW_BYTES;
+  device const uchar* row_u = Wu + (ulong)first_row * ROW_BYTES;
+
+  float yl[16];
+  float yh[16];
+  float sumf_g[NR0] = {{0.f}};
+  float sumf_u[NR0] = {{0.f}};
+
+  device const float* y4 = xb + ix * QK + 64 * iq + 8 * ir;
+  uint16_t sc16[4];
+  thread const uchar* sc8 = (thread const uchar*)sc16;
+
+  for (int ib = ix; ib < {nb}; ib += 4) {{
+    float4 sumy = {{0.f, 0.f, 0.f, 0.f}};
+    for (short i = 0; i < 8; ++i) {{
+      yl[i + 0] = y4[i + 0]; sumy[0] += yl[i + 0];
+      yl[i + 8] = y4[i + 32]; sumy[1] += yl[i + 8];
+      yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+      yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+    }}
+
+    device const uchar* blk_g = row_g + (ulong)ib * 144u;
+    device const uchar* blk_u = row_u + (ulong)ib * 144u;
+    device const uint16_t* sc_g = (device const uint16_t*)(blk_g + 4) + iq;
+    device const uint16_t* q1_g = (device const uint16_t*)(blk_g + 16) + 16 * iq + 4 * ir;
+    device const half* dh_g = (device const half*)blk_g;
+    device const uint16_t* sc_u = (device const uint16_t*)(blk_u + 4) + iq;
+    device const uint16_t* q1_u = (device const uint16_t*)(blk_u + 16) + 16 * iq + 4 * ir;
+    device const half* dh_u = (device const half*)blk_u;
+
+    for (short row = 0; row < NR0; row++) {{
+      float4 acc1_g = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc2_g = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc1_u = {{0.f, 0.f, 0.f, 0.f}};
+      float4 acc2_u = {{0.f, 0.f, 0.f, 0.f}};
+
+      sc16[0] = sc_g[0] & kmask1;
+      sc16[1] = sc_g[2] & kmask1;
+      sc16[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+      sc16[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
+      device const uint16_t* q2_g = q1_g + 32;
+      #pragma unroll
+      for (short i = 0; i < 4; ++i) {{
+        acc1_g[0] += yl[2 * i + 0] * float(q1_g[i] & 0x000Fu);
+        acc1_g[1] += yl[2 * i + 1] * float(q1_g[i] & 0x0F00u);
+        acc1_g[2] += yl[2 * i + 8] * float(q1_g[i] & 0x00F0u);
+        acc1_g[3] += yl[2 * i + 9] * float(q1_g[i] & 0xF000u);
+        acc2_g[0] += yh[2 * i + 0] * float(q2_g[i] & 0x000Fu);
+        acc2_g[1] += yh[2 * i + 1] * float(q2_g[i] & 0x0F00u);
+        acc2_g[2] += yh[2 * i + 8] * float(q2_g[i] & 0x00F0u);
+        acc2_g[3] += yh[2 * i + 9] * float(q2_g[i] & 0xF000u);
+      }}
+      sumf_g[row] += float(dh_g[0]) * ((acc1_g[0] + (1.f / 256.f) * acc1_g[1]) * float(sc8[0]) +
+                                       (acc1_g[2] + (1.f / 256.f) * acc1_g[3]) * float(sc8[1]) * (1.f / 16.f) +
+                                       (acc2_g[0] + (1.f / 256.f) * acc2_g[1]) * float(sc8[4]) +
+                                       (acc2_g[2] + (1.f / 256.f) * acc2_g[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                     float(dh_g[1]) * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                                       sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+      sc16[0] = sc_u[0] & kmask1;
+      sc16[1] = sc_u[2] & kmask1;
+      sc16[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+      sc16[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
+      device const uint16_t* q2_u = q1_u + 32;
+      #pragma unroll
+      for (short i = 0; i < 4; ++i) {{
+        acc1_u[0] += yl[2 * i + 0] * float(q1_u[i] & 0x000Fu);
+        acc1_u[1] += yl[2 * i + 1] * float(q1_u[i] & 0x0F00u);
+        acc1_u[2] += yl[2 * i + 8] * float(q1_u[i] & 0x00F0u);
+        acc1_u[3] += yl[2 * i + 9] * float(q1_u[i] & 0xF000u);
+        acc2_u[0] += yh[2 * i + 0] * float(q2_u[i] & 0x000Fu);
+        acc2_u[1] += yh[2 * i + 1] * float(q2_u[i] & 0x0F00u);
+        acc2_u[2] += yh[2 * i + 8] * float(q2_u[i] & 0x00F0u);
+        acc2_u[3] += yh[2 * i + 9] * float(q2_u[i] & 0xF000u);
+      }}
+      sumf_u[row] += float(dh_u[0]) * ((acc1_u[0] + (1.f / 256.f) * acc1_u[1]) * float(sc8[0]) +
+                                       (acc1_u[2] + (1.f / 256.f) * acc1_u[3]) * float(sc8[1]) * (1.f / 16.f) +
+                                       (acc2_u[0] + (1.f / 256.f) * acc2_u[1]) * float(sc8[4]) +
+                                       (acc2_u[2] + (1.f / 256.f) * acc2_u[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                     float(dh_u[1]) * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                                       sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+      q1_g += ROW_BYTES / 2u; sc_g += ROW_BYTES / 2u; dh_g += ROW_BYTES / 2u;
+      q1_u += ROW_BYTES / 2u; sc_u += ROW_BYTES / 2u; dh_u += ROW_BYTES / 2u;
+    }}
+    y4 += 4 * QK;
+  }}
+
+  for (int row = 0; row < NR0; ++row) {{
+    if (first_row + row >= {rows}) break;
+    float gate = simd_sum(sumf_g[row]);
+    float upv = simd_sum(sumf_u[row]);
+    float ax = clamp(gate, -20.0f, 20.0f);
+    float u = 0.79788456f * (ax + 0.044715f * ax * ax * ax);
+    float g = 0.5f * ax * (1.0f + precise::tanh(u));
+    float outv = g * upv;
+    if (tiisg == 0) yb[first_row + row] = isnan(outv) ? 0.0f : outv;
+  }}
+}}
+"#
+    );
+    let _ = cols;
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 3,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel2D {
+            rows: n_tg as usize,
+            batch,
             tg,
         },
     })
@@ -1925,6 +2750,284 @@ kernel void {name}(
         },
     })
 }
+
+
+fn lower_rmsnorm_batch(
+    graph: &Graph,
+    out: TensorId,
+    _x: TensorId,
+    _w: TensorId,
+    n: usize,
+    batch: usize,
+    eps: f32,
+) -> Result<MetalKernelSource, CodegenError> {
+    let name = format!("k_rmsnorm_b{batch}_{n}_{}", out.0);
+    let tg = 256u64;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+kernel void {name}(
+  device const float* x [[buffer(0)]],
+  device const float* w [[buffer(1)]],
+  device float* y [[buffer(2)]],
+  uint tgpig [[threadgroup_position_in_grid]],
+  uint lid [[thread_index_in_threadgroup]],
+  uint tpg [[threads_per_threadgroup]]
+) {{
+  threadgroup float sh[{tg}];
+  device const float* xb = x + tgpig * {n}u;
+  device float* yb = y + tgpig * {n}u;
+  float local = 0.0f;
+  for (uint i = lid; i < {n}u; i += tpg) local += xb[i] * xb[i];
+  sh[lid] = local;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = tpg / 2u; s > 0u; s >>= 1u) {{
+    if (lid < s) sh[lid] += sh[lid + s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }}
+  float inv = rsqrt(sh[0] / float({n}) + {eps:?}f);
+  for (uint i = lid; i < {n}u; i += tpg) {{
+    yb[i] = xb[i] * inv * w[i];
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel {
+            rows: batch.max(1),
+            tg,
+        },
+    })
+}
+
+fn lower_rmsnorm_add_batch(
+    graph: &Graph,
+    out: TensorId,
+    _x: TensorId,
+    _w: TensorId,
+    _residual: TensorId,
+    n: usize,
+    batch: usize,
+    eps: f32,
+) -> Result<MetalKernelSource, CodegenError> {
+    let name = format!("k_rms_add_b{batch}_{n}_{}", out.0);
+    let tg = 256u64;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+kernel void {name}(
+  device const float* x [[buffer(0)]],
+  device const float* w [[buffer(1)]],
+  device const float* residual [[buffer(2)]],
+  device float* y [[buffer(3)]],
+  uint tgpig [[threadgroup_position_in_grid]],
+  uint lid [[thread_index_in_threadgroup]],
+  uint tpg [[threads_per_threadgroup]]
+) {{
+  threadgroup float sh[256];
+  device const float* xb = x + tgpig * {n}u;
+  device const float* rb = residual + tgpig * {n}u;
+  device float* yb = y + tgpig * {n}u;
+  float local = 0.0f;
+  for (uint i = lid; i < {n}u; i += tpg) local += xb[i] * xb[i];
+  sh[lid] = local;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = tpg / 2u; s > 0u; s >>= 1u) {{
+    if (lid < s) sh[lid] += sh[lid + s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }}
+  float inv = rsqrt(sh[0] / float({n}) + {eps:?}f);
+  for (uint i = lid; i < {n}u; i += tpg) {{
+    yb[i] = xb[i] * inv * w[i] + rb[i];
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 3,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel {
+            rows: batch.max(1),
+            tg,
+        },
+    })
+}
+
+fn lower_rmsnorm_add_scale_batch(
+    graph: &Graph,
+    out: TensorId,
+    _x: TensorId,
+    _w: TensorId,
+    _residual: TensorId,
+    n: usize,
+    batch: usize,
+    eps: f32,
+    scale: f32,
+) -> Result<MetalKernelSource, CodegenError> {
+    let name = format!("k_rms_add_sc_b{batch}_{n}_{}", out.0);
+    let tg = 256u64;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+kernel void {name}(
+  device const float* x [[buffer(0)]],
+  device const float* w [[buffer(1)]],
+  device const float* residual [[buffer(2)]],
+  device float* y [[buffer(3)]],
+  uint tgpig [[threadgroup_position_in_grid]],
+  uint lid [[thread_index_in_threadgroup]],
+  uint tpg [[threads_per_threadgroup]]
+) {{
+  threadgroup float sh[256];
+  device const float* xb = x + tgpig * {n}u;
+  device const float* rb = residual + tgpig * {n}u;
+  device float* yb = y + tgpig * {n}u;
+  float local = 0.0f;
+  for (uint i = lid; i < {n}u; i += tpg) local += xb[i] * xb[i];
+  sh[lid] = local;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = tpg / 2u; s > 0u; s >>= 1u) {{
+    if (lid < s) sh[lid] += sh[lid + s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }}
+  float inv = rsqrt(sh[0] / float({n}) + {eps:?}f);
+  for (uint i = lid; i < {n}u; i += tpg) {{
+    yb[i] = {scale:?}f * (xb[i] * inv * w[i] + rb[i]);
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 3,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::F32,
+        launch: LaunchHint::RowsParallel {
+            rows: batch.max(1),
+            tg,
+        },
+    })
+}
+
+fn lower_rope_batch(
+    graph: &Graph,
+    out: TensorId,
+    _x: TensorId,
+    _cos_sin: TensorId,
+    n_heads: usize,
+    hd: usize,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    let (shape, dtype) = graph.shape_dtype(out)?;
+    let name = format!("k_rope_b{batch}_{}", out.0);
+    let total = batch * n_heads;
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+kernel void {name}(
+  device const float* x [[buffer(0)]],
+  device const float* cos_sin [[buffer(1)]],
+  device float* y [[buffer(2)]],
+  uint gid [[thread_position_in_grid]]
+) {{
+  if (gid >= {total}u) return;
+  uint b = gid / {n_heads}u;
+  uint head = gid % {n_heads}u;
+  device const float* h = x + (b * {n_heads}u + head) * {hd}u;
+  device float* o = y + (b * {n_heads}u + head) * {hd}u;
+  device const float* cs = cos_sin + b * {hd}u;
+  uint half_d = {hd}u / 2u;
+  for (uint i = 0u; i < half_d; i++) {{
+    float c = cs[i];
+    float s = cs[half_d + i];
+    float x0 = h[i];
+    float x1 = h[half_d + i];
+    o[i] = x0 * c - x1 * s;
+    o[half_d + i] = x0 * s + x1 * c;
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: shape,
+        out_dtype: dtype,
+        launch: LaunchHint::Elementwise { n: total.max(1) },
+    })
+}
+
+fn lower_kv_append_q4_batch(
+    graph: &Graph,
+    out: TensorId,
+    _src: TensorId,
+    _start_pos: TensorId,
+    hd: usize,
+    max_t: usize,
+    batch: usize,
+) -> Result<MetalKernelSource, CodegenError> {
+    if hd % 32 != 0 || batch == 0 {
+        return Err(CodegenError::Msg("KvAppendQ4Batch hd/batch invalid".into()));
+    }
+    let groups = hd / 32;
+    let row_bytes = groups * 18;
+    let n = batch * groups;
+    let name = format!("k_kv_q4_b{batch}_{}", out.0);
+    let source = format!(
+        r#"#include <metal_stdlib>
+using namespace metal;
+kernel void {name}(
+  device const float* src [[buffer(0)]],
+  device const uint* start_pos_buf [[buffer(1)]],
+  device uchar* cache [[buffer(2)]],
+  uint gid [[thread_position_in_grid]]
+) {{
+  if (gid >= {n}u) return;
+  uint b = gid / {groups}u;
+  uint g = gid % {groups}u;
+  uint pos = start_pos_buf[0] + b;
+  if (pos >= {max_t}u) return;
+  device const float* row = src + b * {hd}u;
+  float max_abs = 0.0f;
+  for (uint d = 0u; d < 32u; d++) {{
+    float a = fabs(row[g * 32u + d]);
+    if (a > max_abs) max_abs = a;
+  }}
+  float scale = max_abs / 7.0f;
+  if (max_abs == 0.0f) scale = 1.0f;
+  float inv_scale = 1.0f / scale;
+  uint base = pos * {row_bytes}u + g * 18u;
+  *reinterpret_cast<device half*>(&cache[base]) = half(scale);
+  for (uint i = 0u; i < 16u; i++) {{
+    float v_lo = row[g * 32u + i];
+    float v_hi = row[g * 32u + i + 16u];
+    int q_lo = clamp(int(round(v_lo * inv_scale)) + 8, 0, 15);
+    int q_hi = clamp(int(round(v_hi * inv_scale)) + 8, 0, 15);
+    cache[base + 2u + i] = uchar(q_lo | (q_hi << 4));
+  }}
+}}
+"#
+    );
+    Ok(MetalKernelSource {
+        name,
+        source,
+        n_inputs: 2,
+        out_shape: graph.shape_dtype(out)?.0,
+        out_dtype: DType::Q40,
+        launch: LaunchHint::Elementwise { n: n.max(1) },
+    })
+}
+
 
 fn lower_kv_append_q4(
     graph: &Graph,

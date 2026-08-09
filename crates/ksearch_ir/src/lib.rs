@@ -93,12 +93,33 @@ pub enum Op {
     MulBroadcastRow { left: TensorId, row: TensorId },
     /// Fused Q4_K dequant + matvec: `w[M,K] @ x[K] -> y[M]`.
     MatVecQ4K { w: TensorId, x: TensorId },
+    /// Batched Q4_K matvec: `w[M,K] @ x[B,K] -> y[B,M]` (weight reuse).
+    MatVecQ4KBatch { w: TensorId, x: TensorId, batch: usize },
+    /// Q4_K matrix-matrix (simdgroup MMA): `w[rows,cols] @ x[batch,cols] -> y[batch,rows]`.
+    MulMmQ4K {
+        w: TensorId,
+        x: TensorId,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+    },
     /// Fused Q6_K dequant + matvec.
     MatVecQ6K { w: TensorId, x: TensorId },
+    /// Batched Q6_K matvec: `w[M,K] @ x[B,K] -> y[B,M]`.
+    MatVecQ6KBatch { w: TensorId, x: TensorId, batch: usize },
     /// BF16 weights × F32 vector → F32.
     MatVecBF16 { w: TensorId, x: TensorId },
+    /// Batched BF16 matvec: `w[M,K] @ x[B,K] -> y[B,M]`.
+    MatVecBF16Batch { w: TensorId, x: TensorId, batch: usize },
     /// Fused Q4_K gate∥up matvec + GeLU(gate)*up → [M].
     MatVecQ4KGateUpGelu { gate: TensorId, up: TensorId, x: TensorId },
+    /// Batched Q4_K gate∥up + GeLU: x `[B,K]` → y `[B,M]`.
+    MatVecQ4KGateUpGeluBatch {
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+        batch: usize,
+    },
     /// RMSNorm(x,w) fused into Q4 gate∥up + GeLU.
     MatVecQ4KRmsGateUpGelu { gate: TensorId, up: TensorId, x: TensorId, w: TensorId, inv: TensorId, eps: f32 },
     /// RMSNorm(x,w) fused into Q4_K matvec.
@@ -119,12 +140,39 @@ pub enum Op {
     ArgMax { x: TensorId },
     /// RMSNorm: `y = x * rsqrt(mean(x^2)+eps) * w`.
     RmsNorm { x: TensorId, w: TensorId, eps: f32 },
+    /// Batched RMSNorm: `x[B*n]` → `y[B*n]`, one TG per row.
+    RmsNormBatch {
+        x: TensorId,
+        w: TensorId,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    },
     /// `out[0] = rsqrt(mean(x^2)+eps)`.
     InvRms { x: TensorId, eps: f32 },
     /// `y = rmsnorm(x,w) + residual` (fused residual).
     RmsNormAdd { x: TensorId, w: TensorId, residual: TensorId, eps: f32 },
+    /// Batched `y = rmsnorm(x,w) + residual` over `batch` rows of length `n`.
+    RmsNormAddBatch {
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    },
     /// `y = scale * (rmsnorm(x,w) + residual)`.
     RmsNormAddScale { x: TensorId, w: TensorId, residual: TensorId, eps: f32, scale: f32 },
+    /// Batched `y = scale * (rmsnorm(x,w) + residual)`.
+    RmsNormAddScaleBatch {
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        n: usize,
+        batch: usize,
+        eps: f32,
+        scale: f32,
+    },
     /// Per-head RMSNorm over last dim `hd`; `with_weight` uses `w[hd]`.
     RmsNormPerHead {
         x: TensorId,
@@ -140,6 +188,14 @@ pub enum Op {
         cos_sin: TensorId,
         n_heads: usize,
         hd: usize,
+    },
+    /// Batched RoPE: x `[B*n_heads*hd]`, cos_sin `[B*hd]` (one pos per batch row).
+    RopeBatch {
+        x: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+        batch: usize,
     },
     /// Tiled flash decode attention (MQA/GQA); meta = `[T, start]` u32 viewed as float buffer binding.
     AttnGqa {
@@ -215,6 +271,15 @@ pub enum Op {
         pos: TensorId,
         hd: usize,
         max_t: usize,
+    },
+    /// Quantize `src[B*hd]` rows to Q4_0 at positions `start_pos .. start_pos+B-1`.
+    /// `start_pos` is a U32[1] buffer (bound as F32[1] input).
+    KvAppendQ4Batch {
+        src: TensorId,
+        start_pos: TensorId,
+        hd: usize,
+        max_t: usize,
+        batch: usize,
     },
     /// Copy `n` f32 elements: `dst[dst_off + i] = src[src_off + i]`.
     CopySlice {
@@ -331,6 +396,69 @@ impl Graph {
         ))
     }
 
+    pub fn matvec_q4k_batch(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let cols = sw.0[1];
+        let rows = sw.0[0];
+        if dw != DType::Q4K
+            || dx != DType::F32
+            || sw.rank() != 2
+            || batch == 0
+            || cols % 256 != 0
+            || sx.numel() < batch * cols
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::MatVecQ4KBatch { w, x, batch },
+            Shape(vec![batch * rows]),
+            DType::F32,
+        ))
+    }
+
+    /// Q4_K simdgroup MMA: `w[rows,cols] @ x[batch,cols]^T → y[batch,rows]`.
+    pub fn mul_mm_q4k(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if dw != DType::Q4K
+            || dx != DType::F32
+            || sw.rank() != 2
+            || sw.0[0] != rows
+            || sw.0[1] != cols
+            || batch == 0
+            || cols < 64
+            || cols % 32 != 0
+            || cols % 256 != 0
+            || sx.numel() < batch * cols
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::MulMmQ4K {
+                w,
+                x,
+                rows,
+                cols,
+                batch,
+            },
+            Shape(vec![batch * rows]),
+            DType::F32,
+        ))
+    }
+
     pub fn matvec_q6k(&mut self, w: TensorId, x: TensorId) -> Result<TensorId, IrError> {
         let (sw, dw) = self.shape_dtype(w)?;
         let (sx, dx) = self.shape_dtype(x)?;
@@ -350,6 +478,32 @@ impl Graph {
         ))
     }
 
+    pub fn matvec_q6k_batch(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let cols = sw.0[1];
+        let rows = sw.0[0];
+        if dw != DType::Q6K
+            || dx != DType::F32
+            || sw.rank() != 2
+            || batch == 0
+            || cols % 256 != 0
+            || sx.numel() < batch * cols
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::MatVecQ6KBatch { w, x, batch },
+            Shape(vec![batch * rows]),
+            DType::F32,
+        ))
+    }
+
     pub fn matvec_bf16(&mut self, w: TensorId, x: TensorId) -> Result<TensorId, IrError> {
         let (sw, dw) = self.shape_dtype(w)?;
         let (sx, dx) = self.shape_dtype(x)?;
@@ -364,6 +518,31 @@ impl Graph {
         Ok(self.push(
             Op::MatVecBF16 { w, x },
             Shape(vec![sw.0[0]]),
+            DType::F32,
+        ))
+    }
+
+    pub fn matvec_bf16_batch(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let cols = sw.0[1];
+        let rows = sw.0[0];
+        if dw != DType::BF16
+            || dx != DType::F32
+            || sw.rank() != 2
+            || batch == 0
+            || sx.numel() < batch * cols
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::MatVecBF16Batch { w, x, batch },
+            Shape(vec![batch * rows]),
             DType::F32,
         ))
     }
@@ -391,6 +570,41 @@ impl Graph {
         Ok(self.push(
             Op::MatVecQ4KGateUpGelu { gate, up, x },
             Shape(vec![sg.0[0]]),
+            DType::F32,
+        ))
+    }
+
+    pub fn matvec_q4k_gate_up_gelu_batch(
+        &mut self,
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sg, dg) = self.shape_dtype(gate)?;
+        let (su, du) = self.shape_dtype(up)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let cols = sg.0[1];
+        let rows = sg.0[0];
+        if dg != DType::Q4K
+            || du != DType::Q4K
+            || dx != DType::F32
+            || sg != su
+            || sg.rank() != 2
+            || batch == 0
+            || cols % 256 != 0
+            || sx.numel() < batch * cols
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::MatVecQ4KGateUpGeluBatch {
+                gate,
+                up,
+                x,
+                batch,
+            },
+            Shape(vec![batch * rows]),
             DType::F32,
         ))
     }
@@ -534,6 +748,38 @@ impl Graph {
         Ok(self.push(Op::RmsNorm { x, w, eps }, sx, dx))
     }
 
+    pub fn rmsnorm_batch(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sw, dw) = self.shape_dtype(w)?;
+        if dx != DType::F32
+            || dw != DType::F32
+            || n == 0
+            || batch == 0
+            || sw.numel() < n
+            || sx.numel() < batch * n
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::RmsNormBatch {
+                x,
+                w,
+                n,
+                batch,
+                eps,
+            },
+            Shape(vec![batch * n]),
+            DType::F32,
+        ))
+    }
+
     pub fn inv_rms(&mut self, x: TensorId, eps: f32) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
         if dx != DType::F32 || sx.rank() != 1 {
@@ -567,6 +813,43 @@ impl Graph {
         ))
     }
 
+    pub fn rmsnorm_add_batch(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sr, dr) = self.shape_dtype(residual)?;
+        if dx != DType::F32
+            || dw != DType::F32
+            || dr != DType::F32
+            || n == 0
+            || batch == 0
+            || sw.numel() < n
+            || sx.numel() < batch * n
+            || sr.numel() < batch * n
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::RmsNormAddBatch {
+                x,
+                w,
+                residual,
+                n,
+                batch,
+                eps,
+            },
+            Shape(vec![batch * n]),
+            DType::F32,
+        ))
+    }
+
     pub fn rmsnorm_add_scale(
         &mut self,
         x: TensorId,
@@ -591,6 +874,45 @@ impl Graph {
             },
             sx,
             dx,
+        ))
+    }
+
+    pub fn rmsnorm_add_scale_batch(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        n: usize,
+        batch: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sr, dr) = self.shape_dtype(residual)?;
+        if dx != DType::F32
+            || dw != DType::F32
+            || dr != DType::F32
+            || n == 0
+            || batch == 0
+            || sw.numel() < n
+            || sx.numel() < batch * n
+            || sr.numel() < batch * n
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::RmsNormAddScaleBatch {
+                x,
+                w,
+                residual,
+                n,
+                batch,
+                eps,
+                scale,
+            },
+            Shape(vec![batch * n]),
+            DType::F32,
         ))
     }
 
@@ -652,6 +974,39 @@ impl Graph {
             },
             sx,
             dx,
+        ))
+    }
+
+    pub fn rope_batch(
+        &mut self,
+        x: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sc, dc) = self.shape_dtype(cos_sin)?;
+        if dx != DType::F32
+            || dc != DType::F32
+            || n_heads == 0
+            || hd == 0
+            || batch == 0
+            || sx.numel() < batch * n_heads * hd
+            || sc.numel() < batch * hd
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::RopeBatch {
+                x,
+                cos_sin,
+                n_heads,
+                hd,
+                batch,
+            },
+            Shape(vec![batch * n_heads * hd]),
+            DType::F32,
         ))
     }
 
@@ -950,6 +1305,41 @@ impl Graph {
                 pos,
                 hd,
                 max_t,
+            },
+            Shape(vec![max_t * hd]),
+            DType::Q40,
+        ))
+    }
+
+    /// Quantize `src[B*hd]` rows at `start_pos .. start_pos+B-1`.
+    pub fn kv_append_q4_batch(
+        &mut self,
+        src: TensorId,
+        start_pos: TensorId,
+        hd: usize,
+        max_t: usize,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (ss, ds) = self.shape_dtype(src)?;
+        let (sp, dp) = self.shape_dtype(start_pos)?;
+        if ds != DType::F32
+            || dp != DType::F32
+            || batch == 0
+            || ss.numel() < batch * hd
+            || sp.numel() < 1
+            || hd == 0
+            || hd % 32 != 0
+            || max_t == 0
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(
+            Op::KvAppendQ4Batch {
+                src,
+                start_pos,
+                hd,
+                max_t,
+                batch,
             },
             Shape(vec![max_t * hd]),
             DType::Q40,

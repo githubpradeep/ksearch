@@ -13,9 +13,13 @@ Does **not** ship hand FlashAttention / Q4 fusion farms as the product.
 ## Quick start
 
 ```bash
-cargo run -p ksearch_cli --release -- elem-add
-cargo run -p ksearch_cli --release -- matvec --beam
+cargo run -p ksearch_cli --release -- bench
+cargo run -p ksearch_cli --release -- generate \
+  --gguf ~/models/gemma-4-e2b/gemma-4-E2B-it-Q4_K_M.gguf \
+  --prompt "Hi" --n-predict 32 --max-seq 64
 ```
+
+`bench` prints Hi pass/fail plus prefill/decode tok/s for Hi and the essay prompt.
 
 ## References
 
