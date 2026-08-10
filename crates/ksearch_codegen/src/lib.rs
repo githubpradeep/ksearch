@@ -2,6 +2,7 @@
 
 mod beam;
 pub mod layer;
+mod plan_cache;
 mod render;
 mod rewrite;
 mod schedule;
@@ -10,6 +11,7 @@ pub use beam::{
     beam_cache_dir, beam_cache_key, beam_matvec_candidates, beam_matvec_q4k_candidates,
     load_beam_cache, save_beam_cache, BeamCacheEntry, BeamSearchResult,
 };
+pub use plan_cache::{load_plan, plan_cache_dir, plan_key, save_plan};
 pub use render::render_msl;
 pub use rewrite::{matvec_weight_dtype, rewrite_region, validate_q4_matvec_pattern};
 pub use schedule::{is_primitive_region, lower_kernel, schedule};
@@ -31,7 +33,6 @@ pub enum CodegenError {
 pub struct MetalKernelSource {
     pub name: String,
     pub source: String,
-    /// Number of input buffers (binding 0..n-1), output at binding n.
     pub n_inputs: usize,
     pub out_shape: Shape,
     pub out_dtype: DType,
@@ -42,11 +43,8 @@ pub struct MetalKernelSource {
 pub enum LaunchHint {
     Elementwise { n: usize },
     Rows { rows: usize, cols: usize },
-    /// One threadgroup per row; `tg` threads cooperate on that row (matvec reduce).
     RowsParallel { rows: usize, tg: u64 },
-    /// 2D grid: `rows` × `batch` threadgroups (batch matvecs).
     RowsParallel2D { rows: usize, batch: usize, tg: u64 },
-    /// llama.cpp mul_mm: grid `(tg_x, tg_y)`, threads `(tw, nsg)`, shared `smem` bytes.
     MulMm {
         tg_x: u64,
         tg_y: u64,
@@ -56,7 +54,7 @@ pub enum LaunchHint {
     },
 }
 
-/// Lower Graph region via schedule → Kernel IR → MSL (default OptSchedule).
+/// Lower Graph region via schedule → Kernel IR → MSL (default OptSchedule / plan cache).
 pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource, CodegenError> {
     if !is_primitive_region(graph, out)? {
         return Err(CodegenError::Msg(format!(
@@ -64,14 +62,30 @@ pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource,
             graph.node(out)?.op
         )));
     }
-    let sched = match matvec_weight_dtype(graph, out)? {
-        Some(DType::Q4K) => OptSchedule::q4k_default(),
-        _ => OptSchedule::default(),
+    let chip = std::env::var("KSEARCH_CHIP").unwrap_or_else(|_| "default".into());
+    let sched = if let Some(DType::Q4K) = matvec_weight_dtype(graph, out)? {
+        load_plan("matvec_q4k", &matvec_dims(graph, out)?, &chip)
+            .unwrap_or_else(OptSchedule::q4k_default)
+    } else if matvec_weight_dtype(graph, out)?.is_some() {
+        load_plan("matvec_f32", &matvec_dims(graph, out)?, &chip)
+            .unwrap_or_default()
+    } else {
+        OptSchedule::default()
     };
     lower_with_schedule(graph, out, sched)
 }
 
-/// Graph → schedule → Kernel IR → MSL with an explicit OptSchedule (BEAM uses this).
+fn matvec_dims(graph: &Graph, out: TensorId) -> Result<Vec<usize>, CodegenError> {
+    let node = graph.node(out)?;
+    if let Op::SumReduce { inp, .. } = &node.op {
+        if let Op::MulBroadcastRow { left, .. } = &graph.node(*inp)?.op {
+            let sh = graph.shape_dtype(*left)?.0;
+            return Ok(vec![sh.0[0], sh.0[1]]);
+        }
+    }
+    Ok(vec![out.0 as usize])
+}
+
 pub fn lower_with_schedule(
     graph: &Graph,
     out: TensorId,
@@ -86,7 +100,6 @@ pub fn lower_with_schedule(
     render_msl(&kir, sched)
 }
 
-/// Deprecated stub name kept for CLI until callers switch to [`beam_matvec_candidates`].
 pub fn beam_tg_candidates(rows: usize) -> Vec<u64> {
     let _ = rows;
     beam_matvec_candidates()
@@ -97,7 +110,6 @@ pub fn beam_tg_candidates(rows: usize) -> Vec<u64> {
         .collect()
 }
 
-/// Run BEAM over OptSchedules; `time_ms` should compile+time one candidate (caller owns Metal).
 pub fn beam_search_matvec<F>(
     graph: &Graph,
     out: TensorId,

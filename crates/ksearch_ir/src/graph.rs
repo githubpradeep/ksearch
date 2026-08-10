@@ -1,11 +1,11 @@
-//! Tinygrad-shaped Graph: primitives only (ALU + movement + reduce).
+//! Tinygrad-shaped Graph: primitives + CALL regions; sugar expands / hints fusion.
 
-use crate::{DType, IrError, Shape, TensorId};
+use crate::{DType, FuseHint, IrError, Shape, TensorId};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub enum Op {
     Input { shape: Shape, dtype: DType },
-    /// Tinygrad-style CONST leaf (broadcastable scalar / filled tensor).
     Const { value: f32, shape: Shape, dtype: DType },
     Add { a: TensorId, b: TensorId },
     Mul { a: TensorId, b: TensorId },
@@ -15,8 +15,9 @@ pub enum Op {
     Exp { x: TensorId },
     SumReduce { inp: TensorId, axis: usize },
     MaxReduce { inp: TensorId, axis: usize },
-    /// Tinygrad EXPAND: broadcast `inp` to `shape` (numel must divide).
     Expand { inp: TensorId, shape: Shape },
+    Reshape { inp: TensorId, shape: Shape },
+    Permute { inp: TensorId, axes: Vec<usize> },
     MulBroadcastRow { left: TensorId, row: TensorId },
     CopySlice {
         src: TensorId,
@@ -24,16 +25,8 @@ pub enum Op {
         dst_off: usize,
         n: usize,
     },
-    /// Composed SDPA sugar materialized as one scheduled kernel (Q@Kᵀ→softmax→@V).
-    SdpaNaive {
-        q: TensorId,
-        k: TensorId,
-        v: TensorId,
-        meta: TensorId,
-        n_q: usize,
-        hd: usize,
-        max_t: usize,
-    },
+    /// Tinygrad-like CALL: one scheduled kernel over `inputs` (algorithm via [`FuseHint`]).
+    Call { inputs: Vec<TensorId> },
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +39,8 @@ pub struct Node {
 #[derive(Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
+    /// Sugar / scheduler fusion hints keyed by output tensor id.
+    pub fuse_hints: HashMap<u32, FuseHint>,
 }
 
 impl Graph {
@@ -57,6 +52,14 @@ impl Graph {
         let id = TensorId(self.nodes.len() as u32);
         self.nodes.push(Node { op, shape, dtype });
         id
+    }
+
+    pub fn hint(&mut self, id: TensorId, hint: FuseHint) {
+        self.fuse_hints.insert(id.0, hint);
+    }
+
+    pub fn fuse_hint(&self, id: TensorId) -> Option<&FuseHint> {
+        self.fuse_hints.get(&id.0)
     }
 
     pub fn input(&mut self, shape: Shape, dtype: DType) -> TensorId {
@@ -73,6 +76,18 @@ impl Graph {
             shape,
             DType::F32,
         )
+    }
+
+    pub fn call(
+        &mut self,
+        inputs: Vec<TensorId>,
+        shape: Shape,
+        dtype: DType,
+        hint: FuseHint,
+    ) -> TensorId {
+        let id = self.push(Op::Call { inputs }, shape, dtype);
+        self.hint(id, hint);
+        id
     }
 
     pub fn shape_dtype(&self, id: TensorId) -> Result<(Shape, DType), IrError> {
@@ -181,6 +196,31 @@ impl Graph {
         Ok(self.push(Op::Expand { inp, shape: shape.clone() }, shape, d))
     }
 
+    pub fn reshape(&mut self, inp: TensorId, shape: Shape) -> Result<TensorId, IrError> {
+        let (s, d) = self.shape_dtype(inp)?;
+        if s.numel() != shape.numel() {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.push(Op::Reshape { inp, shape: shape.clone() }, shape, d))
+    }
+
+    pub fn permute(&mut self, inp: TensorId, axes: Vec<usize>) -> Result<TensorId, IrError> {
+        let (s, d) = self.shape_dtype(inp)?;
+        if axes.len() != s.rank() {
+            return Err(IrError::ShapeMismatch);
+        }
+        let mut seen = vec![false; axes.len()];
+        let mut out = Vec::with_capacity(axes.len());
+        for &a in &axes {
+            if a >= s.rank() || seen[a] {
+                return Err(IrError::ShapeMismatch);
+            }
+            seen[a] = true;
+            out.push(s.0[a]);
+        }
+        Ok(self.push(Op::Permute { inp, axes }, Shape(out), d))
+    }
+
     pub fn copy_slice(
         &mut self,
         src: TensorId,
@@ -201,6 +241,166 @@ impl Graph {
         ))
     }
 
+    pub fn square(&mut self, x: TensorId) -> Result<TensorId, IrError> {
+        self.mul(x, x)
+    }
+
+    pub fn softcap(&mut self, x: TensorId, cap: f32) -> Result<TensorId, IrError> {
+        let scaled = self.scale_const(x, 1.0 / cap)?;
+        let t = self.tanh(scaled)?;
+        self.scale_const(t, cap)
+    }
+
+    pub fn gelu_tanh(&mut self, x: TensorId) -> Result<TensorId, IrError> {
+        let (s, _) = self.shape_dtype(x)?;
+        let x2 = self.mul(x, x)?;
+        let x3 = self.mul(x2, x)?;
+        let c044 = self.scale_const(x3, 0.044715)?;
+        let inner = self.add(x, c044)?;
+        let u = self.scale_const(inner, 0.79788456)?;
+        let t = self.tanh(u)?;
+        let one = self.const_f32(1.0, s);
+        let one_plus = self.add(one, t)?;
+        let half_x = self.scale_const(x, 0.5)?;
+        self.mul(half_x, one_plus)
+    }
+
+    /// Tinygrad RMSNorm expand + fuse hint for one-kernel schedule.
+    pub fn rmsnorm_expand(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sw, dw) = self.shape_dtype(w)?;
+        if sx != sw || dx != DType::F32 || dw != DType::F32 || sx.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let n = sx.0[0];
+        let sq = self.square(x)?;
+        let sum = self.sum_reduce(sq, 0)?;
+        let mean = self.scale_const(sum, 1.0 / n as f32)?;
+        let eps_t = self.const_f32(eps, Shape(vec![1]));
+        let mean_eps = self.add(mean, eps_t)?;
+        let inv = self.rsqrt(mean_eps)?;
+        let inv_b = self.expand(inv, sx.clone())?;
+        let xn = self.mul(x, inv_b)?;
+        let out = self.mul(xn, w)?;
+        self.hint(
+            out,
+            FuseHint::RmsNorm {
+                n,
+                eps,
+                x,
+                w,
+            },
+        );
+        Ok(out)
+    }
+
+    pub fn rmsnorm_add_expand(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let yn = self.rmsnorm_expand(x, w, eps)?;
+        let out = self.add(yn, residual)?;
+        let n = self.shape_dtype(x)?.0.numel();
+        self.hint(
+            out,
+            FuseHint::RmsNormAdd {
+                n,
+                eps,
+                x,
+                w,
+                residual,
+            },
+        );
+        Ok(out)
+    }
+
+    pub fn rmsnorm_add_scale_expand(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        eps: f32,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let added = self.rmsnorm_add_expand(x, w, residual, eps)?;
+        let out = self.scale_const(added, scale)?;
+        let n = self.shape_dtype(x)?.0.numel();
+        self.hint(
+            out,
+            FuseHint::RmsNormAddScale {
+                n,
+                eps,
+                scale,
+                x,
+                w,
+                residual,
+            },
+        );
+        Ok(out)
+    }
+
+    /// Per-head RMSNorm as CALL (movement+reduce fused by schedule).
+    pub fn rmsnorm_per_head(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if dx != DType::F32 || sx.numel() != n_heads * hd {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w],
+            Shape(vec![n_heads * hd]),
+            DType::F32,
+            FuseHint::RmsNormPerHead {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                x,
+                w,
+            },
+        ))
+    }
+
+    pub fn rope(
+        &mut self,
+        x: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if dx != DType::F32 || sx.numel() != n_heads * hd {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, cos_sin],
+            Shape(vec![n_heads * hd]),
+            DType::F32,
+            FuseHint::Rope {
+                n_heads,
+                hd,
+                x,
+                cos_sin,
+            },
+        ))
+    }
+
+    /// SDPA sugar → CALL (Q@Kᵀ→softmax→@V fused by schedule; not a Graph catalog Op).
     pub fn sdpa_naive(
         &mut self,
         q: TensorId,
@@ -224,73 +424,22 @@ impl Graph {
         {
             return Err(IrError::ShapeMismatch);
         }
-        Ok(self.push(
-            Op::SdpaNaive {
+        Ok(self.call(
+            vec![q, k, v, meta],
+            Shape(vec![n_q * hd]),
+            DType::F32,
+            FuseHint::SdpaNaive {
+                n_q,
+                hd,
+                max_t,
                 q,
                 k,
                 v,
                 meta,
-                n_q,
-                hd,
-                max_t,
             },
-            Shape(vec![n_q * hd]),
-            DType::F32,
         ))
     }
 
-    /// Tinygrad `x.square()`.
-    pub fn square(&mut self, x: TensorId) -> Result<TensorId, IrError> {
-        self.mul(x, x)
-    }
-
-    /// Tinygrad softcap sugar: `cap * tanh(x / cap)`.
-    pub fn softcap(&mut self, x: TensorId, cap: f32) -> Result<TensorId, IrError> {
-        let scaled = self.scale_const(x, 1.0 / cap)?;
-        let t = self.tanh(scaled)?;
-        self.scale_const(t, cap)
-    }
-
-    /// Tinygrad gelu (tanh approx): `0.5 * x * (1 + tanh(0.79788456 * (x + 0.044715 * x^3)))`.
-    pub fn gelu_tanh(&mut self, x: TensorId) -> Result<TensorId, IrError> {
-        let (s, _) = self.shape_dtype(x)?;
-        let x2 = self.mul(x, x)?;
-        let x3 = self.mul(x2, x)?;
-        let c044 = self.scale_const(x3, 0.044715)?;
-        let inner = self.add(x, c044)?;
-        let u = self.scale_const(inner, 0.79788456)?;
-        let t = self.tanh(u)?;
-        let one = self.const_f32(1.0, s);
-        let one_plus = self.add(one, t)?;
-        let half_x = self.scale_const(x, 0.5)?;
-        self.mul(half_x, one_plus)
-    }
-
-    /// Tinygrad `nn.RMSNorm`: `x * rsqrt(mean(x^2)+eps) * weight` (rank-1).
-    pub fn rmsnorm_expand(
-        &mut self,
-        x: TensorId,
-        w: TensorId,
-        eps: f32,
-    ) -> Result<TensorId, IrError> {
-        let (sx, dx) = self.shape_dtype(x)?;
-        let (sw, dw) = self.shape_dtype(w)?;
-        if sx != sw || dx != DType::F32 || dw != DType::F32 || sx.rank() != 1 {
-            return Err(IrError::ShapeMismatch);
-        }
-        let n = sx.0[0];
-        let sq = self.square(x)?;
-        let sum = self.sum_reduce(sq, 0)?;
-        let mean = self.scale_const(sum, 1.0 / n as f32)?;
-        let eps_t = self.const_f32(eps, Shape(vec![1]));
-        let mean_eps = self.add(mean, eps_t)?;
-        let inv = self.rsqrt(mean_eps)?;
-        let inv_b = self.expand(inv, sx.clone())?;
-        let xn = self.mul(x, inv_b)?;
-        self.mul(xn, w)
-    }
-
-    /// `gelu(gate) * up[up_off .. up_off+n]` (tinygrad-style expand + slice).
     pub fn gelu_mul_at(
         &mut self,
         gate: TensorId,
@@ -308,6 +457,30 @@ impl Graph {
         }
         let g = self.gelu_tanh(gate)?;
         let up_s = self.copy_slice(up, up_off, 0, n)?;
-        self.mul(g, up_s)
+        let out = self.mul(g, up_s)?;
+        self.hint(
+            out,
+            FuseHint::GeluMul {
+                n,
+                up_off,
+                gate,
+                up,
+            },
+        );
+        Ok(out)
+    }
+
+    pub fn softcap_argmax(&mut self, x: TensorId, cap: f32) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if dx != DType::F32 || sx.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let n = sx.0[0];
+        Ok(self.call(
+            vec![x],
+            Shape(vec![1]),
+            DType::F32,
+            FuseHint::SoftcapArgmax { n, cap, x },
+        ))
     }
 }

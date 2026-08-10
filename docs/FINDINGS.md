@@ -112,9 +112,10 @@ See [DESIGN.md](./DESIGN.md).
 
 Locked IR study against local `reference/tinygrad` UOp model:
 
-- Graph product = ALU + movement + REDUCE (+ load/store), matching `GroupOp` / `Ops`.
-- Sugar (`rmsnorm_expand`, `gelu_tanh`, `softcap`, `matvec_prim`, `sdpa_naive`) expands like tinygrad nn/Tensor mixins.
-- BEAM = OptOps tilings (`OptSchedule`); Q4_K = dtype fusion at matvec render.
-- **Removed:** `debt/` fused catalog, `GemmaModel`, `KSEARCH_DEBT`. Only `GemmaPrimModel` remains.
+- Graph product = ALU + movement + REDUCE (+ `Call`); sugar expands + `FuseHint`
+- Scheduler invents kernel boundaries from hints / matvec / elemwise
+- BEAM + `plan_cache` for OptSchedules; Q4_K = dtype fusion at matvec render
+- Eng builds **only** Graphs → `lower_to_metal` (no KirBody shortcuts)
+- **Removed:** `debt/` fused catalog, `GemmaModel`, `KSEARCH_DEBT`, `Op::SdpaNaive`
 
-Risk accepted: more launches until schedule fusion matches tinygrad’s CALL fusion; correctness (Hi) before tok/s.
+Architecture path is wired. Remaining gap vs oracle is **tok/s / B≥1 serving polish**, not IR shape.

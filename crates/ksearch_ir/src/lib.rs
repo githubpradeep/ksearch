@@ -4,7 +4,9 @@ mod graph;
 mod kernel;
 
 pub use graph::*;
-pub use kernel::*;
+pub use kernel::{
+    BufId, ElemExpr, FuseHint, KernelIr, KernelKind, KirBody, OptSchedule, ScheduledKernel, ValId,
+};
 
 use std::fmt;
 

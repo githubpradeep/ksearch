@@ -1,5 +1,5 @@
-//! Thesis A Gemma path: Q4_K weights as dtype (Kernel IR fusion), F32 KV, naive SDPA.
-//! Projections use `matvec_prim`; layer sugar (rmsnorm/rope/gelu) schedules to KirBody fusion.
+//! Thesis A Gemma path: Graph sugar → schedule FuseHint → Kernel IR → MSL.
+//! Q4_K weights as dtype; F32 KV; naive SDPA CALL fusion.
 
 use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
 use anyhow::{anyhow, bail, Result};

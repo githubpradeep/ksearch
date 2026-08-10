@@ -60,20 +60,19 @@ There is **no** `Ops.MATMUL`, `Ops.RMSNORM`, `Ops.FLASH_ATTN`, `Ops.GELU` in tin
 
 ```
 GGUF / tensors
-    → Frontend builds Graph (primitive ops + sugar expand)
-    → Scheduler: kernel boundaries (fuse vs materialize)
-    → Per-kernel: Kernel IR → BEAM OptSchedule → render MSL → MTLLibrary
-    → Plan cache (model hash + chip + dim bucket)
-    → Runtime execute (KvPool for serving)
+    → Frontend builds Graph (primitive ops + sugar expand + FuseHint)
+    → Scheduler: invents CALL/kernel boundaries (hints + matvec/elemwise patterns)
+    → Per-kernel: Kernel IR → OptSchedule (plan cache / BEAM) → render MSL → MTLLibrary
+    → Runtime Eng execute (GemmaPrimModel + KvPool)
 ```
 
 | Layer | Role |
 |-------|------|
-| **Graph IR** | Primitives only (ALU / movement / reduce / load) |
-| **Kernel IR** | Scheduled body (`KirBody`); layer sugar may fuse to one region |
-| **Search** | OptOps-like discrete schedules; time on device; disk cache |
-| **Renderer** | Kernel IR → MSL string |
-| **Runtime** | Buffers, CB encode (`GemmaPrimModel` + `Eng`) |
+| **Graph IR** | Primitives (`Add`/`Mul`/`Reduce`/`Expand`/`Reshape`/`Permute`/…) + `Call` |
+| **FuseHint** | Sugar metadata so scheduler invents fused `KirBody` (not Graph catalog Ops) |
+| **Kernel IR** | Scheduled body; BEAM/plan cache picks `OptSchedule` |
+| **Renderer** | Kernel IR → MSL |
+| **Runtime** | `GemmaPrimModel` + `Eng` (Graph→lower only) |
 
 ---
 
@@ -81,24 +80,25 @@ GGUF / tensors
 
 | Topic | Stance |
 |-------|--------|
-| **Attention** | Naive SDPA (`SdpaNaive`) = matmul+softmax composed; no flash catalog |
-| **Quant** | Q4_K as IR **dtype**; fused dequant+matvec at render under BEAM |
-| **Serving** | `KvPool::new_f32`; chunked prefill in `generate_timed` |
+| **Attention** | SDPA sugar → `Call` + `FuseHint::SdpaNaive` (Q@Kᵀ→softmax→@V fused at schedule) |
+| **Quant** | Q4_K as IR **dtype**; fused dequant+matvec at render; plan cache for schedules |
+| **Serving** | `KvPool::new_f32`; chunked prefill; B≥1 pool types ready |
 
 ---
 
 ## Success metrics
 
-| Gate | Metric |
-|------|--------|
-| P0 | Generated Metal kernel from IR runs |
-| P1 | BEAM improves dense matvec over untuned |
-| P2 | `"Hi"` → text contains `Hi!` and `help` on GemmaPrim |
-| P3 | Schedule rewrites / sugar fusion (not catalog Ops) |
-| P4 | Q4_K dtype fusion; no debt Eng |
-| Product | KvPool / B≥1; never claim “discovered FA” |
+| Gate | Metric | Status |
+|------|--------|--------|
+| P0 | Generated Metal kernel from IR runs | ✅ |
+| P1 | BEAM improves dense matvec over untuned | ✅ |
+| P2 | `"Hi"` → `Hi!` + `help` on GemmaPrim | ✅ |
+| P3 | Sugar expand + schedule FuseHint fusion | ✅ |
+| P4 | Q4_K dtype fusion; no debt Eng | ✅ |
+| Arch | Eng = Graph→schedule only; no `Op::SdpaNaive` catalog | ✅ |
+| Product | KvPool / B≥1 decode speed vs oracle | open (scoreboard; not blocking IR) |
 
-Hand MSL is **not** architecture. Layer `KirBody` fusion is scheduled sugar (tinygrad CALL regions), not a Graph `Op` zoo.
+Hand MSL is **not** architecture. `KirBody` fusion is scheduled sugar (tinygrad CALL), not a Graph `Op` zoo.
 
 ---
 
@@ -107,10 +107,10 @@ Hand MSL is **not** architecture. Layer `KirBody` fusion is scheduled sugar (tin
 ```
 ksearch/
   crates/
-    ksearch_ir/              # Graph primitives + Kernel IR + OptSchedule
-    ksearch_codegen/         # schedule, rewrite, BEAM, render, layer Kir builders
+    ksearch_ir/              # Graph primitives + FuseHint + Kernel IR + OptSchedule
+    ksearch_codegen/         # schedule, rewrite, BEAM, plan_cache, render, layer
     ksearch_metal/           # device, compile, buffers, launch
-    ksearch_kernels/         # Eng (Thesis A methods only)
+    ksearch_kernels/         # Eng (Graph → lower_to_metal only)
     ksearch_gguf/            # mmap loader
     ksearch_gemma/           # GemmaPrimModel only
     ksearch_cli/             # benches + generate
@@ -127,10 +127,13 @@ ksearch/
 | **P0** | Graph → schedule → Kernel IR → MSL | ✅ |
 | **P1** | OptOp BEAM + disk cache | ✅ |
 | **P2** | GemmaPrim `"Hi"` gate | ✅ |
-| **P3** | Schedule rewrites / sugar expand | ✅ |
-| **P4** | Q4_K dtype fusion; **debt deleted** | ✅ |
+| **P3** | Sugar expand + FuseHint schedule fusion | ✅ |
+| **P4** | Q4_K dtype fusion; debt deleted | ✅ |
 | **P5** | KvPool + chunked prefill | ✅ |
-| **Purge** | Tinygrad-only IR; no `GemmaModel` / `debt/` | ✅ |
+| **Purge** | Tinygrad-shaped IR; no `GemmaModel` / `debt/` | ✅ |
+| **Arch wire** | Eng Graph-only; `Call`+hints; Reshape/Permute; plan_cache | ✅ |
+
+**Still scoreboard work (not IR gaps):** push decode/prefill tok/s toward oracle via more BEAM + fusion legality — without reintroducing catalog Ops.
 
 ---
 

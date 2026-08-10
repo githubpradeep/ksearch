@@ -1,35 +1,23 @@
-//! Scheduled fusion builders: tinygrad sugar → Kernel IR (not Graph catalog Ops).
-//!
-//! RMSNorm / GeLU / RoPE / softcap are composed of ALU+reduce in sugar; these helpers
-//! emit the **fused** Kernel IR region the scheduler would invent (one launch).
+//! Layer sugar helpers: build Graph + FuseHint → schedule → MSL (same path as Eng).
 
-use crate::{render_msl, CodegenError, MetalKernelSource};
-use ksearch_ir::{DType, KirBody, KernelIr, OptSchedule, Shape};
+use crate::{lower_to_metal, CodegenError, MetalKernelSource};
+use ksearch_ir::{DType, Graph, Shape};
 
 pub fn render_rmsnorm(n: usize, eps: f32) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_rmsnorm_{n}"),
-            n_inputs: 2,
-            out_shape: Shape(vec![n]),
-            out_dtype: DType::F32,
-            body: KirBody::RmsNorm { n, eps },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![n]), DType::F32);
+    let w = g.input(Shape(vec![n]), DType::F32);
+    let out = g.rmsnorm_expand(x, w, eps)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_rmsnorm_add(n: usize, eps: f32) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_rms_add_{n}"),
-            n_inputs: 3,
-            out_shape: Shape(vec![n]),
-            out_dtype: DType::F32,
-            body: KirBody::RmsNormAdd { n, eps },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![n]), DType::F32);
+    let w = g.input(Shape(vec![n]), DType::F32);
+    let r = g.input(Shape(vec![n]), DType::F32);
+    let out = g.rmsnorm_add_expand(x, w, r, eps)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_rmsnorm_add_scale(
@@ -37,16 +25,12 @@ pub fn render_rmsnorm_add_scale(
     eps: f32,
     scale: f32,
 ) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_rms_add_sc_{n}"),
-            n_inputs: 3,
-            out_shape: Shape(vec![n]),
-            out_dtype: DType::F32,
-            body: KirBody::RmsNormAddScale { n, eps, scale },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![n]), DType::F32);
+    let w = g.input(Shape(vec![n]), DType::F32);
+    let r = g.input(Shape(vec![n]), DType::F32);
+    let out = g.rmsnorm_add_scale_expand(x, w, r, eps, scale)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_rmsnorm_per_head(
@@ -55,47 +39,27 @@ pub fn render_rmsnorm_per_head(
     eps: f32,
     with_weight: bool,
 ) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_rms_ph_{n_heads}_{hd}_{}", with_weight as u8),
-            n_inputs: 2,
-            out_shape: Shape(vec![n_heads * hd]),
-            out_dtype: DType::F32,
-            body: KirBody::RmsNormPerHead {
-                n_heads,
-                hd,
-                eps,
-                with_weight,
-            },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![n_heads * hd]), DType::F32);
+    let w = g.input(Shape(vec![hd]), DType::F32);
+    let out = g.rmsnorm_per_head(x, w, n_heads, hd, eps, with_weight)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_rope(n_heads: usize, hd: usize) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_rope_{n_heads}_{hd}"),
-            n_inputs: 2,
-            out_shape: Shape(vec![n_heads * hd]),
-            out_dtype: DType::F32,
-            body: KirBody::Rope { n_heads, hd },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![n_heads * hd]), DType::F32);
+    let c = g.input(Shape(vec![hd]), DType::F32);
+    let out = g.rope(x, c, n_heads, hd)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_gelu_mul(n: usize, up_off: usize) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_gelu_mul_{n}_{up_off}"),
-            n_inputs: 2,
-            out_shape: Shape(vec![n]),
-            out_dtype: DType::F32,
-            body: KirBody::GeluMul { n, up_off },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let gate = g.input(Shape(vec![n]), DType::F32);
+    let up = g.input(Shape(vec![up_off + n]), DType::F32);
+    let out = g.gelu_mul_at(gate, up, up_off)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_copy_slice(
@@ -103,31 +67,15 @@ pub fn render_copy_slice(
     dst_off: usize,
     n: usize,
 ) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_copy_slice_{n}_{src_off}_{dst_off}"),
-            n_inputs: 1,
-            out_shape: Shape(vec![n]),
-            out_dtype: DType::F32,
-            body: KirBody::CopySlice {
-                src_off,
-                dst_off,
-                n,
-            },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![src_off + n]), DType::F32);
+    let out = g.copy_slice(x, src_off, dst_off, n)?;
+    lower_to_metal(&g, out)
 }
 
 pub fn render_softcap_argmax(n: usize, cap: f32) -> Result<MetalKernelSource, CodegenError> {
-    render_msl(
-        &KernelIr {
-            name: format!("k_sca_{n}"),
-            n_inputs: 1,
-            out_shape: Shape(vec![1]),
-            out_dtype: DType::F32,
-            body: KirBody::SoftcapArgmax { n, cap },
-        },
-        OptSchedule::default(),
-    )
+    let mut g = Graph::new();
+    let x = g.input(Shape(vec![n]), DType::F32);
+    let out = g.softcap_argmax(x, cap)?;
+    lower_to_metal(&g, out)
 }

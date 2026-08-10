@@ -1,11 +1,13 @@
-//! Naive Graph → ScheduledKernel for Thesis A primitives + sugar fusion.
+//! Graph → ScheduledKernel: invent CALL/kernel boundaries from primitives + FuseHint.
 
 use crate::rewrite;
 use crate::CodegenError;
-use ksearch_ir::{ElemExpr, Graph, KernelKind, Op, ScheduledKernel, TensorId};
+use ksearch_ir::{ElemExpr, FuseHint, Graph, KernelKind, Op, ScheduledKernel, TensorId};
 
-/// True if `out` is a clean-path primitive / sugar region (no catalog ops).
 pub fn is_primitive_region(graph: &Graph, out: TensorId) -> Result<bool, CodegenError> {
+    if graph.fuse_hint(out).is_some() {
+        return Ok(true);
+    }
     let node = graph.node(out)?;
     Ok(matches!(
         &node.op,
@@ -13,7 +15,6 @@ pub fn is_primitive_region(graph: &Graph, out: TensorId) -> Result<bool, Codegen
             | Op::Mul { .. }
             | Op::SumReduce { .. }
             | Op::MulBroadcastRow { .. }
-            | Op::SdpaNaive { .. }
             | Op::ScaleConst { .. }
             | Op::CopySlice { .. }
             | Op::Rsqrt { .. }
@@ -21,16 +22,166 @@ pub fn is_primitive_region(graph: &Graph, out: TensorId) -> Result<bool, Codegen
             | Op::Exp { .. }
             | Op::Const { .. }
             | Op::Expand { .. }
+            | Op::Reshape { .. }
+            | Op::Permute { .. }
             | Op::MaxReduce { .. }
+            | Op::Call { .. }
     ))
 }
 
-/// Schedule one kernel covering `out` (fuse Add/Mul; materialize at SumReduce).
+fn sk_from_hint(out: TensorId, hint: &FuseHint) -> ScheduledKernel {
+    match hint {
+        FuseHint::RmsNorm { n, eps, x, w } => ScheduledKernel {
+            name: format!("k_rmsnorm_{}", out.0),
+            inputs: vec![*x, *w],
+            output: out,
+            kind: KernelKind::RmsNorm {
+                n: *n,
+                eps: *eps,
+                x: *x,
+                w: *w,
+            },
+        },
+        FuseHint::RmsNormAdd {
+            n,
+            eps,
+            x,
+            w,
+            residual,
+        } => ScheduledKernel {
+            name: format!("k_rms_add_{}", out.0),
+            inputs: vec![*x, *w, *residual],
+            output: out,
+            kind: KernelKind::RmsNormAdd {
+                n: *n,
+                eps: *eps,
+                x: *x,
+                w: *w,
+                residual: *residual,
+            },
+        },
+        FuseHint::RmsNormAddScale {
+            n,
+            eps,
+            scale,
+            x,
+            w,
+            residual,
+        } => ScheduledKernel {
+            name: format!("k_rms_add_sc_{}", out.0),
+            inputs: vec![*x, *w, *residual],
+            output: out,
+            kind: KernelKind::RmsNormAddScale {
+                n: *n,
+                eps: *eps,
+                scale: *scale,
+                x: *x,
+                w: *w,
+                residual: *residual,
+            },
+        },
+        FuseHint::RmsNormPerHead {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            x,
+            w,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_{}", out.0),
+            inputs: vec![*x, *w],
+            output: out,
+            kind: KernelKind::RmsNormPerHead {
+                n_heads: *n_heads,
+                hd: *hd,
+                eps: *eps,
+                with_weight: *with_weight,
+                x: *x,
+                w: *w,
+            },
+        },
+        FuseHint::Rope {
+            n_heads,
+            hd,
+            x,
+            cos_sin,
+        } => ScheduledKernel {
+            name: format!("k_rope_{}", out.0),
+            inputs: vec![*x, *cos_sin],
+            output: out,
+            kind: KernelKind::Rope {
+                n_heads: *n_heads,
+                hd: *hd,
+                x: *x,
+                cos_sin: *cos_sin,
+            },
+        },
+        FuseHint::GeluMul {
+            n,
+            up_off,
+            gate,
+            up,
+        } => ScheduledKernel {
+            name: format!("k_gelu_mul_{}", out.0),
+            inputs: vec![*gate, *up],
+            output: out,
+            kind: KernelKind::GeluMul {
+                n: *n,
+                up_off: *up_off,
+                gate: *gate,
+                up: *up,
+            },
+        },
+        FuseHint::SdpaNaive {
+            n_q,
+            hd,
+            max_t,
+            q,
+            k,
+            v,
+            meta,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_naive_{}", out.0),
+            inputs: vec![*q, *k, *v, *meta],
+            output: out,
+            kind: KernelKind::SdpaNaive {
+                n_q: *n_q,
+                hd: *hd,
+                max_t: *max_t,
+                q: *q,
+                k: *k,
+                v: *v,
+                meta: *meta,
+            },
+        },
+        FuseHint::SoftcapArgmax { n, cap, x } => ScheduledKernel {
+            name: format!("k_sca_{}", out.0),
+            inputs: vec![*x],
+            output: out,
+            kind: KernelKind::SoftcapArgmax {
+                n: *n,
+                cap: *cap,
+                x: *x,
+            },
+        },
+    }
+}
+
+/// Schedule one kernel covering `out` (fuse hints / matvec / elemwise / copy).
 pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, CodegenError> {
     let _ = rewrite::validate_q4_matvec_pattern(graph, out)?;
 
+    if let Some(hint) = graph.fuse_hint(out) {
+        return Ok(vec![sk_from_hint(out, hint)]);
+    }
+
     let node = graph.node(out)?;
     let sk = match &node.op {
+        Op::Call { .. } => {
+            return Err(CodegenError::Msg(
+                "schedule: Call without FuseHint".into(),
+            ));
+        }
         Op::ScaleConst { x, scale } => {
             let n = graph.shape_dtype(out)?.0.numel();
             ScheduledKernel {
@@ -43,22 +194,29 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
                 },
             }
         }
-        Op::Add { .. } | Op::Mul { .. } | Op::Tanh { .. } | Op::Rsqrt { .. } | Op::Exp { .. } => {
-            // Multi-op elemwise chains: only Add/Mul/Scale fuse today; unary alone → single load op.
-            if matches!(&node.op, Op::Add { .. } | Op::Mul { .. }) {
-                let mut inputs = Vec::new();
-                let expr = build_elem_expr(graph, out, &mut inputs)?;
-                let n = graph.shape_dtype(out)?.0.numel();
-                ScheduledKernel {
-                    name: format!("k_elem_{}", out.0),
-                    inputs,
-                    output: out,
-                    kind: KernelKind::Elementwise { n, expr },
-                }
-            } else {
-                return Err(CodegenError::Msg(
-                    "schedule: unary ALU without fused ElemExpr yet — use layer KirBody".into(),
-                ));
+        Op::Add { .. } | Op::Mul { .. } => {
+            let mut inputs = Vec::new();
+            let expr = build_elem_expr(graph, out, &mut inputs)?;
+            let n = graph.shape_dtype(out)?.0.numel();
+            ScheduledKernel {
+                name: format!("k_elem_{}", out.0),
+                inputs,
+                output: out,
+                kind: KernelKind::Elementwise { n, expr },
+            }
+        }
+        Op::Reshape { inp, .. } | Op::Permute { inp, .. } | Op::Expand { inp, .. } => {
+            // Movement-only: schedule as identity copy of underlying buffer view via scale 1.
+            // Real views are handled when fused into producers; standalone → copy via Load.
+            let n = graph.shape_dtype(out)?.0.numel();
+            ScheduledKernel {
+                name: format!("k_move_{}", out.0),
+                inputs: vec![*inp],
+                output: out,
+                kind: KernelKind::Elementwise {
+                    n,
+                    expr: ElemExpr::Load(0),
+                },
             }
         }
         Op::SumReduce { inp, axis } => {
@@ -102,28 +260,6 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
                 }
             }
         }
-        Op::SdpaNaive {
-            q,
-            k,
-            v,
-            meta,
-            n_q,
-            hd,
-            max_t,
-        } => ScheduledKernel {
-            name: format!("k_sdpa_naive_{}", out.0),
-            inputs: vec![*q, *k, *v, *meta],
-            output: out,
-            kind: KernelKind::SdpaNaive {
-                n_q: *n_q,
-                hd: *hd,
-                max_t: *max_t,
-                q: *q,
-                k: *k,
-                v: *v,
-                meta: *meta,
-            },
-        },
         Op::CopySlice {
             src,
             src_off,
@@ -149,7 +285,6 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
     Ok(vec![sk])
 }
 
-/// Expand a scheduled kernel into Kernel IR.
 pub fn lower_kernel(
     graph: &Graph,
     sk: &ScheduledKernel,
@@ -202,18 +337,14 @@ pub fn lower_kernel(
             eps: *eps,
             with_weight: *with_weight,
         },
-        KernelKind::Rope { n_heads, hd, .. } => {
-            ksearch_ir::KirBody::Rope {
-                n_heads: *n_heads,
-                hd: *hd,
-            }
-        }
-        KernelKind::GeluMul { n, up_off, .. } => {
-            ksearch_ir::KirBody::GeluMul {
-                n: *n,
-                up_off: *up_off,
-            }
-        }
+        KernelKind::Rope { n_heads, hd, .. } => ksearch_ir::KirBody::Rope {
+            n_heads: *n_heads,
+            hd: *hd,
+        },
+        KernelKind::GeluMul { n, up_off, .. } => ksearch_ir::KirBody::GeluMul {
+            n: *n,
+            up_off: *up_off,
+        },
         KernelKind::CopySlice {
             src_off,
             dst_off,

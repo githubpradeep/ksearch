@@ -1,9 +1,8 @@
-//! Eng: Graph/Kernel IR → render_msl → Metal. Thesis A only (no fused catalog Ops).
+//! Eng: build Graph (primitives + sugar) → lower_to_metal → Metal.
+//! No direct KirBody / catalog Op shortcuts.
 
 use anyhow::Result;
-use ksearch_codegen::{
-    layer, lower_to_metal, MetalKernelSource,
-};
+use ksearch_codegen::{lower_to_metal, LaunchHint, MetalKernelSource};
 use ksearch_ir::{DType, Graph, Shape};
 use ksearch_metal::MetalContext;
 use metal::*;
@@ -33,15 +32,24 @@ impl Eng {
         Ok(())
     }
 
+    fn tg_for(src: &MetalKernelSource) -> u64 {
+        match src.launch {
+            LaunchHint::Elementwise { .. } | LaunchHint::Rows { .. } => 256,
+            LaunchHint::RowsParallel { tg, .. } => tg,
+            LaunchHint::RowsParallel2D { tg, .. } => tg,
+            LaunchHint::MulMm { tw, nsg, .. } => tw * nsg,
+        }
+    }
+
     fn run(
         &self,
         ctx: &MetalContext,
         key: &str,
         inputs: &[&Buffer],
         output: &Buffer,
-        tg: u64,
     ) -> Result<()> {
         let (src, pipe) = self.cache.get(key).expect("ensure first");
+        let tg = Self::tg_for(src);
         ctx.encode(pipe, src, inputs, output, tg)?;
         Ok(())
     }
@@ -54,9 +62,9 @@ impl Eng {
         input_byte_offsets: &[u64],
         output: &Buffer,
         output_byte_offset: u64,
-        tg: u64,
     ) -> Result<()> {
         let (src, pipe) = self.cache.get(key).expect("ensure first");
+        let tg = Self::tg_for(src);
         ctx.encode_offsets(
             pipe,
             src,
@@ -86,10 +94,9 @@ impl Eng {
             let out = g.matvec_prim(w, v)?;
             self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[a, x], y, 32)
+        self.run(ctx, &key, &[a, x], y)
     }
 
-    /// Q4_K weights via `matvec_prim` — dtype fusion at Kernel IR render.
     pub fn matvec_q4k_prim(
         &mut self,
         ctx: &MetalContext,
@@ -123,7 +130,7 @@ impl Eng {
         }
         let xb = (x_off_elems * 4) as u64;
         let yb = (y_off_elems * 4) as u64;
-        self.run_offsets(ctx, &key, &[a, x], &[0, xb], y, yb, 64)
+        self.run_offsets(ctx, &key, &[a, x], &[0, xb], y, yb)
     }
 
     pub fn rmsnorm(
@@ -151,11 +158,15 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("rms_{n}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_rmsnorm(n, eps)?)?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), DType::F32);
+            let wi = g.input(Shape(vec![n]), DType::F32);
+            let out = g.rmsnorm_expand(xi, wi, eps)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
         let xb = (x_off_elems * 4) as u64;
         let yb = (y_off_elems * 4) as u64;
-        self.run_offsets(ctx, &key, &[x, w], &[xb, 0], y, yb, 256)
+        self.run_offsets(ctx, &key, &[x, w], &[xb, 0], y, yb)
     }
 
     pub fn rmsnorm_add(
@@ -170,9 +181,14 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("rms_add_{n}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_rmsnorm_add(n, eps)?)?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), DType::F32);
+            let wi = g.input(Shape(vec![n]), DType::F32);
+            let ri = g.input(Shape(vec![n]), DType::F32);
+            let out = g.rmsnorm_add_expand(xi, wi, ri, eps)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[x, w, residual], y, 256)
+        self.run(ctx, &key, &[x, w, residual], y)
     }
 
     pub fn rmsnorm_add_scale(
@@ -188,9 +204,14 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("rms_add_sc_{n}_{}_{}", eps.to_bits(), scale.to_bits());
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_rmsnorm_add_scale(n, eps, scale)?)?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), DType::F32);
+            let wi = g.input(Shape(vec![n]), DType::F32);
+            let ri = g.input(Shape(vec![n]), DType::F32);
+            let out = g.rmsnorm_add_scale_expand(xi, wi, ri, eps, scale)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[x, w, residual], y, 256)
+        self.run(ctx, &key, &[x, w, residual], y)
     }
 
     pub fn rmsnorm_per_head(
@@ -205,13 +226,13 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("rms_ph_{n_heads}_{hd}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
-            self.ensure(
-                ctx,
-                &key,
-                layer::render_rmsnorm_per_head(n_heads, hd, eps, true)?,
-            )?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n_heads * hd]), DType::F32);
+            let wi = g.input(Shape(vec![hd]), DType::F32);
+            let out = g.rmsnorm_per_head(xi, wi, n_heads, hd, eps, true)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[x, w], y, n_heads.max(1) as u64)
+        self.run(ctx, &key, &[x, w], y)
     }
 
     pub fn rmsnorm_noweight(
@@ -225,13 +246,13 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("rms_nw_{n_heads}_{hd}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
-            self.ensure(
-                ctx,
-                &key,
-                layer::render_rmsnorm_per_head(n_heads, hd, eps, false)?,
-            )?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n_heads * hd]), DType::F32);
+            let wi = g.input(Shape(vec![hd]), DType::F32);
+            let out = g.rmsnorm_per_head(xi, wi, n_heads, hd, eps, false)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[x, x], y, n_heads.max(1) as u64)
+        self.run(ctx, &key, &[x, x], y)
     }
 
     pub fn add(
@@ -250,7 +271,7 @@ impl Eng {
             let out = g.add(a, b)?;
             self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[a, b], y, 256)
+        self.run(ctx, &key, &[a, b], y)
     }
 
     pub fn gelu_mul(
@@ -275,9 +296,13 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("gelu_{n}_{up_off}");
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_gelu_mul(n, up_off)?)?;
+            let mut g = Graph::new();
+            let gate_i = g.input(Shape(vec![n]), DType::F32);
+            let up_i = g.input(Shape(vec![up_off + n]), DType::F32);
+            let out = g.gelu_mul_at(gate_i, up_i, up_off)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[gate, up], y, 256)
+        self.run(ctx, &key, &[gate, up], y)
     }
 
     pub fn scale_const(
@@ -295,7 +320,7 @@ impl Eng {
             let out = g.scale_const(xi, scale)?;
             self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[x], y, 256)
+        self.run(ctx, &key, &[x], y)
     }
 
     pub fn rope(
@@ -309,12 +334,15 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("rope_{n_heads}_{hd}");
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_rope(n_heads, hd)?)?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n_heads * hd]), DType::F32);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
+            let out = g.rope(xi, ci, n_heads, hd)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[x, cos_sin], y, n_heads.max(1) as u64)
+        self.run(ctx, &key, &[x, cos_sin], y)
     }
 
-    /// Naive MQA SDPA (Graph → schedule → Kernel IR → MSL).
     pub fn sdpa_naive(
         &mut self,
         ctx: &MetalContext,
@@ -337,7 +365,7 @@ impl Eng {
             let o = g.sdpa_naive(qi, ki, vi, mi, n_q, hd, max_t)?;
             self.ensure(ctx, &key, lower_to_metal(&g, o)?)?;
         }
-        self.run(ctx, &key, &[q, k, v, meta], out, 256)
+        self.run(ctx, &key, &[q, k, v, meta], out)
     }
 
     pub fn copy_slice(
@@ -351,9 +379,12 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("csl_{n}_{src_off}_{dst_off}");
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_copy_slice(src_off, dst_off, n)?)?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![src_off + n]), DType::F32);
+            let out = g.copy_slice(xi, src_off, dst_off, n)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
         }
-        self.run(ctx, &key, &[src], dst, 256)
+        self.run(ctx, &key, &[src], dst)
     }
 
     pub fn softcap_argmax(
@@ -366,9 +397,12 @@ impl Eng {
     ) -> Result<()> {
         let key = format!("sca_{n}_{}", cap.to_bits());
         if !self.cache.contains_key(&key) {
-            self.ensure(ctx, &key, layer::render_softcap_argmax(n, cap)?)?;
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), DType::F32);
+            let o = g.softcap_argmax(xi, cap)?;
+            self.ensure(ctx, &key, lower_to_metal(&g, o)?)?;
         }
-        self.run(ctx, &key, &[x], out, 256)
+        self.run(ctx, &key, &[x], out)
     }
 }
 
