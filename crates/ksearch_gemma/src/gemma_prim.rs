@@ -1,5 +1,5 @@
-//! Thesis A Gemma path: Graph sugar → schedule FuseHint → Kernel IR → MSL.
-//! Q4_K weights as dtype; F32 KV; naive SDPA CALL fusion.
+//! Thesis A Gemma path: tinygrad-style — dequant GGUF → F32, then Graph→schedule→AST→MSL.
+//! Matches `tinygrad.llm.gguf.ggml_data_to_tensor` (quant → float Tensor, generic kernels).
 
 use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
 use anyhow::{anyhow, bail, Result};
@@ -14,7 +14,6 @@ use std::time::Instant;
 const PREFILL_CHUNK: usize = 32;
 
 enum WeightBuf {
-    Q4K(Buffer),
     F32(Buffer),
 }
 
@@ -23,8 +22,8 @@ pub struct GemmaPrimModel {
     pub vocab: Option<ksearch_gguf::Vocab>,
     gguf: Gguf,
     ctx: MetalContext,
-    /// Tied lm_head / embed as native Q4_K packed.
-    token_embd_q4k: Buffer,
+    /// Tied lm_head / embed as F32 (dequanted like tinygrad GGUF load).
+    token_embd_f32: Buffer,
     output_norm: Buffer,
     ple_proj_norm: Buffer,
     layer_norms: Vec<LayerNorms>,
@@ -65,19 +64,20 @@ impl GemmaPrimModel {
         let cfg = GemmaConfig::from_gguf(&g)?;
         let vocab = ksearch_gguf::Vocab::from_gguf(&g);
         eprintln!(
-            "[prim] layers={} hidden={} heads={} vocab={} (Q4_K dtype + naive SDPA)",
+            "[prim] layers={} hidden={} heads={} vocab={} (tinygrad-style F32 after GGUF dequant)",
             cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.vocab
         );
 
         let ctx = MetalContext::new()?;
         eprintln!("Metal: {}", ctx.device_name());
 
-        eprintln!("Upload token_embd Q4_K (lm_head via Kernel IR dtype fusion)…");
-        let embd_ty = g.tensor_type("token_embd.weight");
-        assert_eq!(embd_ty, ksearch_gguf::ggml_type::Q4_K);
-        let embd_raw = g.tensor_raw("token_embd.weight");
-        let token_embd_q4k = ctx.buffer_bytes(embd_raw);
-        eprintln!("  token_embd Q4_K: {:.1} MB", embd_raw.len() as f64 / 1e6);
+        eprintln!("Dequant token_embd → F32 (tinygrad ggml_data_to_tensor style)…");
+        let embd_f32 = g.dequant_to_f32("token_embd.weight");
+        let token_embd_f32 = ctx.buffer_f32(&embd_f32);
+        eprintln!(
+            "  token_embd F32: {:.1} MB",
+            (embd_f32.len() * 4) as f64 / 1e6
+        );
 
         let output_norm = ctx.buffer_f32(&g.dequant_to_f32("output_norm.weight"));
         let ple_proj_norm = ctx.buffer_f32(&g.dequant_to_f32("per_layer_proj_norm.weight"));
@@ -156,7 +156,7 @@ impl GemmaPrimModel {
             vocab,
             gguf: g,
             ctx,
-            token_embd_q4k,
+            token_embd_f32,
             output_norm,
             ple_proj_norm,
             layer_norms,
@@ -193,13 +193,8 @@ impl GemmaPrimModel {
         if self.weight_bufs.contains_key(name) {
             return Ok(());
         }
-        let ty = self.gguf.tensor_type(name);
-        let buf = match ty {
-            ksearch_gguf::ggml_type::Q4_K => {
-                WeightBuf::Q4K(self.ctx.buffer_bytes(self.gguf.tensor_raw(name)))
-            }
-            _ => WeightBuf::F32(self.ctx.buffer_f32(&self.gguf.dequant_to_f32(name))),
-        };
+        // Always dequant to F32 (tinygrad: ggml_data_to_tensor → float Tensor).
+        let buf = WeightBuf::F32(self.ctx.buffer_f32(&self.gguf.dequant_to_f32(name)));
         self.weight_bufs.insert(name.to_string(), buf);
         Ok(())
     }
@@ -213,23 +208,16 @@ impl GemmaPrimModel {
         y: Buffer,
     ) -> Result<()> {
         self.ensure_weight(name)?;
-        match self.weight_bufs.get(name).unwrap() {
-            WeightBuf::Q4K(w) => {
-                let w = w.clone();
-                self.eng.matvec_q4k_prim(&self.ctx, rows, cols, &w, &x, &y)
-            }
-            WeightBuf::F32(w) => {
-                let w = w.clone();
-                self.eng.matvec(&self.ctx, rows, cols, &w, &x, &y)
-            }
-        }
+        let WeightBuf::F32(w) = self.weight_bufs.get(name).unwrap();
+        let w = w.clone();
+        self.eng.matvec(&self.ctx, rows, cols, &w, &x, &y)
     }
 
     fn write_meta(&self, layer: usize, tlen: u32, start: u32) {
-        let ptr = self.meta[layer].contents() as *mut u32;
+        let ptr = self.meta[layer].contents() as *mut f32;
         unsafe {
-            *ptr = tlen;
-            *ptr.add(1) = start;
+            *ptr = tlen as f32;
+            *ptr.add(1) = start as f32;
         }
     }
 
@@ -255,11 +243,17 @@ impl GemmaPrimModel {
     fn embed_token(&mut self, token: u32) -> Result<()> {
         let h = self.cfg.hidden;
         let scale = (h as f32).sqrt();
-        let mut row = self.gguf.dequant_row("token_embd.weight", token as usize);
-        for v in &mut row {
-            *v *= scale;
-        }
-        self.ctx.write_buffer(&self.x, &row);
+        // Copy row from dequanted F32 embd (same as indexing a float Tensor in tinygrad).
+        self.eng.copy_slice(
+            &self.ctx,
+            h,
+            &self.token_embd_f32,
+            token as usize * h,
+            &self.x,
+            0,
+        )?;
+        self.eng
+            .scale_const(&self.ctx, h, scale, &self.x, &self.x)?;
         Ok(())
     }
 
@@ -556,11 +550,11 @@ impl GemmaPrimModel {
             .rmsnorm(&self.ctx, h, eps, &self.x, &self.output_norm, &self.x2)?;
         let vocab = self.cfg.vocab;
         let cap = self.cfg.softcap;
-        self.eng.matvec_q4k_prim(
+        self.eng.matvec(
             &self.ctx,
             vocab,
             h,
-            &self.token_embd_q4k,
+            &self.token_embd_f32,
             &self.x2,
             &self.logits,
         )?;

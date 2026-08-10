@@ -113,9 +113,10 @@ See [DESIGN.md](./DESIGN.md).
 Locked IR study against local `reference/tinygrad` UOp model:
 
 - Graph product = ALU + movement + REDUCE (+ `Call`); sugar expands + `FuseHint`
-- Scheduler invents kernel boundaries from hints / matvec / elemwise
-- BEAM + `plan_cache` for OptSchedules; Q4_K = dtype fusion at matvec render
-- Eng builds **only** Graphs → `lower_to_metal` (no KirBody shortcuts)
-- **Removed:** `debt/` fused catalog, `GemmaModel`, `KSEARCH_DEBT`, `Op::SdpaNaive`
+- Scheduler invents CALL boundaries → **lower to KirStmt/KirExpr AST**
+- **Generic MSL renderer** walks the AST only (dtype expand on `Load` e.g. Q4_K) — no hand `rmsnorm.metal`
+- BEAM / plan_cache = OptOps tilings on that AST
+- Eng builds **only** Graphs → `lower_to_metal`
+- **Removed:** `debt/`, `GemmaModel`, `KSEARCH_DEBT`, hand `KirBody::*` Metal templates
 
-Architecture path is wired. Remaining gap vs oracle is **tok/s / B≥1 serving polish**, not IR shape.
+Scoreboard: tok/s will rise via BEAM/parallel reduces on the AST — not via reintroducing hand kernels.

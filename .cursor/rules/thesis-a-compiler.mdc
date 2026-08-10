@@ -7,44 +7,33 @@ alwaysApply: true
 
 ksearch is **tinygrad-shaped**, not metal-llm-server-shaped.
 
-## Mental model
-
-- **Allowed:** graph of **primitive** ops → scheduler invents kernel boundaries → lower / search / render MSL.
-- **Forbidden:** growing `Op` into a catalog of already-fused kernels where codegen is “match this op → paste this Metal template.”
+## Pipeline (required)
 
 ```
-tinygrad:  primitives → compiler invents kernels
-ksearch:   MUST stay on that path
-NOT:       fused-op enum → call kernel template
+primitives → scheduler invents CALL boundaries → Kernel IR AST
+  → generic MSL renderer (from AST only) → BEAM tilings
 ```
 
-Study source: `reference/tinygrad` UOp `Ops` (ALU / movement / REDUCE / LOAD-STORE). No `Ops.MATMUL` / `RMSNORM` / `FLASH_ATTN` / `GELU` — those are Tensor sugar.
+**Forbidden:** hand `rmsnorm.metal` / named `KirBody::RmsNorm` MSL templates / oracle shader paste / Graph catalog Ops (`MatVecQ4K*`, `AttnGqa*`, …).
 
-## Oracle (`reference/metal-llm-server`)
+Study source: `reference/tinygrad` UOp `Ops`. No `Ops.MATMUL` / `RMSNORM` / `FLASH_ATTN` / `GELU`.
 
-Use only as:
+## What may exist
 
-1. **Scoreboard** (tok/s, Hi gate, semantics)
-2. **Structure** hints (chunked prefill order, Q4_K as dtype, etc.)
+- Graph sugar that **expands** to primitives (+ `Call`/`FuseHint` for schedule)
+- Scheduler → `KernelKind` → **lower to KirStmt/KirExpr AST**
+- Renderer that only walks the AST (F32 loads — quant dequanted to float first, like tinygrad `ggml_data_to_tensor`)
+- BEAM OptOps as tilings on that AST
 
-Do **NOT**:
+## Quant
 
-- Paste oracle `.metal` / fused attention / mul_mm blobs as the product
-- Add `Op::AttnGqaQ4Fused`, `Op::MulMmQ4K`, `Op::MatVecQ4KRmsGateUpGelu`, etc.
-- Chase tok/s by promoting hand fusion into named Graph Ops
-- Revive `debt/` or `GemmaModel` / `KSEARCH_DEBT`
+tinygrad CUDA: Q4_K → float Tensor ops → generic float kernels. **Same on Metal:** dequant to F32 buffers; **no** hand `q4k_load` / fused Q4 matvec MSL.
 
-Layer sugar (RMSNorm / GeLU / RoPE) may schedule to a fused **Kernel IR** region (`KirBody`) — that is CALL fusion, not a Graph catalog Op.
+## Oracle
 
-## When optimizing decode/prefill
-
-1. Prefer IR rewrites + schedule search over new fused `Op` variants.
-2. Quant belongs as **dtype** (e.g. Q4_K) that fused lowers can *discover*, not a zoo of `MatVecQ4K*` ops.
-3. If a change would add a fused catalog op “because the oracle has that kernel,” **stop** and compose primitives instead.
+Scoreboard + structure hints only. Never hot-path shader source.
 
 ## Source of truth
 
-- `docs/DESIGN.md` — Thesis A lock + tinygrad IR map
-- `README.md` — “IR → generate MSL → search schedules”
-
-If speed work conflicts with this rule, **this rule wins**. Ask the user before any exception.
+- `docs/DESIGN.md`
+- This rule wins over speed work. Ask before any exception.

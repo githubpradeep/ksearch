@@ -97,40 +97,35 @@ impl Eng {
         self.run(ctx, &key, &[a, x], y)
     }
 
+    /// Removed: tinygrad dequants to float then uses generic matvec.
     pub fn matvec_q4k_prim(
         &mut self,
-        ctx: &MetalContext,
-        rows: usize,
-        cols: usize,
-        a: &Buffer,
-        x: &Buffer,
-        y: &Buffer,
+        _ctx: &MetalContext,
+        _rows: usize,
+        _cols: usize,
+        _a: &Buffer,
+        _x: &Buffer,
+        _y: &Buffer,
     ) -> Result<()> {
-        self.matvec_q4k_prim_at(ctx, rows, cols, a, x, 0, y, 0)
+        anyhow::bail!(
+            "matvec_q4k_prim removed — dequant to F32 then matvec (tinygrad ggml_data_to_tensor)"
+        )
     }
 
     pub fn matvec_q4k_prim_at(
         &mut self,
-        ctx: &MetalContext,
-        rows: usize,
-        cols: usize,
-        a: &Buffer,
-        x: &Buffer,
-        x_off_elems: usize,
-        y: &Buffer,
-        y_off_elems: usize,
+        _ctx: &MetalContext,
+        _rows: usize,
+        _cols: usize,
+        _a: &Buffer,
+        _x: &Buffer,
+        _x_off_elems: usize,
+        _y: &Buffer,
+        _y_off_elems: usize,
     ) -> Result<()> {
-        let key = format!("mv_q4k_prim_{rows}x{cols}");
-        if !self.cache.contains_key(&key) {
-            let mut g = Graph::new();
-            let w = g.input(Shape(vec![rows, cols]), DType::Q4K);
-            let v = g.input(Shape(vec![cols]), DType::F32);
-            let out = g.matvec_prim(w, v)?;
-            self.ensure(ctx, &key, lower_to_metal(&g, out)?)?;
-        }
-        let xb = (x_off_elems * 4) as u64;
-        let yb = (y_off_elems * 4) as u64;
-        self.run_offsets(ctx, &key, &[a, x], &[0, xb], y, yb)
+        anyhow::bail!(
+            "matvec_q4k_prim_at removed — dequant to F32 then matvec (tinygrad style)"
+        )
     }
 
     pub fn rmsnorm(

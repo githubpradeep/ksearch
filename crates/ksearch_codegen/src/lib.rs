@@ -2,6 +2,7 @@
 
 mod beam;
 pub mod layer;
+mod lower;
 mod plan_cache;
 mod render;
 mod rewrite;
