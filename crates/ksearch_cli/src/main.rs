@@ -222,14 +222,14 @@ fn elem_add(n: usize) -> Result<()> {
 
 fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
     let mut g = Graph::new();
-    let a = g.input(Shape(vec![rows, cols]), DType::F32);
-    let x = g.input(Shape(vec![cols]), DType::F32);
+    let a = g.input(Shape(vec![rows, cols]), DType::F16);
+    let x = g.input(Shape(vec![cols]), DType::F16);
     let ax = g.mul_broadcast_row(a, x)?;
     let y = g.sum_reduce(ax, 1)?;
 
     let ctx = MetalContext::new()?;
     println!("Metal device: {}", ctx.device_name());
-    println!("path: Graph → schedule → Kernel IR → MSL");
+    println!("path: Graph → schedule → Kernel IR → MSL (F16)");
 
     let mut va = vec![0f32; rows * cols];
     let mut vx = vec![0f32; cols];
@@ -248,15 +248,26 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
         expect[r] = s;
     }
 
-    let ba = ctx.buffer_f32(&va);
-    let bx = ctx.buffer_f32(&vx);
-    let by = ctx.buffer_empty_f32(rows);
+    let ba = {
+        let bytes: Vec<u8> = va
+            .iter()
+            .flat_map(|&v| ksearch_gguf::f32_to_f16(v).to_le_bytes())
+            .collect();
+        ctx.buffer_bytes(&bytes)
+    };
+    let bx = {
+        let bytes: Vec<u8> = vx
+            .iter()
+            .flat_map(|&v| ksearch_gguf::f32_to_f16(v).to_le_bytes())
+            .collect();
+        ctx.buffer_bytes(&bytes)
+    };
+    let by = ctx.buffer_empty_f16(rows);
 
     let time_one = |kernel: &ksearch_codegen::MetalKernelSource| -> Result<f64, CodegenError> {
         let pipe = ctx
             .compile(kernel)
             .map_err(|e| CodegenError::Msg(e.to_string()))?;
-        // Warmup + median of 3 timed runs (Metal launch noise).
         let _ = ctx
             .run(&pipe, kernel, &[&ba, &bx], &by, kernel_tg(kernel))
             .map_err(|e| CodegenError::Msg(e.to_string()))?;
@@ -282,9 +293,8 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
         );
 
         let chip = ctx.device_name();
-        // Bust cache so this CLI run always searches (cache still written).
         if std::env::var_os("KSEARCH_BEAM_FORCE").is_some() {
-            let key = ksearch_codegen::beam_cache_key("matvec", rows, cols, &chip);
+            let key = ksearch_codegen::plan_key("matvec_f16", &[rows, cols], &chip);
             let _ = std::fs::remove_file(
                 ksearch_codegen::beam_cache_dir().join(format!("{key}.txt")),
             );
@@ -324,14 +334,19 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
         &by,
         kernel_tg(&best_kernel),
     )?;
-    let got = ctx.read_f32(&by, rows);
+    let got: Vec<f32> = ctx
+        .read_u16(&by, rows)
+        .into_iter()
+        .map(ksearch_gguf::f16_to_f32)
+        .collect();
     let max_err = expect
         .iter()
         .zip(got.iter())
         .map(|(e, o)| (e - o).abs())
         .fold(0f32, f32::max);
     println!("best ({label})  {best_ms:.3} ms  max|err|={max_err:.3e}");
-    if max_err > 1e-2 {
+    // F16 accumulate vs F32 CPU ref — allow modest error.
+    if max_err > 0.05 {
         anyhow::bail!("CPU/GPU mismatch");
     }
     println!("OK");
@@ -346,4 +361,3 @@ fn kernel_tg(kernel: &ksearch_codegen::MetalKernelSource) -> u64 {
     }
 }
 
-// temporary - no, use a small bin

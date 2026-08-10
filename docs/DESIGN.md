@@ -33,7 +33,7 @@ There is **no** `Ops.MATMUL`, `Ops.RMSNORM`, `Ops.FLASH_ATTN`, `Ops.GELU` in tin
 
 ### Quant (tinygrad CUDA parity)
 
-tinygrad `ggml_data_to_tensor` turns Q4_K into a **float Tensor** via bit/byte Tensor ops, then CUDA/Metal see only float kernels. ksearch does the same: **CPU `dequant_to_f32` → F32 buffers → generic AST matvec**. No `q4k_load` hand Metal helper.
+tinygrad `ggml_data_to_tensor` turns Q4_K into a float Tensor, then typically `.half()`. ksearch: **CPU `dequant_to_f16_bytes` → F16 buffers → generic AST** (ALU in float, store half). Argmax index stays F32 (vocab ids). No `q4k_load`.
 
 ---
 
@@ -73,8 +73,8 @@ GGUF / tensors
 | Topic | Stance |
 |-------|--------|
 | **Attention** | SDPA sugar → `Call` + `FuseHint::SdpaNaive` (Q@Kᵀ→softmax→@V fused at schedule) |
-| **Quant** | Like tinygrad: dequant Q4→F32 (`ggml_data_to_tensor` style), then generic F32 kernels only |
-| **Serving** | `KvPool::new_f32`; chunked prefill; B≥1 pool types ready |
+| **Quant** | Like tinygrad: dequant Q4→float then **`.half()` (F16)** buffers; generic AST kernels only |
+| **Serving** | `KvPool::new_f16`; chunked prefill; B≥1 pool types ready |
 
 ---
 
@@ -86,7 +86,7 @@ GGUF / tensors
 | P1 | BEAM improves dense matvec over untuned | ✅ |
 | P2 | `"Hi"` → `Hi!` + `help` on GemmaPrim | ✅ |
 | P3 | Sugar expand + schedule FuseHint fusion | ✅ |
-| P4 | Q4→F32 dequant (tinygrad); no debt Eng; no `q4k_load` | ✅ |
+| P4 | Q4→F16 dequant (tinygrad `.half()`); no debt Eng; no `q4k_load` | ✅ |
 | Arch | Eng = Graph→schedule only; no `Op::SdpaNaive` catalog | ✅ |
 | Product | KvPool / B≥1 decode speed vs oracle | open (scoreboard; not blocking IR) |
 
@@ -120,12 +120,12 @@ ksearch/
 | **P1** | OptOp BEAM + disk cache | ✅ |
 | **P2** | GemmaPrim `"Hi"` gate | ✅ |
 | **P3** | Sugar expand + FuseHint schedule fusion | ✅ |
-| **P4** | Q4→F32 dequant (tinygrad); debt deleted; no `q4k_load` | ✅ |
+| **P4** | Q4→F16 dequant (tinygrad `.half()`); debt deleted; no `q4k_load` | ✅ |
 | **P5** | KvPool + chunked prefill | ✅ |
 | **Purge** | Tinygrad-shaped IR; no `GemmaModel` / `debt/` | ✅ |
 | **Arch wire** | Eng Graph-only; `Call`+hints; Reshape/Permute; plan_cache | ✅ |
 
-**Still scoreboard work (not IR gaps):** push decode/prefill tok/s toward oracle via more BEAM + fusion legality — without reintroducing catalog Ops.
+**Still scoreboard work (not IR gaps):** F16 + FuseHints + **device-keyed F16 BEAM plan warm on load** are in. Dense F16 GEMV tilings are near local plateau (~4 tok/s); next real gain is LOCAL (threadgroup) staging of the matvec `x` vector, not more TG/VEC search.
 
 ---
 

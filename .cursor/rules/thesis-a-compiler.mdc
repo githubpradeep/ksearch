@@ -27,7 +27,7 @@ Study source: `reference/tinygrad` UOp `Ops`. No `Ops.MATMUL` / `RMSNORM` / `FLA
 
 ## Quant
 
-tinygrad CUDA: Q4_K → float Tensor ops → generic float kernels. **Same on Metal:** dequant to F32 buffers; **no** hand `q4k_load` / fused Q4 matvec MSL.
+tinygrad CUDA: Q4_K → float Tensor ops → often `.half()` → generic float/half kernels. **Same on Metal:** dequant to F16 buffers; **no** hand `q4k_load` / fused Q4 matvec MSL.
 
 ## Oracle
 

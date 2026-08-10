@@ -17,6 +17,7 @@ pub struct TensorId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
     F32,
+    F16,
     /// GGML Q4_K packed (256 elems / 144 bytes). Logical shape is element counts.
     Q4K,
     Q5K,
@@ -29,7 +30,7 @@ impl DType {
     pub fn size_bytes(self) -> usize {
         match self {
             DType::F32 => 4,
-            DType::BF16 => 2,
+            DType::F16 | DType::BF16 => 2,
             DType::Q4K | DType::Q5K | DType::Q6K | DType::Q40 => 0,
         }
     }
@@ -37,9 +38,14 @@ impl DType {
     pub fn msl(self) -> &'static str {
         match self {
             DType::F32 => "float",
+            DType::F16 => "half",
             DType::BF16 => "bfloat",
             DType::Q4K | DType::Q5K | DType::Q6K | DType::Q40 => "uchar",
         }
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, DType::F32 | DType::F16)
     }
 }
 

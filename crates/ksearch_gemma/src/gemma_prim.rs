@@ -1,9 +1,9 @@
-//! Thesis A Gemma path: tinygrad-style — dequant GGUF → F32, then Graph→schedule→AST→MSL.
-//! Matches `tinygrad.llm.gguf.ggml_data_to_tensor` (quant → float Tensor, generic kernels).
+//! Thesis A Gemma path: tinygrad-style — dequant GGUF → F16 (`.half()`), then Graph→AST→MSL.
+//! Matches `ggml_data_to_tensor` then float/half Tensor ops (generic kernels).
 
 use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
 use anyhow::{anyhow, bail, Result};
-use ksearch_gguf::Gguf;
+use ksearch_gguf::{f32_to_f16, Gguf};
 use ksearch_kernels::Eng;
 use ksearch_metal::MetalContext;
 use metal::Buffer;
@@ -14,7 +14,7 @@ use std::time::Instant;
 const PREFILL_CHUNK: usize = 32;
 
 enum WeightBuf {
-    F32(Buffer),
+    F16(Buffer),
 }
 
 pub struct GemmaPrimModel {
@@ -22,8 +22,8 @@ pub struct GemmaPrimModel {
     pub vocab: Option<ksearch_gguf::Vocab>,
     gguf: Gguf,
     ctx: MetalContext,
-    /// Tied lm_head / embed as F32 (dequanted like tinygrad GGUF load).
-    token_embd_f32: Buffer,
+    /// Tied lm_head / embed as F16 (tinygrad dequant → `.half()`).
+    token_embd_f16: Buffer,
     output_norm: Buffer,
     ple_proj_norm: Buffer,
     layer_norms: Vec<LayerNorms>,
@@ -47,7 +47,7 @@ pub struct GemmaPrimModel {
     ple_proj: Buffer,
     meta: Vec<Buffer>,
     cos_sin: Vec<Buffer>,
-    /// F32 KV caches [max_seq × hd] per owning layer.
+    /// F16 KV caches [max_seq × hd] per owning layer.
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
     eng: Eng,
@@ -64,23 +64,23 @@ impl GemmaPrimModel {
         let cfg = GemmaConfig::from_gguf(&g)?;
         let vocab = ksearch_gguf::Vocab::from_gguf(&g);
         eprintln!(
-            "[prim] layers={} hidden={} heads={} vocab={} (tinygrad-style F32 after GGUF dequant)",
+            "[prim] layers={} hidden={} heads={} vocab={} (tinygrad-style F16 after GGUF dequant)",
             cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.vocab
         );
 
         let ctx = MetalContext::new()?;
         eprintln!("Metal: {}", ctx.device_name());
 
-        eprintln!("Dequant token_embd → F32 (tinygrad ggml_data_to_tensor style)…");
-        let embd_f32 = g.dequant_to_f32("token_embd.weight");
-        let token_embd_f32 = ctx.buffer_f32(&embd_f32);
+        eprintln!("Dequant token_embd → F16 (tinygrad ggml_data_to_tensor + .half())…");
+        let embd_f16 = g.dequant_to_f16_bytes("token_embd.weight");
+        let token_embd_f16 = ctx.buffer_bytes(&embd_f16);
         eprintln!(
-            "  token_embd F32: {:.1} MB",
-            (embd_f32.len() * 4) as f64 / 1e6
+            "  token_embd F16: {:.1} MB",
+            embd_f16.len() as f64 / 1e6
         );
 
-        let output_norm = ctx.buffer_f32(&g.dequant_to_f32("output_norm.weight"));
-        let ple_proj_norm = ctx.buffer_f32(&g.dequant_to_f32("per_layer_proj_norm.weight"));
+        let output_norm = ctx.buffer_bytes(&g.dequant_to_f16_bytes("output_norm.weight"));
+        let ple_proj_norm = ctx.buffer_bytes(&g.dequant_to_f16_bytes("per_layer_proj_norm.weight"));
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let mut layer_norms = Vec::with_capacity(cfg.n_layers);
@@ -89,15 +89,15 @@ impl GemmaPrimModel {
             let hd = cfg.head_dim(i);
             let pref = format!("blk.{i}.");
             layer_norms.push(LayerNorms {
-                attn_norm: ctx.buffer_f32(&g.dequant_to_f32(&format!("{pref}attn_norm.weight"))),
-                q_norm: ctx.buffer_f32(&g.dequant_to_f32(&format!("{pref}attn_q_norm.weight"))),
-                k_norm: ctx.buffer_f32(&g.dequant_to_f32(&format!("{pref}attn_k_norm.weight"))),
+                attn_norm: ctx.buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}attn_norm.weight"))),
+                q_norm: ctx.buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}attn_q_norm.weight"))),
+                k_norm: ctx.buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}attn_k_norm.weight"))),
                 post_attn_norm: ctx
-                    .buffer_f32(&g.dequant_to_f32(&format!("{pref}post_attention_norm.weight"))),
-                ffn_norm: ctx.buffer_f32(&g.dequant_to_f32(&format!("{pref}ffn_norm.weight"))),
+                    .buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}post_attention_norm.weight"))),
+                ffn_norm: ctx.buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}ffn_norm.weight"))),
                 post_ffw_norm: ctx
-                    .buffer_f32(&g.dequant_to_f32(&format!("{pref}post_ffw_norm.weight"))),
-                post_norm: ctx.buffer_f32(&g.dequant_to_f32(&format!("{pref}post_norm.weight"))),
+                    .buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}post_ffw_norm.weight"))),
+                post_norm: ctx.buffer_bytes(&g.dequant_to_f16_bytes(&format!("{pref}post_norm.weight"))),
                 layer_scale: g.dequant_to_f32(&format!("{pref}layer_output_scale.weight"))[0],
             });
             layers.push(LayerMeta {
@@ -119,8 +119,8 @@ impl GemmaPrimModel {
         let mut kv_v = Vec::new();
         for i in 0..n_kv_owners {
             let hd = cfg.head_dim(i);
-            kv_k.push(ctx.buffer_empty_f32(max_seq * hd));
-            kv_v.push(ctx.buffer_empty_f32(max_seq * hd));
+            kv_k.push(ctx.buffer_empty_f16(max_seq * hd));
+            kv_v.push(ctx.buffer_empty_f16(max_seq * hd));
         }
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
@@ -130,33 +130,60 @@ impl GemmaPrimModel {
                 ctx.device
                     .new_buffer(32, metal::MTLResourceOptions::StorageModeShared),
             );
-            cos_sin.push(ctx.buffer_empty_f32(max_hd));
+            cos_sin.push(ctx.buffer_empty_f16(max_hd));
         }
 
-        let x = ctx.buffer_empty_f32(cfg.hidden);
-        let x2 = ctx.buffer_empty_f32(cfg.hidden);
-        let tmp_q = ctx.buffer_empty_f32(cfg.n_heads * max_hd);
-        let tmp_k = ctx.buffer_empty_f32(cfg.n_kv * max_hd);
-        let tmp_v = ctx.buffer_empty_f32(cfg.n_kv * max_hd);
-        let tmp_o = ctx.buffer_empty_f32(cfg.n_heads * max_hd);
-        let tmp_ff1 = ctx.buffer_empty_f32(max_ff.max(ple_total));
-        let tmp_ff2 = ctx.buffer_empty_f32(max_ff.max(ple_total));
-        let tmp_ff3 = ctx.buffer_empty_f32(max_ff.max(ple_total));
-        let logits = ctx.buffer_empty_f32(cfg.vocab);
+        let x = ctx.buffer_empty_f16(cfg.hidden);
+        let x2 = ctx.buffer_empty_f16(cfg.hidden);
+        let tmp_q = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
+        let tmp_k = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
+        let tmp_v = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
+        let tmp_o = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
+        let tmp_ff1 = ctx.buffer_empty_f16(max_ff.max(ple_total));
+        let tmp_ff2 = ctx.buffer_empty_f16(max_ff.max(ple_total));
+        let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
+        let logits = ctx.buffer_empty_f16(cfg.vocab);
         let argmax_out = ctx.buffer_empty_f32(1);
-        let ple_tok = ctx.buffer_empty_f32(ple_total);
-        let ple_ctx = ctx.buffer_empty_f32(ple_total);
-        let ple_tmp = ctx.buffer_empty_f32(ple_total);
-        let ple_gate = ctx.buffer_empty_f32(cfg.ple_dim);
-        let ple_u = ctx.buffer_empty_f32(cfg.ple_dim);
-        let ple_proj = ctx.buffer_empty_f32(cfg.hidden);
+        let ple_tok = ctx.buffer_empty_f16(ple_total);
+        let ple_ctx = ctx.buffer_empty_f16(ple_total);
+        let ple_tmp = ctx.buffer_empty_f16(ple_total);
+        let ple_gate = ctx.buffer_empty_f16(cfg.ple_dim);
+        let ple_u = ctx.buffer_empty_f16(cfg.ple_dim);
+        let ple_proj = ctx.buffer_empty_f16(cfg.hidden);
+
+        let mut eng = Eng::new();
+        {
+            use std::collections::BTreeSet;
+            let mut shapes = BTreeSet::new();
+            let h = cfg.hidden;
+            for layer in 0..cfg.n_layers {
+                let hd = cfg.head_dim(layer);
+                shapes.insert((cfg.n_heads * hd, h));
+                shapes.insert((h, cfg.n_heads * hd));
+                shapes.insert((cfg.n_kv * hd, h));
+                shapes.insert((cfg.ffn[layer], h));
+                shapes.insert((h, cfg.ffn[layer]));
+                shapes.insert((cfg.ple_dim, h));
+                shapes.insert((h, cfg.ple_dim));
+            }
+            shapes.insert((cfg.ple_total(), h));
+            let shapes: Vec<_> = shapes.into_iter().collect();
+            eprintln!(
+                "[beam] warm {} mid-size F16 matvec plans (chip={}) …",
+                shapes.len(),
+                ctx.device_name()
+            );
+            eng.warm_f16_matvec_plans(&ctx, &shapes)?;
+            // lm_head / tied embd — reuse dequanted embd buffer (no second 800MB alloc)
+            eng.beam_f16_matvec(&ctx, cfg.vocab, h, &token_embd_f16)?;
+        }
 
         Ok(Self {
             cfg: cfg.clone(),
             vocab,
             gguf: g,
             ctx,
-            token_embd_f32,
+            token_embd_f16,
             output_norm,
             ple_proj_norm,
             layer_norms,
@@ -182,7 +209,7 @@ impl GemmaPrimModel {
             cos_sin,
             kv_k,
             kv_v,
-            eng: Eng::new(),
+            eng,
             weight_bufs: HashMap::new(),
             max_seq,
             pos: 0,
@@ -193,8 +220,8 @@ impl GemmaPrimModel {
         if self.weight_bufs.contains_key(name) {
             return Ok(());
         }
-        // Always dequant to F32 (tinygrad: ggml_data_to_tensor → float Tensor).
-        let buf = WeightBuf::F32(self.ctx.buffer_f32(&self.gguf.dequant_to_f32(name)));
+        // Dequant → F16 (tinygrad: ggml_data_to_tensor → .half()).
+        let buf = WeightBuf::F16(self.ctx.buffer_bytes(&self.gguf.dequant_to_f16_bytes(name)));
         self.weight_bufs.insert(name.to_string(), buf);
         Ok(())
     }
@@ -208,21 +235,21 @@ impl GemmaPrimModel {
         y: Buffer,
     ) -> Result<()> {
         self.ensure_weight(name)?;
-        let WeightBuf::F32(w) = self.weight_bufs.get(name).unwrap();
+        let WeightBuf::F16(w) = self.weight_bufs.get(name).unwrap();
         let w = w.clone();
         self.eng.matvec(&self.ctx, rows, cols, &w, &x, &y)
     }
 
     fn write_meta(&self, layer: usize, tlen: u32, start: u32) {
-        let ptr = self.meta[layer].contents() as *mut f32;
+        let ptr = self.meta[layer].contents() as *mut u16;
         unsafe {
-            *ptr = tlen as f32;
-            *ptr.add(1) = start as f32;
+            *ptr = f32_to_f16(tlen as f32);
+            *ptr.add(1) = f32_to_f16(start as f32);
         }
     }
 
     fn fill_cos_sin(&self, layer: usize, pos: usize, hd: usize, theta: f32, rope_angles: usize) {
-        let ptr = self.cos_sin[layer].contents() as *mut f32;
+        let ptr = self.cos_sin[layer].contents() as *mut u16;
         let half = hd / 2;
         let rope_angles = rope_angles.min(half);
         unsafe {
@@ -230,11 +257,11 @@ impl GemmaPrimModel {
                 if i < rope_angles {
                     let freq = 1.0 / theta.powf((2 * i) as f32 / hd as f32);
                     let ang = pos as f32 * freq;
-                    *ptr.add(i) = ang.cos();
-                    *ptr.add(half + i) = ang.sin();
+                    *ptr.add(i) = f32_to_f16(ang.cos());
+                    *ptr.add(half + i) = f32_to_f16(ang.sin());
                 } else {
-                    *ptr.add(i) = 1.0;
-                    *ptr.add(half + i) = 0.0;
+                    *ptr.add(i) = f32_to_f16(1.0);
+                    *ptr.add(half + i) = f32_to_f16(0.0);
                 }
             }
         }
@@ -243,17 +270,15 @@ impl GemmaPrimModel {
     fn embed_token(&mut self, token: u32) -> Result<()> {
         let h = self.cfg.hidden;
         let scale = (h as f32).sqrt();
-        // Copy row from dequanted F32 embd (same as indexing a float Tensor in tinygrad).
-        self.eng.copy_slice(
+        self.eng.copy_scale(
             &self.ctx,
             h,
-            &self.token_embd_f32,
+            scale,
+            &self.token_embd_f16,
             token as usize * h,
             &self.x,
             0,
         )?;
-        self.eng
-            .scale_const(&self.ctx, h, scale, &self.x, &self.x)?;
         Ok(())
     }
 
@@ -265,7 +290,8 @@ impl GemmaPrimModel {
         for v in &mut row {
             *v *= scale;
         }
-        self.ctx.write_buffer(&self.ple_tok, &row);
+        let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
+        self.ctx.write_u16s(&self.ple_tok, &row_h);
         Ok(())
     }
 
@@ -313,7 +339,7 @@ impl GemmaPrimModel {
         Ok(())
     }
 
-    fn kv_append_f32(&mut self, kv_src: usize, hd: usize) -> Result<()> {
+    fn kv_append_f16(&mut self, kv_src: usize, hd: usize) -> Result<()> {
         let pos = self.pos;
         self.eng.copy_slice(
             &self.ctx,
@@ -386,31 +412,25 @@ impl GemmaPrimModel {
             }
 
             self.fill_cos_sin(layer, self.pos, hd, theta, rope_angles);
-            self.eng.rmsnorm_per_head(
+            self.eng.rmsnorm_per_head_rope(
                 &self.ctx,
                 n_heads,
                 hd,
                 eps,
                 &self.tmp_q,
                 &self.layer_norms[layer].q_norm,
-                &self.tmp_q,
-            )?;
-            self.eng.rope(
-                &self.ctx,
-                n_heads,
-                hd,
-                &self.tmp_q,
                 &self.cos_sin[layer],
                 &self.tmp_q,
             )?;
             if owns_kv {
-                self.eng.rmsnorm_per_head(
+                self.eng.rmsnorm_per_head_rope(
                     &self.ctx,
                     self.cfg.n_kv,
                     hd,
                     eps,
                     &self.tmp_k,
                     &self.layer_norms[layer].k_norm,
+                    &self.cos_sin[layer],
                     &self.tmp_k,
                 )?;
                 self.eng.rmsnorm_noweight(
@@ -421,15 +441,7 @@ impl GemmaPrimModel {
                     &self.tmp_v,
                     &self.tmp_v,
                 )?;
-                self.eng.rope(
-                    &self.ctx,
-                    1,
-                    hd,
-                    &self.tmp_k,
-                    &self.cos_sin[layer],
-                    &self.tmp_k,
-                )?;
-                self.kv_append_f32(kv_src, hd)?;
+                self.kv_append_f16(kv_src, hd)?;
             }
 
             let kv_len = self.pos + 1;
@@ -554,7 +566,7 @@ impl GemmaPrimModel {
             &self.ctx,
             vocab,
             h,
-            &self.token_embd_f32,
+            &self.token_embd_f16,
             &self.x2,
             &self.logits,
         )?;
@@ -571,7 +583,7 @@ impl GemmaPrimModel {
             .count()
             .max(1);
         let hd = self.cfg.head_dim_full.max(self.cfg.head_dim_swa);
-        KvPool::new_f32(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
+        KvPool::new_f16(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
     }
 
     pub fn reset(&mut self) {

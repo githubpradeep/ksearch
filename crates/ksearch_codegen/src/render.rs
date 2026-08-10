@@ -13,13 +13,13 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
     }
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
     let n_in = kir.n_inputs as u32;
-    let (params, launch, grid_n) = match &kir.launch {
+    let (params, launch, guard) = match &kir.launch {
         KirLaunch::Elementwise { n } => {
             let p = buffer_params(kir);
             (
                 format!("{p}  uint gid [[thread_position_in_grid]]"),
                 LaunchHint::Elementwise { n: (*n).max(1) },
-                *n,
+                format!("  if (gid >= {}u) return;\n", (*n).max(1)),
             )
         }
         KirLaunch::Rows { rows } => {
@@ -29,16 +29,29 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
                 LaunchHint::Elementwise {
                     n: (*rows).max(1),
                 },
-                *rows,
+                format!("  if (gid >= {}u) return;\n", (*rows).max(1)),
+            )
+        }
+        KirLaunch::RowsParallel { rows, tg } => {
+            let p = buffer_params(kir);
+            (
+                format!(
+                    "{p}  uint gid [[threadgroup_position_in_grid]],\n  uint lid [[thread_index_in_threadgroup]]"
+                ),
+                LaunchHint::RowsParallel {
+                    rows: (*rows).max(1),
+                    tg: (*tg).max(1),
+                },
+                format!("  if (gid >= {}u) return;\n", (*rows).max(1)),
             )
         }
     };
-    let body = emit_stmts(&kir.body, 1, n_in)?;
+    let body = emit_stmts(&kir.body, 1, n_in, kir.out_dtype)?;
     src.push_str(&format!(
-        "kernel void {name}(\n{params}\n) {{\n  if (gid >= {grid_n}u) return;\n{body}}}\n",
+        "kernel void {name}(\n{params}\n) {{\n{guard}{body}}}\n",
         name = kir.name,
         params = params,
-        grid_n = grid_n.max(1),
+        guard = guard,
         body = body,
     ));
     Ok(MetalKernelSource {
@@ -52,17 +65,73 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
 }
 
 fn buffer_params(kir: &KernelIr) -> String {
+    let mut in_dt = vec![kir.out_dtype; kir.n_inputs];
+    infer_load_dtypes(&kir.body, &mut in_dt);
     let mut p = String::new();
     for i in 0..kir.n_inputs {
+        let ty = in_dt[i].msl();
         p.push_str(&format!(
-            "  device const float* in{i} [[buffer({i})]],\n"
+            "  device const {ty}* in{i} [[buffer({i})]],\n"
         ));
     }
+    let out_ty = kir.out_dtype.msl();
     p.push_str(&format!(
-        "  device float* out [[buffer({})]],\n",
+        "  device {out_ty}* out [[buffer({})]],\n",
         kir.n_inputs
     ));
     p
+}
+
+fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
+    for s in stmts {
+        match s {
+            KirStmt::For { body, .. } | KirStmt::If { body, .. } | KirStmt::ForRange { body, .. } => {
+                infer_load_dtypes(body, in_dt);
+            }
+            KirStmt::Let { expr, .. } | KirStmt::LetU32 { expr, .. } | KirStmt::Assign { expr, .. } => {
+                infer_load_expr(expr, in_dt);
+            }
+            KirStmt::Store { idx, val, .. } => {
+                infer_load_expr(idx, in_dt);
+                infer_load_expr(val, in_dt);
+            }
+            KirStmt::ThreadgroupReduce { .. } => {}
+        }
+    }
+}
+
+fn infer_load_expr(e: &KirExpr, in_dt: &mut [DType]) {
+    match e {
+        KirExpr::Load { buf, idx, dtype } => {
+            if (*buf as usize) < in_dt.len() {
+                in_dt[*buf as usize] = *dtype;
+            }
+            infer_load_expr(idx, in_dt);
+        }
+        KirExpr::VecMulSum {
+            a_buf,
+            a_idx,
+            b_buf,
+            b_idx,
+            dtype,
+            ..
+        } => {
+            if (*a_buf as usize) < in_dt.len() {
+                in_dt[*a_buf as usize] = *dtype;
+            }
+            if (*b_buf as usize) < in_dt.len() {
+                in_dt[*b_buf as usize] = *dtype;
+            }
+            infer_load_expr(a_idx, in_dt);
+            infer_load_expr(b_idx, in_dt);
+        }
+        KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => infer_load_expr(a, in_dt),
+        KirExpr::Bin { a, b, .. } | KirExpr::CmpGt { a, b } | KirExpr::CmpEq { a, b } => {
+            infer_load_expr(a, in_dt);
+            infer_load_expr(b, in_dt);
+        }
+        _ => {}
+    }
 }
 
 fn buf_name(buf: u32, n_in: u32) -> String {
@@ -73,52 +142,78 @@ fn buf_name(buf: u32, n_in: u32) -> String {
     }
 }
 
+fn walk_expr_q4(e: &KirExpr, buf: u32) -> bool {
+    match e {
+        KirExpr::Load {
+            buf: b,
+            dtype: DType::Q4K,
+            ..
+        } if *b == buf => true,
+        KirExpr::Load { idx, .. } => walk_expr_q4(idx, buf),
+        KirExpr::VecMulSum {
+            a_idx,
+            b_idx,
+            ..
+        } => walk_expr_q4(a_idx, buf) || walk_expr_q4(b_idx, buf),
+        KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => walk_expr_q4(a, buf),
+        KirExpr::Bin { a, b, .. }
+        | KirExpr::CmpGt { a, b }
+        | KirExpr::CmpEq { a, b } => walk_expr_q4(a, buf) || walk_expr_q4(b, buf),
+        _ => false,
+    }
+}
+
 fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
-    fn walk(stmts: &[KirStmt], buf: u32) -> bool {
-        for s in stmts {
-            match s {
-                KirStmt::For { body, .. } | KirStmt::If { body, .. } => {
-                    if walk(body, buf) {
-                        return true;
-                    }
-                }
-                KirStmt::Let { expr, .. } | KirStmt::Assign { expr, .. } => {
-                    if expr_q4(expr, buf) {
-                        return true;
-                    }
-                }
-                KirStmt::Store { idx, val, .. } => {
-                    if expr_q4(idx, buf) || expr_q4(val, buf) {
-                        return true;
-                    }
+    for s in stmts {
+        match s {
+            KirStmt::For { body, .. } | KirStmt::If { body, .. } => {
+                if buf_is_q4(body, buf) {
+                    return true;
                 }
             }
-        }
-        false
-    }
-    fn expr_q4(e: &KirExpr, buf: u32) -> bool {
-        match e {
-            KirExpr::Load {
-                buf: b,
-                dtype: DType::Q4K,
+            KirStmt::ForRange {
+                limit_off,
+                bound,
+                step,
+                body,
                 ..
-            } if *b == buf => true,
-            KirExpr::Load { idx, .. } => expr_q4(idx, buf),
-            KirExpr::Bin { a, b, .. } | KirExpr::CmpGt { a, b } => {
-                expr_q4(a, buf) || expr_q4(b, buf)
+            } => {
+                if walk_expr_q4(limit_off, buf)
+                    || walk_expr_q4(bound, buf)
+                    || walk_expr_q4(step, buf)
+                    || buf_is_q4(body, buf)
+                {
+                    return true;
+                }
             }
-            KirExpr::Unary { a, .. } => expr_q4(a, buf),
-            _ => false,
+            KirStmt::Let { expr, .. }
+            | KirStmt::LetU32 { expr, .. }
+            | KirStmt::Assign { expr, .. } => {
+                if walk_expr_q4(expr, buf) {
+                    return true;
+                }
+            }
+            KirStmt::Store { idx, val, .. } => {
+                if walk_expr_q4(idx, buf) || walk_expr_q4(val, buf) {
+                    return true;
+                }
+            }
+            KirStmt::ThreadgroupReduce { .. } => {}
         }
     }
-    walk(stmts, buf)
+    false
 }
 
 fn body_needs_q4(stmts: &[KirStmt]) -> bool {
     (0..8).any(|b| buf_is_q4(stmts, b))
 }
 
-fn emit_stmts(stmts: &[KirStmt], indent: usize, n_in: u32) -> Result<String, CodegenError> {
+fn emit_stmts(
+    stmts: &[KirStmt],
+    indent: usize,
+    n_in: u32,
+    elem: DType,
+) -> Result<String, CodegenError> {
     let pad = "  ".repeat(indent);
     let mut s = String::new();
     for st in stmts {
@@ -127,49 +222,97 @@ fn emit_stmts(stmts: &[KirStmt], indent: usize, n_in: u32) -> Result<String, Cod
                 s.push_str(&format!(
                     "{pad}for (uint f{id} = 0u; f{id} < {n}u; f{id}++) {{\n"
                 ));
-                s.push_str(&emit_stmts(body, indent + 1, n_in)?);
+                s.push_str(&emit_stmts(body, indent + 1, n_in, elem)?);
+                s.push_str(&format!("{pad}}}\n"));
+            }
+            KirStmt::ForRange {
+                id,
+                limit_off,
+                bound,
+                step,
+                body,
+            } => {
+                let lo = emit_expr_ty(limit_off, n_in, false, elem)?;
+                let bd = emit_expr_ty(bound, n_in, false, elem)?;
+                let sp = emit_expr_ty(step, n_in, false, elem)?;
+                s.push_str(&format!(
+                    "{pad}for (; u{id} + ({lo}) < ({bd}); u{id} += ({sp})) {{\n"
+                ));
+                s.push_str(&emit_stmts(body, indent + 1, n_in, elem)?);
                 s.push_str(&format!("{pad}}}\n"));
             }
             KirStmt::Let { id, expr } => {
                 s.push_str(&format!(
                     "{pad}float v{id} = {};\n",
-                    emit_expr_ty(expr, n_in, true)?
+                    emit_expr_ty(expr, n_in, true, elem)?
+                ));
+            }
+            KirStmt::LetU32 { id, expr } => {
+                s.push_str(&format!(
+                    "{pad}uint u{id} = {};\n",
+                    emit_expr_ty(expr, n_in, false, elem)?
                 ));
             }
             KirStmt::Assign { id, expr } => {
                 s.push_str(&format!(
                     "{pad}v{id} = {};\n",
-                    emit_expr_ty(expr, n_in, true)?
+                    emit_expr_ty(expr, n_in, true, elem)?
                 ));
             }
             KirStmt::Store { buf, idx, val } => {
-                let idx_s = emit_expr_ty(idx, n_in, false)?;
+                let idx_s = emit_expr_ty(idx, n_in, false, elem)?;
                 let idx_u = if is_uintish(idx) {
                     idx_s
                 } else {
                     format!("uint({idx_s})")
                 };
+                let vs = emit_expr_ty(val, n_in, true, elem)?;
+                let store = match elem {
+                    DType::F16 => format!("half({vs})"),
+                    _ => vs,
+                };
                 s.push_str(&format!(
                     "{pad}{}[{}] = {};\n",
                     buf_name(*buf, n_in),
                     idx_u,
-                    emit_expr_ty(val, n_in, true)?
+                    store
                 ));
             }
             KirStmt::If { cond, body } => {
                 s.push_str(&format!(
                     "{pad}if ({}) {{\n",
-                    emit_expr_ty(cond, n_in, true)?
+                    emit_expr_ty(cond, n_in, true, elem)?
                 ));
-                s.push_str(&emit_stmts(body, indent + 1, n_in)?);
+                s.push_str(&emit_stmts(body, indent + 1, n_in, elem)?);
                 s.push_str(&format!("{pad}}}\n"));
+            }
+            KirStmt::ThreadgroupReduce { acc_id, tg } => {
+                if *tg <= 32 {
+                    s.push_str(&format!("{pad}v{acc_id} = simd_sum(v{acc_id});\n"));
+                } else {
+                    s.push_str(&format!(
+                        "{pad}threadgroup float red_{acc_id}[{tg}];\n\
+                         {pad}red_{acc_id}[lid] = v{acc_id};\n\
+                         {pad}threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                         {pad}for (uint stride = {tg}u / 2u; stride > 0u; stride >>= 1u) {{\n\
+                         {pad}  if (lid < stride) red_{acc_id}[lid] += red_{acc_id}[lid + stride];\n\
+                         {pad}  threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                         {pad}}}\n\
+                         {pad}v{acc_id} = red_{acc_id}[0];\n"
+                    ));
+                }
             }
         }
     }
     Ok(s)
 }
 
-fn emit_expr_ty(e: &KirExpr, n_in: u32, as_float: bool) -> Result<String, CodegenError> {
+fn emit_expr_ty(
+    e: &KirExpr,
+    n_in: u32,
+    as_float: bool,
+    elem: DType,
+) -> Result<String, CodegenError> {
     Ok(match e {
         KirExpr::ConstF32(f) => format!("{f:?}f"),
         KirExpr::ConstU32(u) => {
@@ -186,6 +329,13 @@ fn emit_expr_ty(e: &KirExpr, n_in: u32, as_float: bool) -> Result<String, Codege
                 "gid".into()
             }
         }
+        KirExpr::Lid => {
+            if as_float {
+                "float(lid)".into()
+            } else {
+                "lid".into()
+            }
+        }
         KirExpr::ForVar(id) => {
             if as_float {
                 format!("float(f{id})")
@@ -194,22 +344,75 @@ fn emit_expr_ty(e: &KirExpr, n_in: u32, as_float: bool) -> Result<String, Codege
             }
         }
         KirExpr::Var(id) => format!("v{id}"),
+        KirExpr::UVar(id) => {
+            if as_float {
+                format!("float(u{id})")
+            } else {
+                format!("u{id}")
+            }
+        }
         KirExpr::Load { buf, idx, dtype } => {
-            let idx_s = emit_expr_ty(idx, n_in, false)?;
+            let idx_s = emit_expr_ty(idx, n_in, false, elem)?;
             let idx_u = if is_uintish(idx) {
                 idx_s
             } else {
                 format!("uint({idx_s})")
             };
+            let load = format!("{}[{}]", buf_name(*buf, n_in), idx_u);
             match dtype {
-                DType::F32 => format!("{}[{}]", buf_name(*buf, n_in), idx_u),
+                DType::F32 => load,
+                DType::F16 => format!("float({load})"),
                 other => {
                     return Err(CodegenError::Msg(format!(
-                        "render load: dtype {other:?} — dequant to F32 first (tinygrad style)"
+                        "render load: dtype {other:?} — dequant to float first (tinygrad style)"
                     )))
                 }
             }
         }
+        KirExpr::VecMulSum {
+            a_buf,
+            a_idx,
+            b_buf,
+            b_idx,
+            width,
+            dtype,
+        } => {
+            let ai = emit_expr_ty(a_idx, n_in, false, elem)?;
+            let bi = emit_expr_ty(b_idx, n_in, false, elem)?;
+            let a = buf_name(*a_buf, n_in);
+            let b = buf_name(*b_buf, n_in);
+            let (vn, cast) = match dtype {
+                DType::F16 => ("half", "float"),
+                _ => ("float", ""),
+            };
+            match width {
+                4 if *dtype == DType::F16 => format!(
+                    "dot(float4(*(device const half4*)({a} + ({ai}))), float4(*(device const half4*)({b} + ({bi}))))"
+                ),
+                2 if *dtype == DType::F16 => format!(
+                    "(float((*(device const half2*)({a} + ({ai}))).x) * float((*(device const half2*)({b} + ({bi}))).x) + \
+                     float((*(device const half2*)({a} + ({ai}))).y) * float((*(device const half2*)({b} + ({bi}))).y))"
+                ),
+                1 if *dtype == DType::F16 => {
+                    format!("(float({a}[{ai}]) * float({b}[{bi}]))")
+                }
+                4 => format!(
+                    "dot(*(device const float4*)({a} + ({ai})), *(device const float4*)({b} + ({bi})))"
+                ),
+                2 => format!(
+                    "((*(device const float2*)({a} + ({ai}))).x * (*(device const float2*)({b} + ({bi}))).x + \
+                     (*(device const float2*)({a} + ({ai}))).y * (*(device const float2*)({b} + ({bi}))).y)"
+                ),
+                1 => format!("{a}[{ai}] * {b}[{bi}]"),
+                w => {
+                    let _ = (vn, cast);
+                    return Err(CodegenError::Msg(format!(
+                        "render VecMulSum: unsupported width {w}"
+                    )))
+                }
+            }
+        }
+        KirExpr::SimdSum(a) => format!("simd_sum({})", emit_expr_ty(a, n_in, true, elem)?),
         KirExpr::Bin { op, a, b } => {
             if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
                 && is_uintish(a)
@@ -224,14 +427,14 @@ fn emit_expr_ty(e: &KirExpr, n_in: u32, as_float: bool) -> Result<String, Codege
                 };
                 format!(
                     "({} {} {})",
-                    emit_expr_ty(a, n_in, false)?,
+                    emit_expr_ty(a, n_in, false, elem)?,
                     op_s,
-                    emit_expr_ty(b, n_in, false)?
+                    emit_expr_ty(b, n_in, false, elem)?
                 )
             } else {
                 let (as_, bs) = (
-                    emit_expr_ty(a, n_in, true)?,
-                    emit_expr_ty(b, n_in, true)?,
+                    emit_expr_ty(a, n_in, true, elem)?,
+                    emit_expr_ty(b, n_in, true, elem)?,
                 );
                 match op {
                     BinOp::Add => format!("({as_} + {bs})"),
@@ -244,7 +447,7 @@ fn emit_expr_ty(e: &KirExpr, n_in: u32, as_float: bool) -> Result<String, Codege
             }
         }
         KirExpr::Unary { op, a } => {
-            let x = emit_expr_ty(a, n_in, true)?;
+            let x = emit_expr_ty(a, n_in, true, elem)?;
             match op {
                 UnaryOp::Neg => format!("(-{x})"),
                 UnaryOp::Exp => format!("exp({x})"),
@@ -256,15 +459,32 @@ fn emit_expr_ty(e: &KirExpr, n_in: u32, as_float: bool) -> Result<String, Codege
         }
         KirExpr::CmpGt { a, b } => format!(
             "(({}) > ({}))",
-            emit_expr_ty(a, n_in, true)?,
-            emit_expr_ty(b, n_in, true)?
+            emit_expr_ty(a, n_in, true, elem)?,
+            emit_expr_ty(b, n_in, true, elem)?
         ),
+        KirExpr::CmpEq { a, b } => {
+            if is_uintish(a) && is_uintish(b) {
+                format!(
+                    "(({}) == ({}))",
+                    emit_expr_ty(a, n_in, false, elem)?,
+                    emit_expr_ty(b, n_in, false, elem)?
+                )
+            } else {
+                format!(
+                    "(({}) == ({}))",
+                    emit_expr_ty(a, n_in, true, elem)?,
+                    emit_expr_ty(b, n_in, true, elem)?
+                )
+            }
+        }
     })
 }
 
 fn is_uintish(e: &KirExpr) -> bool {
     match e {
-        KirExpr::Gid | KirExpr::ForVar(_) | KirExpr::ConstU32(_) => true,
+        KirExpr::Gid | KirExpr::Lid | KirExpr::ForVar(_) | KirExpr::ConstU32(_) | KirExpr::UVar(_) => {
+            true
+        }
         KirExpr::Bin {
             op: BinOp::Add | BinOp::Sub | BinOp::Mul,
             a,

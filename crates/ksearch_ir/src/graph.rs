@@ -67,14 +67,18 @@ impl Graph {
     }
 
     pub fn const_f32(&mut self, value: f32, shape: Shape) -> TensorId {
+        self.const_val(value, shape, DType::F32)
+    }
+
+    pub fn const_val(&mut self, value: f32, shape: Shape, dtype: DType) -> TensorId {
         self.push(
             Op::Const {
                 value,
                 shape: shape.clone(),
-                dtype: DType::F32,
+                dtype,
             },
             shape,
-            DType::F32,
+            dtype,
         )
     }
 
@@ -145,6 +149,7 @@ impl Graph {
         }
         let out_dtype = match (dl, dr) {
             (DType::F32, DType::F32) => DType::F32,
+            (DType::F16, DType::F16) => DType::F16,
             (DType::Q4K, DType::F32) if sl.0[1] % 256 == 0 => DType::F32,
             _ => return Err(IrError::ShapeMismatch),
         };
@@ -252,14 +257,14 @@ impl Graph {
     }
 
     pub fn gelu_tanh(&mut self, x: TensorId) -> Result<TensorId, IrError> {
-        let (s, _) = self.shape_dtype(x)?;
+        let (s, d) = self.shape_dtype(x)?;
         let x2 = self.mul(x, x)?;
         let x3 = self.mul(x2, x)?;
         let c044 = self.scale_const(x3, 0.044715)?;
         let inner = self.add(x, c044)?;
         let u = self.scale_const(inner, 0.79788456)?;
         let t = self.tanh(u)?;
-        let one = self.const_f32(1.0, s);
+        let one = self.const_val(1.0, s.clone(), d);
         let one_plus = self.add(one, t)?;
         let half_x = self.scale_const(x, 0.5)?;
         self.mul(half_x, one_plus)
@@ -274,14 +279,14 @@ impl Graph {
     ) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
         let (sw, dw) = self.shape_dtype(w)?;
-        if sx != sw || dx != DType::F32 || dw != DType::F32 || sx.rank() != 1 {
+        if sx != sw || !dx.is_float() || dx != dw || sx.rank() != 1 {
             return Err(IrError::ShapeMismatch);
         }
         let n = sx.0[0];
         let sq = self.square(x)?;
         let sum = self.sum_reduce(sq, 0)?;
         let mean = self.scale_const(sum, 1.0 / n as f32)?;
-        let eps_t = self.const_f32(eps, Shape(vec![1]));
+        let eps_t = self.const_val(eps, Shape(vec![1]), dx);
         let mean_eps = self.add(mean, eps_t)?;
         let inv = self.rsqrt(mean_eps)?;
         let inv_b = self.expand(inv, sx.clone())?;
@@ -358,13 +363,13 @@ impl Graph {
         with_weight: bool,
     ) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
-        if dx != DType::F32 || sx.numel() != n_heads * hd {
+        if !dx.is_float() || sx.numel() != n_heads * hd {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
             vec![x, w],
             Shape(vec![n_heads * hd]),
-            DType::F32,
+            dx,
             FuseHint::RmsNormPerHead {
                 n_heads,
                 hd,
@@ -372,6 +377,63 @@ impl Graph {
                 with_weight,
                 x,
                 w,
+            },
+        ))
+    }
+
+    /// Per-head RMSNorm + RoPE as one CALL (decode hot path).
+    pub fn rmsnorm_per_head_rope(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || sx.numel() != n_heads * hd {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w, cos_sin],
+            Shape(vec![n_heads * hd]),
+            dx,
+            FuseHint::RmsNormPerHeadRope {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                x,
+                w,
+                cos_sin,
+            },
+        ))
+    }
+
+    pub fn copy_scale(
+        &mut self,
+        src: TensorId,
+        src_off: usize,
+        dst_off: usize,
+        n: usize,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (_, d) = self.shape_dtype(src)?;
+        if !d.is_float() {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![src],
+            Shape(vec![n]),
+            d,
+            FuseHint::CopyScale {
+                src_off,
+                dst_off,
+                n,
+                scale,
+                src,
             },
         ))
     }
@@ -384,13 +446,13 @@ impl Graph {
         hd: usize,
     ) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
-        if dx != DType::F32 || sx.numel() != n_heads * hd {
+        if !dx.is_float() || sx.numel() != n_heads * hd {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
             vec![x, cos_sin],
             Shape(vec![n_heads * hd]),
-            DType::F32,
+            dx,
             FuseHint::Rope {
                 n_heads,
                 hd,
@@ -414,9 +476,9 @@ impl Graph {
         let (sq, dq) = self.shape_dtype(q)?;
         let (_, dk) = self.shape_dtype(k)?;
         let (_, dv) = self.shape_dtype(v)?;
-        if dq != DType::F32
-            || dk != DType::F32
-            || dv != DType::F32
+        if !dq.is_float()
+            || dk != dq
+            || dv != dq
             || sq.numel() != n_q * hd
             || n_q == 0
             || hd == 0
@@ -427,7 +489,7 @@ impl Graph {
         Ok(self.call(
             vec![q, k, v, meta],
             Shape(vec![n_q * hd]),
-            DType::F32,
+            dq,
             FuseHint::SdpaNaive {
                 n_q,
                 hd,
@@ -448,7 +510,7 @@ impl Graph {
     ) -> Result<TensorId, IrError> {
         let (sg, dg) = self.shape_dtype(gate)?;
         let (su, du) = self.shape_dtype(up)?;
-        if dg != DType::F32 || du != DType::F32 || sg.rank() != 1 {
+        if !dg.is_float() || du != dg || sg.rank() != 1 {
             return Err(IrError::ShapeMismatch);
         }
         let n = sg.0[0];
@@ -472,14 +534,14 @@ impl Graph {
 
     pub fn softcap_argmax(&mut self, x: TensorId, cap: f32) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
-        if dx != DType::F32 || sx.rank() != 1 {
+        if !dx.is_float() || sx.rank() != 1 {
             return Err(IrError::ShapeMismatch);
         }
         let n = sx.0[0];
         Ok(self.call(
             vec![x],
             Shape(vec![1]),
-            DType::F32,
+            DType::F32, // index must stay F32 — half cannot represent vocab ids
             FuseHint::SoftcapArgmax { n, cap, x },
         ))
     }

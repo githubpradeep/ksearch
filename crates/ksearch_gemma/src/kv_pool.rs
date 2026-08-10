@@ -27,8 +27,10 @@ pub struct KvPool {
     pub max_seq: usize,
     pub n_kv_layers: usize,
     pub hd: usize,
-    /// True when buffers are F32 `[max_seq * hd]` (Thesis A prim); false = Q4_0 packs.
+    /// True when buffers are float elems `[max_seq * hd]` (F16 or F32); false = Q4_0 packs.
     pub f32_kv: bool,
+    /// Element size when `f32_kv` (2=F16, 4=F32).
+    pub kv_elem_bytes: usize,
     /// Per slot, per kv-layer: K and V caches.
     pub k: Vec<Vec<Buffer>>,
     pub v: Vec<Vec<Buffer>>,
@@ -43,10 +45,10 @@ impl KvPool {
         n_kv_layers: usize,
         hd: usize,
     ) -> Result<Self> {
-        Self::new_inner(ctx, max_batch, max_seq, n_kv_layers, hd, false)
+        Self::new_inner(ctx, max_batch, max_seq, n_kv_layers, hd, false, 0)
     }
 
-    /// F32 KV for Thesis A prim path (matches `SdpaNaive`).
+    /// F32 KV (legacy).
     pub fn new_f32(
         ctx: &MetalContext,
         max_batch: usize,
@@ -54,7 +56,18 @@ impl KvPool {
         n_kv_layers: usize,
         hd: usize,
     ) -> Result<Self> {
-        Self::new_inner(ctx, max_batch, max_seq, n_kv_layers, hd, true)
+        Self::new_inner(ctx, max_batch, max_seq, n_kv_layers, hd, true, 4)
+    }
+
+    /// F16 KV for Thesis A prim path (tinygrad `.half()`).
+    pub fn new_f16(
+        ctx: &MetalContext,
+        max_batch: usize,
+        max_seq: usize,
+        n_kv_layers: usize,
+        hd: usize,
+    ) -> Result<Self> {
+        Self::new_inner(ctx, max_batch, max_seq, n_kv_layers, hd, true, 2)
     }
 
     fn new_inner(
@@ -63,7 +76,8 @@ impl KvPool {
         max_seq: usize,
         n_kv_layers: usize,
         hd: usize,
-        f32_kv: bool,
+        float_kv: bool,
+        elem_bytes: usize,
     ) -> Result<Self> {
         if max_batch == 0 || max_seq == 0 || n_kv_layers == 0 || hd == 0 {
             bail!("KvPool dims must be non-zero");
@@ -81,9 +95,15 @@ impl KvPool {
             let mut ks = Vec::with_capacity(n_kv_layers);
             let mut vs = Vec::with_capacity(n_kv_layers);
             for _ in 0..n_kv_layers {
-                if f32_kv {
-                    ks.push(ctx.buffer_empty_f32(max_seq * hd));
-                    vs.push(ctx.buffer_empty_f32(max_seq * hd));
+                if float_kv {
+                    let n = max_seq * hd;
+                    if elem_bytes == 2 {
+                        ks.push(ctx.buffer_empty_f16(n));
+                        vs.push(ctx.buffer_empty_f16(n));
+                    } else {
+                        ks.push(ctx.buffer_empty_f32(n));
+                        vs.push(ctx.buffer_empty_f32(n));
+                    }
                 } else {
                     let nbytes = q40_nbytes(max_seq, hd);
                     ks.push(ctx.buffer_empty_bytes(nbytes));
@@ -99,7 +119,8 @@ impl KvPool {
             max_seq,
             n_kv_layers,
             hd,
-            f32_kv,
+            f32_kv: float_kv,
+            kv_elem_bytes: elem_bytes,
             k,
             v,
         })

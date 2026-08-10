@@ -100,6 +100,28 @@ fn sk_from_hint(out: TensorId, hint: &FuseHint) -> ScheduledKernel {
                 w: *w,
             },
         },
+        FuseHint::RmsNormPerHeadRope {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            x,
+            w,
+            cos_sin,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_rope_{}", out.0),
+            inputs: vec![*x, *w, *cos_sin],
+            output: out,
+            kind: KernelKind::RmsNormPerHeadRope {
+                n_heads: *n_heads,
+                hd: *hd,
+                eps: *eps,
+                with_weight: *with_weight,
+                x: *x,
+                w: *w,
+                cos_sin: *cos_sin,
+            },
+        },
         FuseHint::Rope {
             n_heads,
             hd,
@@ -114,6 +136,24 @@ fn sk_from_hint(out: TensorId, hint: &FuseHint) -> ScheduledKernel {
                 hd: *hd,
                 x: *x,
                 cos_sin: *cos_sin,
+            },
+        },
+        FuseHint::CopyScale {
+            src_off,
+            dst_off,
+            n,
+            scale,
+            src,
+        } => ScheduledKernel {
+            name: format!("k_csl_sc_{}", out.0),
+            inputs: vec![*src],
+            output: out,
+            kind: KernelKind::CopyScale {
+                src_off: *src_off,
+                dst_off: *dst_off,
+                n: *n,
+                scale: *scale,
+                src: *src,
             },
         },
         FuseHint::GeluMul {
@@ -288,9 +328,10 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
 pub fn lower_kernel(
     graph: &Graph,
     sk: &ScheduledKernel,
+    sched: ksearch_ir::OptSchedule,
 ) -> Result<ksearch_ir::KernelIr, CodegenError> {
     let (out_shape, out_dtype) = graph.shape_dtype(sk.output)?;
-    crate::lower::lower_to_kir(sk, out_shape, out_dtype, ksearch_ir::OptSchedule::default())
+    crate::lower::lower_to_kir(sk, out_shape, out_dtype, sched)
 }
 
 fn build_elem_expr(

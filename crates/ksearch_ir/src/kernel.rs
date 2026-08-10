@@ -18,20 +18,28 @@ pub struct OptSchedule {
 }
 
 impl Default for OptSchedule {
+    /// Dense F32 matvec default (LOCAL≈TG, UPCAST≈VEC).
     fn default() -> Self {
         Self {
-            tg: 1,
-            vec: 1,
+            tg: 32,
+            vec: 4,
             unroll: 1,
-            nsg: 1,
-            nr0: 2,
+            nsg: 2,
+            nr0: 4,
         }
     }
 }
 
 impl OptSchedule {
+    /// Same TG, scalar K (BEAM baseline).
     pub fn untuned() -> Self {
-        Self::default()
+        Self {
+            tg: 32,
+            vec: 1,
+            unroll: 1,
+            nsg: 2,
+            nr0: 4,
+        }
     }
     pub fn q4k_default() -> Self {
         Self::default()
@@ -69,11 +77,27 @@ pub enum FuseHint {
         x: TensorId,
         w: TensorId,
     },
+    RmsNormPerHeadRope {
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+    },
     Rope {
         n_heads: usize,
         hd: usize,
         x: TensorId,
         cos_sin: TensorId,
+    },
+    CopyScale {
+        src_off: usize,
+        dst_off: usize,
+        n: usize,
+        scale: f32,
+        src: TensorId,
     },
     GeluMul {
         n: usize,
@@ -158,11 +182,27 @@ pub enum KernelKind {
         x: TensorId,
         w: TensorId,
     },
+    RmsNormPerHeadRope {
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+    },
     Rope {
         n_heads: usize,
         hd: usize,
         x: TensorId,
         cos_sin: TensorId,
+    },
+    CopyScale {
+        src_off: usize,
+        dst_off: usize,
+        n: usize,
+        scale: f32,
+        src: TensorId,
     },
     GeluMul {
         n: usize,
@@ -194,7 +234,10 @@ pub enum ElemExpr {
 #[derive(Clone, Debug)]
 pub enum KirLaunch {
     Elementwise { n: usize },
+    /// One thread per row (`thread_position_in_grid`).
     Rows { rows: usize },
+    /// One threadgroup per row; `gid`=row, `lid`=lane (`OptSchedule.tg`).
+    RowsParallel { rows: usize, tg: u64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -222,14 +265,27 @@ pub enum KirExpr {
     ConstF32(f32),
     ConstU32(u32),
     Gid,
+    Lid,
     ForVar(u32),
     Var(u32),
-    /// Logical element load. `Q4K` means packed weight buffer; renderer expands dtype.
+    /// Mutable uint (thread-local), e.g. K index across ForRange loops.
+    UVar(u32),
+    /// Logical element load (F32 after dequant).
     Load {
         buf: u32,
         idx: Box<KirExpr>,
         dtype: DType,
     },
+    /// `dot(floatN(a[idx_a..]), floatN(b[idx_b..]))` for width 1/2/4 (promote half→float).
+    VecMulSum {
+        a_buf: u32,
+        a_idx: Box<KirExpr>,
+        b_buf: u32,
+        b_idx: Box<KirExpr>,
+        width: u32,
+        dtype: DType,
+    },
+    SimdSum(Box<KirExpr>),
     Bin {
         op: BinOp,
         a: Box<KirExpr>,
@@ -240,6 +296,10 @@ pub enum KirExpr {
         a: Box<KirExpr>,
     },
     CmpGt {
+        a: Box<KirExpr>,
+        b: Box<KirExpr>,
+    },
+    CmpEq {
         a: Box<KirExpr>,
         b: Box<KirExpr>,
     },
@@ -256,9 +316,21 @@ pub enum KirStmt {
         id: u32,
         expr: KirExpr,
     },
+    LetU32 {
+        id: u32,
+        expr: KirExpr,
+    },
     Assign {
         id: u32,
         expr: KirExpr,
+    },
+    /// `for (; id + limit_off < bound; id += step)` over existing `LetU32` var.
+    ForRange {
+        id: u32,
+        limit_off: KirExpr,
+        bound: KirExpr,
+        step: KirExpr,
+        body: Vec<KirStmt>,
     },
     Store {
         buf: u32,
@@ -269,6 +341,8 @@ pub enum KirStmt {
         cond: KirExpr,
         body: Vec<KirStmt>,
     },
+    /// Tree reduce `acc` across threadgroup (`tg` lanes). Uses simd_sum when tg≤32.
+    ThreadgroupReduce { acc_id: u32, tg: u64 },
 }
 
 #[derive(Clone, Debug)]

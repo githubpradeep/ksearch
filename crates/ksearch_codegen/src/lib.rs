@@ -57,21 +57,30 @@ pub enum LaunchHint {
 
 /// Lower Graph region via schedule → Kernel IR → MSL (default OptSchedule / plan cache).
 pub fn lower_to_metal(graph: &Graph, out: TensorId) -> Result<MetalKernelSource, CodegenError> {
+    let chip = std::env::var("KSEARCH_CHIP").unwrap_or_else(|_| "default".into());
+    lower_to_metal_chip(graph, out, &chip)
+}
+
+/// Same as [`lower_to_metal`] but with an explicit chip key for plan cache (use device name).
+pub fn lower_to_metal_chip(
+    graph: &Graph,
+    out: TensorId,
+    chip: &str,
+) -> Result<MetalKernelSource, CodegenError> {
     if !is_primitive_region(graph, out)? {
         return Err(CodegenError::Msg(format!(
             "lower_to_metal: not a primitive region ({:?})",
             graph.node(out)?.op
         )));
     }
-    let chip = std::env::var("KSEARCH_CHIP").unwrap_or_else(|_| "default".into());
-    let sched = if let Some(DType::Q4K) = matvec_weight_dtype(graph, out)? {
-        load_plan("matvec_q4k", &matvec_dims(graph, out)?, &chip)
-            .unwrap_or_else(OptSchedule::q4k_default)
-    } else if matvec_weight_dtype(graph, out)?.is_some() {
-        load_plan("matvec_f32", &matvec_dims(graph, out)?, &chip)
-            .unwrap_or_default()
-    } else {
-        OptSchedule::default()
+    let sched = match matvec_weight_dtype(graph, out)? {
+        Some(DType::Q4K) => load_plan("matvec_q4k", &matvec_dims(graph, out)?, chip)
+            .unwrap_or_else(OptSchedule::q4k_default),
+        Some(DType::F16) => load_plan("matvec_f16", &matvec_dims(graph, out)?, chip)
+            .unwrap_or_default(),
+        Some(DType::F32) => load_plan("matvec_f32", &matvec_dims(graph, out)?, chip)
+            .unwrap_or_default(),
+        Some(_) | None => OptSchedule::default(),
     };
     lower_with_schedule(graph, out, sched)
 }
@@ -97,7 +106,7 @@ pub fn lower_with_schedule(
         .into_iter()
         .next()
         .ok_or_else(|| CodegenError::Msg("empty schedule".into()))?;
-    let kir = lower_kernel(graph, &sk)?;
+    let kir = lower_kernel(graph, &sk, sched)?;
     render_msl(&kir, sched)
 }
 
@@ -132,17 +141,24 @@ where
         }
         _ => return Err(CodegenError::Msg("beam_search_matvec: not matvec".into())),
     };
-    let key = beam_cache_key("matvec", rows, cols, chip);
-    if let Some(cached) = load_beam_cache(&key) {
-        let sched = cached.schedule;
-        let kernel = lower_with_schedule(graph, out, sched)?;
-        let ms = time_ms(&kernel)?;
-        return Ok(BeamSearchResult {
-            schedule: sched,
-            ms,
-            from_cache: true,
-            kernel,
-        });
+    let dims = [rows, cols];
+    let plan_kind = match matvec_weight_dtype(graph, out)? {
+        Some(DType::F16) => "matvec_f16",
+        Some(DType::Q4K) => "matvec_q4k",
+        _ => "matvec_f32",
+    };
+    let force = std::env::var("KSEARCH_BEAM_FORCE").is_ok();
+    if !force {
+        if let Some(sched) = load_plan(plan_kind, &dims, chip) {
+            let kernel = lower_with_schedule(graph, out, sched)?;
+            let ms = time_ms(&kernel)?;
+            return Ok(BeamSearchResult {
+                schedule: sched,
+                ms,
+                from_cache: true,
+                kernel,
+            });
+        }
     }
 
     let untuned = OptSchedule::untuned();
@@ -160,13 +176,7 @@ where
         }
     }
 
-    save_beam_cache(
-        &key,
-        &BeamCacheEntry {
-            schedule: best_sched,
-            ms: best_ms,
-        },
-    );
+    save_plan(plan_kind, &dims, chip, best_sched, best_ms);
     Ok(BeamSearchResult {
         schedule: best_sched,
         ms: best_ms,

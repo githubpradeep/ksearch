@@ -10,27 +10,44 @@ pub fn lower_to_kir(
     sk: &ScheduledKernel,
     out_shape: ksearch_ir::Shape,
     out_dtype: DType,
-    _sched: OptSchedule,
+    sched: OptSchedule,
 ) -> Result<KernelIr, CodegenError> {
     let mut next = 0u32;
     let (launch, body) = match &sk.kind {
         KernelKind::Elementwise { n, expr } => (
             KirLaunch::Elementwise { n: *n },
-            lower_elemwise(expr, sk.inputs.len() as u32),
+            lower_elemwise(expr, sk.inputs.len() as u32, out_dtype),
         ),
         KernelKind::Matvec {
             rows,
             cols,
             weight_dtype,
             ..
-        } => (
-            KirLaunch::Rows { rows: *rows },
-            lower_matvec(*cols, *weight_dtype, &mut next),
-        ),
-        KernelKind::SumLast { rows, cols, .. } => (
-            KirLaunch::Rows { rows: *rows },
-            lower_sum_last(*cols, &mut next),
-        ),
+        } => {
+            if !weight_dtype.is_float() {
+                return Err(CodegenError::Msg(
+                    "lower matvec: only float weights (dequant first)".into(),
+                ));
+            }
+            validate_sched(sched)?;
+            (
+                KirLaunch::RowsParallel {
+                    rows: *rows,
+                    tg: sched.tg,
+                },
+                lower_matvec(*cols, *weight_dtype, sched, &mut next)?,
+            )
+        }
+        KernelKind::SumLast { rows, cols, .. } => {
+            validate_sched(sched)?;
+            (
+                KirLaunch::RowsParallel {
+                    rows: *rows,
+                    tg: sched.tg,
+                },
+                lower_sum_last(*cols, out_dtype, sched, &mut next)?,
+            )
+        }
         KernelKind::CopySlice {
             src_off,
             dst_off,
@@ -38,21 +55,21 @@ pub fn lower_to_kir(
             ..
         } => (
             KirLaunch::Elementwise { n: *n },
-            lower_copy_slice(*src_off, *dst_off, sk.inputs.len() as u32),
+            lower_copy_slice(*src_off, *dst_off, sk.inputs.len() as u32, out_dtype),
         ),
         KernelKind::RmsNorm { n, eps, .. } => (
             KirLaunch::Elementwise { n: 1 },
-            lower_rmsnorm(*n, *eps, false, None, 2, &mut next),
+            lower_rmsnorm(*n, *eps, false, None, 2, out_dtype, &mut next),
         ),
         KernelKind::RmsNormAdd { n, eps, .. } => (
             KirLaunch::Elementwise { n: 1 },
-            lower_rmsnorm(*n, *eps, true, None, 3, &mut next),
+            lower_rmsnorm(*n, *eps, true, None, 3, out_dtype, &mut next),
         ),
         KernelKind::RmsNormAddScale {
             n, eps, scale, ..
         } => (
             KirLaunch::Elementwise { n: 1 },
-            lower_rmsnorm(*n, *eps, true, Some(*scale), 3, &mut next),
+            lower_rmsnorm(*n, *eps, true, Some(*scale), 3, out_dtype, &mut next),
         ),
         KernelKind::RmsNormPerHead {
             n_heads,
@@ -62,23 +79,44 @@ pub fn lower_to_kir(
             ..
         } => (
             KirLaunch::Elementwise { n: *n_heads },
-            lower_rmsnorm_per_head(*hd, *eps, *with_weight, &mut next),
+            lower_rmsnorm_per_head(*hd, *eps, *with_weight, 0, 1, 2, out_dtype, &mut next),
+        ),
+        KernelKind::RmsNormPerHeadRope {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            ..
+        } => (
+            KirLaunch::Elementwise { n: *n_heads },
+            lower_rmsnorm_per_head_rope(*hd, *eps, *with_weight, out_dtype, &mut next),
         ),
         KernelKind::Rope { n_heads, hd, .. } => (
             KirLaunch::Elementwise { n: *n_heads },
-            lower_rope(*hd, &mut next),
+            lower_rope(*hd, 0, 1, 2, out_dtype, &mut next),
+        ),
+        KernelKind::CopyScale {
+            src_off,
+            dst_off,
+            n,
+            scale,
+            ..
+        } => (
+            KirLaunch::Elementwise { n: *n },
+            lower_copy_scale(*src_off, *dst_off, *scale, sk.inputs.len() as u32, out_dtype),
         ),
         KernelKind::GeluMul { n, up_off, .. } => (
             KirLaunch::Elementwise { n: *n },
-            lower_gelu_mul(*up_off, sk.inputs.len() as u32, &mut next),
+            lower_gelu_mul(*up_off, sk.inputs.len() as u32, out_dtype, &mut next),
         ),
         KernelKind::SdpaNaive { n_q, hd, max_t, .. } => (
             KirLaunch::Elementwise { n: *n_q },
-            lower_sdpa(*hd, *max_t, &mut next),
+            lower_sdpa(*hd, *max_t, out_dtype, &mut next),
         ),
         KernelKind::SoftcapArgmax { n, cap, .. } => (
+            // Gemma prim uses F16 logits; out_dtype is F32 for the index.
             KirLaunch::Elementwise { n: 1 },
-            lower_softcap_argmax(*n, *cap, &mut next),
+            lower_softcap_argmax(*n, *cap, DType::F16, &mut next),
         ),
     };
     Ok(KernelIr {
@@ -108,6 +146,9 @@ fn gid() -> KirExpr {
 }
 fn v(id: u32) -> KirExpr {
     KirExpr::Var(id)
+}
+fn uv(id: u32) -> KirExpr {
+    KirExpr::UVar(id)
 }
 fn fv(id: u32) -> KirExpr {
     KirExpr::ForVar(id)
@@ -142,87 +183,237 @@ fn gt(a: KirExpr, b: KirExpr) -> KirExpr {
     }
 }
 
-fn elem_kir(expr: &ElemExpr, g: &KirExpr) -> KirExpr {
+fn elem_kir(expr: &ElemExpr, g: &KirExpr, dt: DType) -> KirExpr {
     match expr {
-        ElemExpr::Load(bi) => ld(*bi as u32, g.clone(), DType::F32),
-        ElemExpr::Add(a, b) => bin(BinOp::Add, elem_kir(a, g), elem_kir(b, g)),
-        ElemExpr::Mul(a, b) => bin(BinOp::Mul, elem_kir(a, g), elem_kir(b, g)),
-        ElemExpr::Scale(i, s) => bin(BinOp::Mul, c(*s), elem_kir(i, g)),
+        ElemExpr::Load(bi) => ld(*bi as u32, g.clone(), dt),
+        ElemExpr::Add(a, b) => bin(BinOp::Add, elem_kir(a, g, dt), elem_kir(b, g, dt)),
+        ElemExpr::Mul(a, b) => bin(BinOp::Mul, elem_kir(a, g, dt), elem_kir(b, g, dt)),
+        ElemExpr::Scale(i, s) => bin(BinOp::Mul, c(*s), elem_kir(i, g, dt)),
     }
 }
 
-fn lower_elemwise(expr: &ElemExpr, n_in: u32) -> Vec<KirStmt> {
-    vec![st(n_in, gid(), elem_kir(expr, &gid()))]
+fn lid() -> KirExpr {
+    KirExpr::Lid
+}
+fn eq(a: KirExpr, b: KirExpr) -> KirExpr {
+    KirExpr::CmpEq {
+        a: Box::new(a),
+        b: Box::new(b),
+    }
+}
+fn vec_dot(a_buf: u32, a_idx: KirExpr, b_buf: u32, b_idx: KirExpr, width: u32, dt: DType) -> KirExpr {
+    KirExpr::VecMulSum {
+        a_buf,
+        a_idx: Box::new(a_idx),
+        b_buf,
+        b_idx: Box::new(b_idx),
+        width,
+        dtype: dt,
+    }
 }
 
-fn lower_matvec(cols: usize, weight_dtype: DType, next: &mut u32) -> Vec<KirStmt> {
+fn validate_sched(sched: OptSchedule) -> Result<(), CodegenError> {
+    if !matches!(sched.vec, 1 | 2 | 4) {
+        return Err(CodegenError::Msg(format!("unsupported VEC={}", sched.vec)));
+    }
+    if !matches!(sched.unroll, 1 | 2 | 4 | 8) {
+        return Err(CodegenError::Msg(format!(
+            "unsupported UNROLL={}",
+            sched.unroll
+        )));
+    }
+    if sched.tg == 0 || sched.tg > 1024 {
+        return Err(CodegenError::Msg(format!("unsupported TG={}", sched.tg)));
+    }
+    Ok(())
+}
+
+fn lower_elemwise(expr: &ElemExpr, n_in: u32, dt: DType) -> Vec<KirStmt> {
+    vec![st(n_in, gid(), elem_kir(expr, &gid(), dt))]
+}
+
+/// Tinygrad-style LOCAL/UPCAST/UNROLL as AST: lid-strided K, vec loads, tg reduce.
+fn lower_matvec(
+    cols: usize,
+    weight_dtype: DType,
+    sched: OptSchedule,
+    next: &mut u32,
+) -> Result<Vec<KirStmt>, CodegenError> {
+    let tg = sched.tg;
+    let vec = sched.vec;
+    let unroll = sched.unroll;
+    let stride = tg * u64::from(vec);
+    let step = stride * u64::from(unroll);
+    let last_u = u64::from(unroll.saturating_sub(1));
     let acc = fresh(next);
     let k = fresh(next);
     let row = gid();
-    vec![
+    let base = fresh(next);
+
+    let mut stmts = vec![
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, row.clone(), cu(cols as u32)),
+        },
         KirStmt::Let {
             id: acc,
             expr: c(0.0),
         },
-        KirStmt::For {
+        KirStmt::LetU32 {
             id: k,
-            n: cols,
+            expr: bin(BinOp::Mul, lid(), cu(vec)),
+        },
+    ];
+
+    // Main: for (; k + (unroll-1)*stride + vec - 1 < cols; k += step)
+    let main_off = (last_u * stride + u64::from(vec) - 1) as u32;
+    let mut main_body = Vec::new();
+    for u in 0..unroll {
+        let off = if u == 0 {
+            uv(k)
+        } else {
+            bin(BinOp::Add, uv(k), cu((u as u64 * stride) as u32))
+        };
+        main_body.push(KirStmt::Assign {
+            id: acc,
+            expr: bin(
+                BinOp::Add,
+                v(acc),
+                vec_dot(
+                    0,
+                    bin(BinOp::Add, uv(base), off.clone()),
+                    1,
+                    off,
+                    vec,
+                    weight_dtype,
+                ),
+            ),
+        });
+    }
+    stmts.push(KirStmt::ForRange {
+        id: k,
+        limit_off: cu(main_off),
+        bound: cu(cols as u32),
+        step: cu(step as u32),
+        body: main_body,
+    });
+
+    // Remainder vector: for (; k + vec - 1 < cols; k += stride)
+    let rem_off = vec.saturating_sub(1);
+    stmts.push(KirStmt::ForRange {
+        id: k,
+        limit_off: cu(rem_off),
+        bound: cu(cols as u32),
+        step: cu(stride as u32),
+        body: vec![KirStmt::Assign {
+            id: acc,
+            expr: bin(
+                BinOp::Add,
+                v(acc),
+                vec_dot(0, bin(BinOp::Add, uv(base), uv(k)), 1, uv(k), vec, weight_dtype),
+            ),
+        }],
+    });
+
+    // Scalar tail: for (; k < cols; k += tg)
+    stmts.push(KirStmt::ForRange {
+        id: k,
+        limit_off: cu(0),
+        bound: cu(cols as u32),
+        step: cu(tg as u32),
+        body: vec![KirStmt::Assign {
+            id: acc,
+            expr: bin(
+                BinOp::Add,
+                v(acc),
+                bin(
+                    BinOp::Mul,
+                    ld(0, bin(BinOp::Add, uv(base), uv(k)), weight_dtype),
+                    ld(1, uv(k), weight_dtype),
+                ),
+            ),
+        }],
+    });
+
+    stmts.push(KirStmt::ThreadgroupReduce { acc_id: acc, tg });
+    stmts.push(KirStmt::If {
+        cond: eq(lid(), cu(0)),
+        body: vec![st(2, row, v(acc))],
+    });
+    Ok(stmts)
+}
+
+fn lower_sum_last(
+    cols: usize,
+    dt: DType,
+    sched: OptSchedule,
+    next: &mut u32,
+) -> Result<Vec<KirStmt>, CodegenError> {
+    let tg = sched.tg;
+    let acc = fresh(next);
+    let k = fresh(next);
+    let row = gid();
+    let base = fresh(next);
+    Ok(vec![
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, row.clone(), cu(cols as u32)),
+        },
+        KirStmt::Let {
+            id: acc,
+            expr: c(0.0),
+        },
+        KirStmt::LetU32 {
+            id: k,
+            expr: lid(),
+        },
+        KirStmt::ForRange {
+            id: k,
+            limit_off: cu(0),
+            bound: cu(cols as u32),
+            step: cu(tg as u32),
             body: vec![KirStmt::Assign {
                 id: acc,
                 expr: bin(
                     BinOp::Add,
                     v(acc),
-                    bin(
-                        BinOp::Mul,
-                        ld(
-                            0,
-                            bin(BinOp::Add, bin(BinOp::Mul, row.clone(), cu(cols as u32)), fv(k)),
-                            weight_dtype,
-                        ),
-                        ld(1, fv(k), DType::F32),
-                    ),
+                    ld(0, bin(BinOp::Add, uv(base), uv(k)), dt),
                 ),
             }],
         },
-        st(2, row, v(acc)),
-    ]
+        KirStmt::ThreadgroupReduce { acc_id: acc, tg },
+        KirStmt::If {
+            cond: eq(lid(), cu(0)),
+            body: vec![st(1, row, v(acc))],
+        },
+    ])
 }
 
-fn lower_sum_last(cols: usize, next: &mut u32) -> Vec<KirStmt> {
-    let acc = fresh(next);
-    let k = fresh(next);
-    let row = gid();
-    vec![
-        KirStmt::Let {
-            id: acc,
-            expr: c(0.0),
-        },
-        KirStmt::For {
-            id: k,
-            n: cols,
-            body: vec![KirStmt::Assign {
-                id: acc,
-                expr: bin(
-                    BinOp::Add,
-                    v(acc),
-                    ld(
-                        0,
-                        bin(BinOp::Add, bin(BinOp::Mul, row.clone(), cu(cols as u32)), fv(k)),
-                        DType::F32,
-                    ),
-                ),
-            }],
-        },
-        st(1, row, v(acc)),
-    ]
-}
-
-fn lower_copy_slice(src_off: usize, dst_off: usize, n_in: u32) -> Vec<KirStmt> {
+fn lower_copy_slice(src_off: usize, dst_off: usize, n_in: u32, dt: DType) -> Vec<KirStmt> {
     let g = gid();
     vec![st(
         n_in,
         bin(BinOp::Add, cu(dst_off as u32), g.clone()),
-        ld(0, bin(BinOp::Add, cu(src_off as u32), g), DType::F32),
+        ld(0, bin(BinOp::Add, cu(src_off as u32), g), dt),
+    )]
+}
+
+fn lower_copy_scale(
+    src_off: usize,
+    dst_off: usize,
+    scale: f32,
+    n_in: u32,
+    dt: DType,
+) -> Vec<KirStmt> {
+    let g = gid();
+    vec![st(
+        n_in,
+        bin(BinOp::Add, cu(dst_off as u32), g.clone()),
+        bin(
+            BinOp::Mul,
+            c(scale),
+            ld(0, bin(BinOp::Add, cu(src_off as u32), g), dt),
+        ),
     )]
 }
 
@@ -232,6 +423,7 @@ fn lower_rmsnorm(
     add_res: bool,
     scale: Option<f32>,
     out_buf: u32,
+    dt: DType,
     next: &mut u32,
 ) -> Vec<KirStmt> {
     let ss = fresh(next);
@@ -253,8 +445,8 @@ fn lower_rmsnorm(
                     v(ss),
                     bin(
                         BinOp::Mul,
-                        ld(0, fv(i), DType::F32),
-                        ld(0, fv(i), DType::F32),
+                        ld(0, fv(i), dt),
+                        ld(0, fv(i), dt),
                     ),
                 ),
             }],
@@ -269,11 +461,11 @@ fn lower_rmsnorm(
     ];
     let mut val = bin(
         BinOp::Mul,
-        bin(BinOp::Mul, ld(0, fv(j), DType::F32), v(inv)),
-        ld(1, fv(j), DType::F32),
+        bin(BinOp::Mul, ld(0, fv(j), dt), v(inv)),
+        ld(1, fv(j), dt),
     );
     if add_res {
-        val = bin(BinOp::Add, val, ld(2, fv(j), DType::F32));
+        val = bin(BinOp::Add, val, ld(2, fv(j), dt));
     }
     if let Some(sc) = scale {
         val = bin(BinOp::Mul, c(sc), val);
@@ -290,6 +482,10 @@ fn lower_rmsnorm_per_head(
     hd: usize,
     eps: f32,
     with_weight: bool,
+    x_buf: u32,
+    w_buf: u32,
+    out_buf: u32,
+    dt: DType,
     next: &mut u32,
 ) -> Vec<KirStmt> {
     let head = gid();
@@ -317,8 +513,8 @@ fn lower_rmsnorm_per_head(
                     v(ss),
                     bin(
                         BinOp::Mul,
-                        ld(0, bin(BinOp::Add, v(base), fv(i)), DType::F32),
-                        ld(0, bin(BinOp::Add, v(base), fv(i)), DType::F32),
+                        ld(x_buf, bin(BinOp::Add, v(base), fv(i)), dt),
+                        ld(x_buf, bin(BinOp::Add, v(base), fv(i)), dt),
                     ),
                 ),
             }],
@@ -333,21 +529,41 @@ fn lower_rmsnorm_per_head(
     ];
     let mut val = bin(
         BinOp::Mul,
-        ld(0, bin(BinOp::Add, v(base), fv(j)), DType::F32),
+        ld(x_buf, bin(BinOp::Add, v(base), fv(j)), dt),
         v(inv),
     );
     if with_weight {
-        val = bin(BinOp::Mul, val, ld(1, fv(j), DType::F32));
+        val = bin(BinOp::Mul, val, ld(w_buf, fv(j), dt));
     }
     stmts.push(KirStmt::For {
         id: j,
         n: hd,
-        body: vec![st(2, bin(BinOp::Add, v(base), fv(j)), val)],
+        body: vec![st(out_buf, bin(BinOp::Add, v(base), fv(j)), val)],
     });
     stmts
 }
 
-fn lower_rope(hd: usize, next: &mut u32) -> Vec<KirStmt> {
+fn lower_rmsnorm_per_head_rope(
+    hd: usize,
+    eps: f32,
+    with_weight: bool,
+    dt: DType,
+    next: &mut u32,
+) -> Vec<KirStmt> {
+    // inputs: x=0, w=1, cos_sin=2; out=3
+    let mut body = lower_rmsnorm_per_head(hd, eps, with_weight, 0, 1, 3, dt, next);
+    body.extend(lower_rope(hd, 3, 2, 3, dt, next));
+    body
+}
+
+fn lower_rope(
+    hd: usize,
+    x_buf: u32,
+    cos_buf: u32,
+    out_buf: u32,
+    dt: DType,
+    next: &mut u32,
+) -> Vec<KirStmt> {
     let half = hd / 2;
     let base = fresh(next);
     let i = fresh(next);
@@ -366,26 +582,26 @@ fn lower_rope(hd: usize, next: &mut u32) -> Vec<KirStmt> {
             body: vec![
                 KirStmt::Let {
                     id: cos,
-                    expr: ld(1, fv(i), DType::F32),
+                    expr: ld(cos_buf, fv(i), dt),
                 },
                 KirStmt::Let {
                     id: sin,
-                    expr: ld(1, bin(BinOp::Add, cu(half as u32), fv(i)), DType::F32),
+                    expr: ld(cos_buf, bin(BinOp::Add, cu(half as u32), fv(i)), dt),
                 },
                 KirStmt::Let {
                     id: u,
-                    expr: ld(0, bin(BinOp::Add, v(base), fv(i)), DType::F32),
+                    expr: ld(x_buf, bin(BinOp::Add, v(base), fv(i)), dt),
                 },
                 KirStmt::Let {
                     id: vv,
                     expr: ld(
-                        0,
+                        x_buf,
                         bin(BinOp::Add, v(base), bin(BinOp::Add, cu(half as u32), fv(i))),
-                        DType::F32,
+                        dt,
                     ),
                 },
                 st(
-                    2,
+                    out_buf,
                     bin(BinOp::Add, v(base), fv(i)),
                     bin(
                         BinOp::Sub,
@@ -394,7 +610,7 @@ fn lower_rope(hd: usize, next: &mut u32) -> Vec<KirStmt> {
                     ),
                 ),
                 st(
-                    2,
+                    out_buf,
                     bin(BinOp::Add, v(base), bin(BinOp::Add, cu(half as u32), fv(i))),
                     bin(
                         BinOp::Add,
@@ -407,7 +623,7 @@ fn lower_rope(hd: usize, next: &mut u32) -> Vec<KirStmt> {
     ]
 }
 
-fn lower_gelu_mul(up_off: usize, n_in: u32, next: &mut u32) -> Vec<KirStmt> {
+fn lower_gelu_mul(up_off: usize, n_in: u32, dt: DType, next: &mut u32) -> Vec<KirStmt> {
     let g = gid();
     let x = fresh(next);
     let ax = fresh(next);
@@ -416,7 +632,7 @@ fn lower_gelu_mul(up_off: usize, n_in: u32, next: &mut u32) -> Vec<KirStmt> {
     vec![
         KirStmt::Let {
             id: x,
-            expr: ld(0, g.clone(), DType::F32),
+            expr: ld(0, g.clone(), dt),
         },
         KirStmt::Let {
             id: ax,
@@ -452,7 +668,7 @@ fn lower_gelu_mul(up_off: usize, n_in: u32, next: &mut u32) -> Vec<KirStmt> {
             bin(
                 BinOp::Mul,
                 v(gelu),
-                ld(1, bin(BinOp::Add, cu(up_off as u32), g), DType::F32),
+                ld(1, bin(BinOp::Add, cu(up_off as u32), g), dt),
             ),
         ),
     ]
@@ -466,6 +682,7 @@ fn dot_qkv(
     s_id: u32,
     d_id: u32,
     k_buf: u32,
+    dt: DType,
 ) -> Vec<KirStmt> {
     vec![
         KirStmt::Let {
@@ -485,7 +702,7 @@ fn dot_qkv(
                         ld(
                             0,
                             bin(BinOp::Add, bin(BinOp::Mul, head.clone(), cu(hd as u32)), fv(d_id)),
-                            DType::F32,
+                            dt,
                         ),
                         ld(
                             k_buf,
@@ -494,7 +711,7 @@ fn dot_qkv(
                                 bin(BinOp::Mul, bin(BinOp::Add, start.clone(), t), cu(hd as u32)),
                                 fv(d_id),
                             ),
-                            DType::F32,
+                            dt,
                         ),
                     ),
                 ),
@@ -503,7 +720,7 @@ fn dot_qkv(
     ]
 }
 
-fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
+fn lower_sdpa(hd: usize, max_t: usize, dt: DType, next: &mut u32) -> Vec<KirStmt> {
     let head = gid();
     let tlen = fresh(next);
     let start = fresh(next);
@@ -517,11 +734,11 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
     let mut stmts = vec![
         KirStmt::Let {
             id: tlen,
-            expr: ld(3, cu(0), DType::F32),
+            expr: ld(3, cu(0), dt),
         },
         KirStmt::Let {
             id: start,
-            expr: ld(3, cu(1), DType::F32),
+            expr: ld(3, cu(1), dt),
         },
         KirStmt::Let {
             id: mmax,
@@ -529,7 +746,7 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
         },
     ];
 
-    let mut pass1 = dot_qkv(&head, &v(start), fv(t), hd, s, d, 1);
+    let mut pass1 = dot_qkv(&head, &v(start), fv(t), hd, s, d, 1, dt);
     pass1.push(KirStmt::If {
         cond: gt(v(tlen), fv(t)),
         body: vec![KirStmt::Assign {
@@ -550,7 +767,7 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
     let t2 = fresh(next);
     let s2 = fresh(next);
     let d2 = fresh(next);
-    let mut pass2 = dot_qkv(&head, &v(start), fv(t2), hd, s2, d2, 1);
+    let mut pass2 = dot_qkv(&head, &v(start), fv(t2), hd, s2, d2, 1, dt);
     pass2.push(KirStmt::If {
         cond: gt(v(tlen), fv(t2)),
         body: vec![KirStmt::Assign {
@@ -588,7 +805,7 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
     let d3 = fresh(next);
     let p = fresh(next);
     let d4 = fresh(next);
-    let mut pass3 = dot_qkv(&head, &v(start), fv(t3), hd, s3, d3, 1);
+    let mut pass3 = dot_qkv(&head, &v(start), fv(t3), hd, s3, d3, 1, dt);
     pass3.push(KirStmt::If {
         cond: gt(v(tlen), fv(t3)),
         body: {
@@ -614,7 +831,7 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
                         oi.clone(),
                         bin(
                             BinOp::Add,
-                            ld(4, oi, DType::F32),
+                            ld(4, oi, dt),
                             bin(
                                 BinOp::Mul,
                                 v(p),
@@ -629,7 +846,7 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
                                         ),
                                         fv(d4),
                                     ),
-                                    DType::F32,
+                                    dt,
                                 ),
                             ),
                         ),
@@ -647,7 +864,7 @@ fn lower_sdpa(hd: usize, max_t: usize, next: &mut u32) -> Vec<KirStmt> {
     stmts
 }
 
-fn lower_softcap_argmax(n: usize, cap: f32, next: &mut u32) -> Vec<KirStmt> {
+fn lower_softcap_argmax(n: usize, cap: f32, dt: DType, next: &mut u32) -> Vec<KirStmt> {
     let best = fresh(next);
     let bestv = fresh(next);
     let i = fresh(next);
@@ -672,7 +889,7 @@ fn lower_softcap_argmax(n: usize, cap: f32, next: &mut u32) -> Vec<KirStmt> {
                         c(cap),
                         un(
                             UnaryOp::Tanh,
-                            bin(BinOp::Div, ld(0, fv(i), DType::F32), c(cap)),
+                            bin(BinOp::Div, ld(0, fv(i), dt), c(cap)),
                         ),
                     ),
                 },

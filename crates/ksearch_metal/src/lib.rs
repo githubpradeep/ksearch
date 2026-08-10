@@ -74,6 +74,10 @@ impl MetalContext {
         )
     }
 
+    pub fn buffer_empty_f16(&self, n: usize) -> Buffer {
+        self.buffer_empty_bytes(n * 2)
+    }
+
     pub fn buffer_empty_bytes(&self, n: usize) -> Buffer {
         self.device
             .new_buffer(n as u64, MTLResourceOptions::StorageModeShared)
@@ -85,6 +89,12 @@ impl MetalContext {
         unsafe { std::slice::from_raw_parts(ptr, n).to_vec() }
     }
 
+    pub fn read_u16(&self, buf: &Buffer, n: usize) -> Vec<u16> {
+        self.synchronize().ok();
+        let ptr = buf.contents() as *const u16;
+        unsafe { std::slice::from_raw_parts(ptr, n).to_vec() }
+    }
+
     pub fn write_buffer(&self, buf: &Buffer, data: &[f32]) {
         self.synchronize().ok();
         self.write_buffer_nosync(buf, data);
@@ -93,6 +103,14 @@ impl MetalContext {
     /// Host write without flushing GPU. Caller must ensure `buf` is not a pending GPU write target.
     pub fn write_buffer_nosync(&self, buf: &Buffer, data: &[f32]) {
         let ptr = buf.contents() as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+        }
+    }
+
+    pub fn write_u16s(&self, buf: &Buffer, data: &[u16]) {
+        self.synchronize().ok();
+        let ptr = buf.contents() as *mut u16;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }

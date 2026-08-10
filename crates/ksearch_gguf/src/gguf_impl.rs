@@ -443,6 +443,19 @@ impl Gguf {
         });
         out
     }
+
+    /// Dequant → IEEE F16 bytes (tinygrad `.half()` after `ggml_data_to_tensor`).
+    pub fn dequant_to_f16_bytes(&self, name: &str) -> Vec<u8> {
+        let info = self.tensor(name).unwrap_or_else(|| panic!("tensor not found: {}", name));
+        let bytes = self.tensor_bytes(info);
+        let mut out = Vec::with_capacity(info.num_elements() * 2);
+        dequant_blocks(info.ggml_type, bytes, info.num_elements(), |chunk| {
+            for &v in chunk {
+                out.extend_from_slice(&crate::f32_to_f16(v).to_le_bytes());
+            }
+        });
+        out
+    }
 }
 
 fn align_up(x: usize, align: usize) -> usize {

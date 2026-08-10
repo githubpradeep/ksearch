@@ -20,10 +20,10 @@ pub struct BeamSearchResult {
     pub kernel: MetalKernelSource,
 }
 
-/// Discrete TG / VEC / UNROLL candidates for dense F32 matvec.
+/// Discrete TG / VEC / UNROLL candidates for dense float matvec (F16/F32).
 pub fn beam_matvec_candidates() -> Vec<OptSchedule> {
     let mut out = Vec::new();
-    for &tg in &[32u64, 64, 128] {
+    for &tg in &[16u64, 32, 64, 128, 256] {
         for &vec in &[1u32, 2, 4] {
             for &unroll in &[1u32, 2, 4] {
                 out.push(OptSchedule {
