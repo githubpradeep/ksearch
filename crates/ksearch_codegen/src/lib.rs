@@ -47,6 +47,8 @@ pub enum LaunchHint {
     Elementwise { n: usize },
     Rows { rows: usize, cols: usize },
     RowsParallel { rows: usize, tg: u64 },
+    /// ggml-style: `threads_per_threadgroup = (32, nsg)`; `rows` = #threadgroups.
+    RowsParallelSg { rows: usize, nsg: u64 },
     RowsParallel2D { rows: usize, batch: usize, tg: u64 },
     MulMm {
         tg_x: u64,
@@ -197,7 +199,11 @@ where
     let mut best_ms = f64::INFINITY;
     let mut best_kernel = lower_with_schedule(graph, out, untuned)?;
 
-    for sched in beam_matvec_candidates() {
+    let candidates = match matvec_weight_dtype(graph, out)? {
+        Some(DType::Q4K) => beam_matvec_q4k_candidates(),
+        _ => beam_matvec_candidates(),
+    };
+    for sched in candidates {
         let kernel = lower_with_schedule(graph, out, sched)?;
         let ms = time_ms(&kernel)?;
         if ms < best_ms {

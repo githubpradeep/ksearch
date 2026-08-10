@@ -22,6 +22,12 @@ pub struct MetalContext {
     inflight: RefCell<Vec<CommandBuffer>>,
 }
 
+impl Drop for MetalContext {
+    fn drop(&mut self) {
+        let _ = self.synchronize();
+    }
+}
+
 impl MetalContext {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| anyhow!("No Metal device"))?;
@@ -317,6 +323,7 @@ impl MetalContext {
                     (n_tg, tg)
                 }
                 LaunchHint::RowsParallel { rows, tg } => (*rows as u64, *tg),
+                LaunchHint::RowsParallelSg { rows, nsg } => (*rows as u64, nsg * 32),
                 LaunchHint::RowsParallel2D { rows, batch, tg } => {
                     // Encode as flattened 1D for the common path; 2D set below.
                     let _ = (rows, batch, tg);
@@ -329,6 +336,12 @@ impl MetalContext {
                     enc.dispatch_thread_groups(
                         MTLSize::new(*rows as u64, *batch as u64, 1),
                         MTLSize::new(*tg, 1, 1),
+                    );
+                }
+                LaunchHint::RowsParallelSg { rows, nsg } => {
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(*rows as u64, 1, 1),
+                        MTLSize::new(32, *nsg, 1),
                     );
                 }
                 LaunchHint::MulMm {
@@ -391,6 +404,7 @@ impl MetalContext {
                     (n_tg, tg)
                 }
                 LaunchHint::RowsParallel { rows, tg } => (*rows as u64, *tg),
+                LaunchHint::RowsParallelSg { rows, nsg } => (*rows as u64, nsg * 32),
                 LaunchHint::RowsParallel2D { rows, batch, tg } => {
                     (*rows as u64 * *batch as u64, *tg)
                 }
@@ -401,6 +415,12 @@ impl MetalContext {
                     enc.dispatch_thread_groups(
                         MTLSize::new(*rows as u64, *batch as u64, 1),
                         MTLSize::new(*tg, 1, 1),
+                    );
+                }
+                LaunchHint::RowsParallelSg { rows, nsg } => {
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(*rows as u64, 1, 1),
+                        MTLSize::new(32, *nsg, 1),
                     );
                 }
                 LaunchHint::MulMm {

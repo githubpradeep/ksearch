@@ -3,6 +3,15 @@
 use crate::{DType, FuseHint, IrError, Shape, TensorId};
 use std::collections::HashMap;
 
+/// Out dtype for matvec-like FuseHints: float weights match act, or Q4K×F16 → F16.
+fn matvec_weight_act_out(weight: DType, act: DType, cols: usize) -> Result<DType, IrError> {
+    match (weight, act) {
+        (d, a) if d.is_float() && a == d => Ok(d),
+        (DType::Q4K, DType::F16) if cols % 256 == 0 => Ok(DType::F16),
+        _ => Err(IrError::ShapeMismatch),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Op {
     Input { shape: Shape, dtype: DType },
@@ -151,6 +160,7 @@ impl Graph {
             (DType::F32, DType::F32) => DType::F32,
             (DType::F16, DType::F16) => DType::F16,
             (DType::Q4K, DType::F32) if sl.0[1] % 256 == 0 => DType::F32,
+            (DType::Q4K, DType::F16) if sl.0[1] % 256 == 0 => DType::F16,
             _ => return Err(IrError::ShapeMismatch),
         };
         Ok(self.push(
@@ -533,6 +543,7 @@ impl Graph {
     }
 
     /// Fused gate/up matvecs + GELU*mul: `out[i] = gelu(W_gate[i]·x) * (W_up[i]·x)`.
+    /// Weights may be F16/F32 (matching act) or Q4K with F16 activations (out F16).
     pub fn matvec_gate_up_gelu(
         &mut self,
         gate: TensorId,
@@ -545,15 +556,16 @@ impl Graph {
         if sg.rank() != 2 || su != sg || sx.rank() != 1 {
             return Err(IrError::ShapeMismatch);
         }
-        if !dg.is_float() || du != dg || dx != dg || sx.0[0] != sg.0[1] {
+        if du != dg || sx.0[0] != sg.0[1] {
             return Err(IrError::ShapeMismatch);
         }
         let rows = sg.0[0];
         let cols = sg.0[1];
+        let out_dt = matvec_weight_act_out(dg, dx, cols)?;
         Ok(self.call(
             vec![gate, up, x],
             Shape(vec![rows]),
-            dg,
+            out_dt,
             FuseHint::MatvecGateUpGelu {
                 rows,
                 cols,
@@ -565,6 +577,7 @@ impl Graph {
     }
 
     /// Fused Q/K/V matvecs sharing `x`: Metal emits 3 outputs; Call root shape is Q.
+    /// Weights may be F16/F32 (matching act) or Q4K with F16 activations (out F16).
     pub fn matvec_qkv(
         &mut self,
         wq: TensorId,
@@ -582,16 +595,17 @@ impl Graph {
         if sk != sv || sq.0[1] != sk.0[1] || sx.0[0] != sq.0[1] {
             return Err(IrError::ShapeMismatch);
         }
-        if !dq.is_float() || dk != dq || dv != dq || dx != dq {
+        if dk != dq || dv != dq {
             return Err(IrError::ShapeMismatch);
         }
         let q_rows = sq.0[0];
         let kv_rows = sk.0[0];
         let cols = sq.0[1];
+        let out_dt = matvec_weight_act_out(dq, dx, cols)?;
         Ok(self.call(
             vec![wq, wk, wv, x],
             Shape(vec![q_rows]),
-            dq,
+            out_dt,
             FuseHint::MatvecQkv {
                 q_rows,
                 kv_rows,
@@ -605,6 +619,7 @@ impl Graph {
     }
 
     /// RMSNorm(x,w_norm) fused into dense matvec: LOCAL `x_hat`, `y = W @ x_hat`.
+    /// Weight may be Q4K with F16 act/norm (norm stays F16); out is F16.
     pub fn rmsnorm_matvec(
         &mut self,
         w_mat: TensorId,
@@ -618,7 +633,7 @@ impl Graph {
         if sw.rank() != 2 || sx.rank() != 1 || sn.rank() != 1 {
             return Err(IrError::ShapeMismatch);
         }
-        if !dw.is_float() || dx != dw || dn != dw {
+        if dn != dx {
             return Err(IrError::ShapeMismatch);
         }
         if sx.0[0] != sw.0[1] || sn.0[0] != sx.0[0] {
@@ -626,10 +641,11 @@ impl Graph {
         }
         let rows = sw.0[0];
         let cols = sw.0[1];
+        let out_dt = matvec_weight_act_out(dw, dx, cols)?;
         Ok(self.call(
             vec![w_mat, x, w_norm],
             Shape(vec![rows]),
-            dw,
+            out_dt,
             FuseHint::RmsNormMatvec {
                 n: cols,
                 eps,
@@ -658,7 +674,7 @@ impl Graph {
         if sg.rank() != 2 || su != sg || sx.rank() != 1 || sn.rank() != 1 {
             return Err(IrError::ShapeMismatch);
         }
-        if !dg.is_float() || du != dg || dx != dg || dn != dg {
+        if du != dg || dn != dx {
             return Err(IrError::ShapeMismatch);
         }
         if sx.0[0] != sg.0[1] || sn.0[0] != sx.0[0] {
@@ -666,10 +682,11 @@ impl Graph {
         }
         let rows = sg.0[0];
         let cols = sg.0[1];
+        let out_dt = matvec_weight_act_out(dg, dx, cols)?;
         Ok(self.call(
             vec![gate, up, x, w_norm],
             Shape(vec![rows]),
-            dg,
+            out_dt,
             FuseHint::RmsNormMatvecGateUpGelu {
                 n: cols,
                 eps,
@@ -705,16 +722,17 @@ impl Graph {
         if sk != sv || sq.0[1] != sk.0[1] || sx.0[0] != sq.0[1] || sn.0[0] != sx.0[0] {
             return Err(IrError::ShapeMismatch);
         }
-        if !dq.is_float() || dk != dq || dv != dq || dx != dq || dn != dq {
+        if dk != dq || dv != dq || dn != dx {
             return Err(IrError::ShapeMismatch);
         }
         let q_rows = sq.0[0];
         let kv_rows = sk.0[0];
         let cols = sq.0[1];
+        let out_dt = matvec_weight_act_out(dq, dx, cols)?;
         Ok(self.call(
             vec![wq, wk, wv, x, w_norm],
             Shape(vec![q_rows]),
-            dq,
+            out_dt,
             FuseHint::RmsNormMatvecQkv {
                 n: cols,
                 eps,

@@ -43,18 +43,22 @@ pub fn beam_matvec_candidates() -> Vec<OptSchedule> {
     out
 }
 
-/// Discrete NSG / NR0 candidates for Q4_K dtype-fused matvec.
+/// Discrete TG / UNROLL / NR0 candidates for Q4_K.
+/// Lower clamps TG to `cols/vec` (vec=256 when K%256==0) and ignores `vec` here.
 pub fn beam_matvec_q4k_candidates() -> Vec<OptSchedule> {
     let mut out = Vec::new();
-    for &nsg in &[1u32, 2, 4] {
-        for &nr0 in &[2u32, 4, 8] {
-            out.push(OptSchedule {
-                tg: (nsg as u64) * 32,
-                vec: 1,
-                unroll: 1,
-                nsg,
-                nr0,
-            });
+    // Prefer small TG seeds; apply_matvec_sched clamps to useful K-chunks (often 6–24).
+    for &tg in &[8u64, 16, 32, 64] {
+        for &unroll in &[1u32, 2] {
+            for &nr0 in &[4u32, 8, 16] {
+                out.push(OptSchedule {
+                    tg,
+                    vec: 1,
+                    unroll,
+                    nsg: 2,
+                    nr0,
+                });
+            }
         }
     }
     out

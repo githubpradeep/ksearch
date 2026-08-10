@@ -9,7 +9,7 @@ use ksearch_ir::{DType, Graph, Op, TensorId};
 /// Apply local rewrites rooted at `out`. Returns the (possibly new) root id.
 ///
 /// Current rewrites:
-/// 1. **Q4 matvec discoverability** — `SumReduce(MulBroadcastRow(Q4K, F32))` is left
+/// 1. **Q4 matvec discoverability** — `SumReduce(MulBroadcastRow(Q4K, F16|F32))` is left
 ///    intact so the scheduler emits one Kernel IR matvec with `weight_dtype=Q4K`
 ///    (dequant fused at render). No `Op::MatVecQ4K` is introduced.
 /// 2. **ScaleConst folding into Mul** — `Mul(ScaleConst(x,s), y)` → keep structure but
@@ -47,7 +47,7 @@ pub fn validate_q4_matvec_pattern(graph: &Graph, out: TensorId) -> Result<bool, 
     };
     let (_, wd) = graph.shape_dtype(*left)?;
     let (_, xd) = graph.shape_dtype(*row)?;
-    Ok(wd == DType::Q4K && xd == DType::F32)
+    Ok(wd == DType::Q4K && matches!(xd, DType::F16 | DType::F32))
 }
 
 /// Classify weight dtype for a scheduled matvec root (`SumReduce` of `MulBroadcastRow`

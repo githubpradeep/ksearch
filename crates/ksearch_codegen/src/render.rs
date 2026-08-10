@@ -3,15 +3,394 @@
 use crate::{CodegenError, LaunchHint, MetalKernelSource};
 use ksearch_ir::{BinOp, DType, KirExpr, KirLaunch, KirStmt, KernelIr, OptSchedule, UnaryOp};
 
-pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSource, CodegenError> {
-    // Tinygrad-style: no hand q4k_load. Quant → float via Graph/CPU dequant, then F32 AST only.
-    if body_needs_q4(&kir.body) {
-        return Err(CodegenError::Msg(
-            "render: Q4_K Load in AST — dequant to F32 first (tinygrad ggml_data_to_tensor style)"
-                .into(),
-        ));
+/// Generic Q4_K Load / VecMulSum expand (not a named matvec kernel).
+const Q4K_LOAD_HELPER: &str = r#"
+inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
+  if (j < 4u) { d = q[j] & 63u; m = q[j + 4u] & 63u; }
+  else { d = (q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u); m = (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u); }
+}
+inline float ksearch_q4k_at(device const uchar* blk, float d, float dmin, uint j) {
+  device const uchar* scales = blk + 4;
+  device const uchar* qs = blk + 16;
+  uint is = (j / 64u) * 2u;
+  uint qoff = (j / 64u) * 32u;
+  uint jl = j % 64u;
+  uchar sc, mn;
+  if (jl < 32u) {
+    ksearch_get_scale_min_k4(is, scales, sc, mn);
+    return d * float(sc) * float(qs[qoff + jl] & 0x0Fu) - dmin * float(mn);
+  } else {
+    ksearch_get_scale_min_k4(is + 1u, scales, sc, mn);
+    return d * float(sc) * float(qs[qoff + (jl - 32u)] >> 4u) - dmin * float(mn);
+  }
+}
+inline float ksearch_load_q4k(device const uchar* A, uint idx) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  device const uchar* blk = A + (idx / QK) * BPB;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  return ksearch_q4k_at(blk, d, dmin, idx % QK);
+}
+// Shared super-block metadata for consecutive idx..idx+3 (vec Load expand).
+inline float4 ksearch_load_q4k4(device const uchar* A, uint idx) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  uint b0 = idx / QK;
+  if ((idx + 3u) / QK != b0) {
+    return float4(ksearch_load_q4k(A, idx), ksearch_load_q4k(A, idx + 1u),
+                  ksearch_load_q4k(A, idx + 2u), ksearch_load_q4k(A, idx + 3u));
+  }
+  device const uchar* blk = A + b0 * BPB;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  uint j = idx % QK;
+  return float4(ksearch_q4k_at(blk, d, dmin, j),
+                ksearch_q4k_at(blk, d, dmin, j + 1u),
+                ksearch_q4k_at(blk, d, dmin, j + 2u),
+                ksearch_q4k_at(blk, d, dmin, j + 3u));
+}
+inline float2 ksearch_load_q4k2(device const uchar* A, uint idx) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  uint b0 = idx / QK;
+  if ((idx + 1u) / QK != b0) {
+    return float2(ksearch_load_q4k(A, idx), ksearch_load_q4k(A, idx + 1u));
+  }
+  device const uchar* blk = A + b0 * BPB;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  uint j = idx % QK;
+  return float2(ksearch_q4k_at(blk, d, dmin, j), ksearch_q4k_at(blk, d, dmin, j + 1u));
+}
+// One 6-bit scale/min governs 32 weights — vectorized nibble unpack + float4 dots.
+inline float ksearch_dot_q4k32(device const uchar* A, uint widx, threadgroup const float* x, uint xidx) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  device const uchar* blk = A + (widx / QK) * BPB;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  device const uchar* scales = blk + 4;
+  device const uchar* qs = blk + 16;
+  uint j = widx % QK;
+  uint is = (j / 64u) * 2u;
+  uint qoff = (j / 64u) * 32u;
+  uint jl = j % 64u;
+  uchar sc, mn;
+  float4 x0 = *(threadgroup const float4*)(x + xidx + 0u);
+  float4 x1 = *(threadgroup const float4*)(x + xidx + 4u);
+  float4 x2 = *(threadgroup const float4*)(x + xidx + 8u);
+  float4 x3 = *(threadgroup const float4*)(x + xidx + 12u);
+  float4 x4 = *(threadgroup const float4*)(x + xidx + 16u);
+  float4 x5 = *(threadgroup const float4*)(x + xidx + 20u);
+  float4 x6 = *(threadgroup const float4*)(x + xidx + 24u);
+  float4 x7 = *(threadgroup const float4*)(x + xidx + 28u);
+  packed_uchar4 qp0 = *(device const packed_uchar4*)(qs + qoff + 0u);
+  packed_uchar4 qp1 = *(device const packed_uchar4*)(qs + qoff + 4u);
+  packed_uchar4 qp2 = *(device const packed_uchar4*)(qs + qoff + 8u);
+  packed_uchar4 qp3 = *(device const packed_uchar4*)(qs + qoff + 12u);
+  packed_uchar4 qp4 = *(device const packed_uchar4*)(qs + qoff + 16u);
+  packed_uchar4 qp5 = *(device const packed_uchar4*)(qs + qoff + 20u);
+  packed_uchar4 qp6 = *(device const packed_uchar4*)(qs + qoff + 24u);
+  packed_uchar4 qp7 = *(device const packed_uchar4*)(qs + qoff + 28u);
+  uint4 q0 = uint4(qp0[0], qp0[1], qp0[2], qp0[3]);
+  uint4 q1 = uint4(qp1[0], qp1[1], qp1[2], qp1[3]);
+  uint4 q2 = uint4(qp2[0], qp2[1], qp2[2], qp2[3]);
+  uint4 q3 = uint4(qp3[0], qp3[1], qp3[2], qp3[3]);
+  uint4 q4 = uint4(qp4[0], qp4[1], qp4[2], qp4[3]);
+  uint4 q5 = uint4(qp5[0], qp5[1], qp5[2], qp5[3]);
+  uint4 q6 = uint4(qp6[0], qp6[1], qp6[2], qp6[3]);
+  uint4 q7 = uint4(qp7[0], qp7[1], qp7[2], qp7[3]);
+  float4 acc4 = float4(0.0f);
+  if (jl < 32u) {
+    ksearch_get_scale_min_k4(is, scales, sc, mn);
+    float d1 = d * float(sc);
+    float4 m = float4(dmin * float(mn));
+    acc4 += (d1 * float4(int4(q0 & 0xFu)) - m) * x0;
+    acc4 += (d1 * float4(int4(q1 & 0xFu)) - m) * x1;
+    acc4 += (d1 * float4(int4(q2 & 0xFu)) - m) * x2;
+    acc4 += (d1 * float4(int4(q3 & 0xFu)) - m) * x3;
+    acc4 += (d1 * float4(int4(q4 & 0xFu)) - m) * x4;
+    acc4 += (d1 * float4(int4(q5 & 0xFu)) - m) * x5;
+    acc4 += (d1 * float4(int4(q6 & 0xFu)) - m) * x6;
+    acc4 += (d1 * float4(int4(q7 & 0xFu)) - m) * x7;
+  } else {
+    ksearch_get_scale_min_k4(is + 1u, scales, sc, mn);
+    float d2 = d * float(sc);
+    float4 m = float4(dmin * float(mn));
+    acc4 += (d2 * float4(int4(q0 >> 4u)) - m) * x0;
+    acc4 += (d2 * float4(int4(q1 >> 4u)) - m) * x1;
+    acc4 += (d2 * float4(int4(q2 >> 4u)) - m) * x2;
+    acc4 += (d2 * float4(int4(q3 >> 4u)) - m) * x3;
+    acc4 += (d2 * float4(int4(q4 >> 4u)) - m) * x4;
+    acc4 += (d2 * float4(int4(q5 >> 4u)) - m) * x5;
+    acc4 += (d2 * float4(int4(q6 >> 4u)) - m) * x6;
+    acc4 += (d2 * float4(int4(q7 >> 4u)) - m) * x7;
+  }
+  return acc4.x + acc4.y + acc4.z + acc4.w;
+}
+// Full Q4_K super-block (256 weights) — one d/dmin load, 8 scale groups.
+inline float ksearch_dot_q4k256(device const uchar* A, uint widx, threadgroup const float* x, uint xidx) {
+  constexpr uint BPB = 144u;
+  device const uchar* blk = A + (widx / 256u) * BPB;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  device const uchar* scales = blk + 4;
+  device const uchar* qs = blk + 16;
+  float acc = 0.0f;
+  for (uint g = 0u; g < 4u; g++) {
+    uchar sc0, mn0, sc1, mn1;
+    ksearch_get_scale_min_k4(g * 2u, scales, sc0, mn0);
+    ksearch_get_scale_min_k4(g * 2u + 1u, scales, sc1, mn1);
+    float d0 = d * float(sc0);
+    float m0 = dmin * float(mn0);
+    float d1 = d * float(sc1);
+    float m1 = dmin * float(mn1);
+    uint qoff = g * 32u;
+    uint x0 = xidx + g * 64u;
+    for (uint l = 0u; l < 32u; l += 4u) {
+      float4 ql = float4(float(qs[qoff + l] & 0x0Fu), float(qs[qoff + l + 1u] & 0x0Fu),
+                         float(qs[qoff + l + 2u] & 0x0Fu), float(qs[qoff + l + 3u] & 0x0Fu));
+      float4 qh = float4(float(qs[qoff + l] >> 4u), float(qs[qoff + l + 1u] >> 4u),
+                         float(qs[qoff + l + 2u] >> 4u), float(qs[qoff + l + 3u] >> 4u));
+      acc += dot(d0 * ql - float4(m0), *(threadgroup const float4*)(x + x0 + l));
+      acc += dot(d1 * qh - float4(m1), *(threadgroup const float4*)(x + x0 + 32u + l));
     }
+  }
+  return acc;
+}
+inline float ksearch_dot_q4k32_dev(device const uchar* A, uint widx, device const half* x, uint xidx) {
+  float acc = 0.0f;
+  for (uint l = 0u; l < 32u; l++) {
+    acc += ksearch_load_q4k(A, widx + l) * float(x[xidx + l]);
+  }
+  return acc;
+}
+inline float ksearch_dot_q4k256_dev(device const uchar* A, uint widx, device const half* x, uint xidx) {
+  float acc = 0.0f;
+  for (uint l = 0u; l < 256u; l++) {
+    acc += ksearch_load_q4k(A, widx + l) * float(x[xidx + l]);
+  }
+  return acc;
+}
+// ggml-style simdgroup lane partial for one Q4_K superblock (mul_vec_q4_K layout).
+inline float ksearch_q4k_coop_frag(
+    device const uchar* A, uint row_base, uint cols, uint ib,
+    threadgroup const float* x, uint lane) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+  uint it = lane % 8u;
+  uint iq = it / 4u;
+  uint ir = it % 4u;
+  (void)cols;
+  device const uchar* blk = A + (row_base / QK + ib) * BPB;
+  float yl[16];
+  float yh[16];
+  threadgroup const float* y4 = x + ib * QK + 64u * iq + 8u * ir;
+  float4 sumy = float4(0.0f);
+  for (uint i = 0u; i < 8u; i++) {
+    yl[i + 0u] = y4[i + 0u];   sumy[0] += yl[i + 0u];
+    yl[i + 8u] = y4[i + 32u];  sumy[1] += yl[i + 8u];
+    yh[i + 0u] = y4[i + 128u]; sumy[2] += yh[i + 0u];
+    yh[i + 8u] = y4[i + 160u]; sumy[3] += yh[i + 8u];
+  }
+  device const uint16_t* sc = ((device const uint16_t*)(blk + 4)) + iq;
+  device const uint16_t* q1 = ((device const uint16_t*)(blk + 16)) + 16u * iq + 4u * ir;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  uint16_t sc16[4];
+  thread const uchar* sc8 = (thread const uchar*)sc16;
+  sc16[0] = sc[0] & kmask1;
+  sc16[1] = sc[2] & kmask1;
+  sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+  sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+  device const uint16_t* q2 = q1 + 32;
+  float4 acc1 = float4(0.0f);
+  float4 acc2 = float4(0.0f);
+  for (uint i = 0u; i < 4u; i++) {
+    acc1[0] += yl[2u * i + 0u] * float(q1[i] & 0x000Fu);
+    acc1[1] += yl[2u * i + 1u] * float(q1[i] & 0x0F00u);
+    acc1[2] += yl[2u * i + 8u] * float(q1[i] & 0x00F0u);
+    acc1[3] += yl[2u * i + 9u] * float(q1[i] & 0xF000u);
+    acc2[0] += yh[2u * i + 0u] * float(q2[i] & 0x000Fu);
+    acc2[1] += yh[2u * i + 1u] * float(q2[i] & 0x0F00u);
+    acc2[2] += yh[2u * i + 8u] * float(q2[i] & 0x00F0u);
+    acc2[3] += yh[2u * i + 9u] * float(q2[i] & 0xF000u);
+  }
+  return d * ((acc1[0] + (1.0f / 256.0f) * acc1[1]) * float(sc8[0]) +
+              (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1]) * (1.0f / 16.0f) +
+              (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4]) +
+              (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5]) * (1.0f / 16.0f)) -
+         dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                 sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+}
+// One y-load; accumulate 4 rows for both gate and up weight streams.
+inline void ksearch_q4k_coop_frag_nr4_dual(
+    device const uchar* Ag, device const uchar* Au,
+    uint row0_base, uint cols, uint ib,
+    threadgroup const float* x, uint lane,
+    thread float* g0, thread float* g1, thread float* g2, thread float* g3,
+    thread float* u0, thread float* u1, thread float* u2, thread float* u3) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+  uint it = lane % 8u;
+  uint iq = it / 4u;
+  uint ir = it % 4u;
+  uint bpr = cols / QK;
+  float yl[16];
+  float yh[16];
+  threadgroup const float* y4 = x + ib * QK + 64u * iq + 8u * ir;
+  float4 sumy = float4(0.0f);
+  for (uint i = 0u; i < 8u; i++) {
+    yl[i + 0u] = y4[i + 0u];   sumy[0] += yl[i + 0u];
+    yl[i + 8u] = y4[i + 32u];  sumy[1] += yl[i + 8u];
+    yh[i + 0u] = y4[i + 128u]; sumy[2] += yh[i + 0u];
+    yh[i + 8u] = y4[i + 160u]; sumy[3] += yh[i + 8u];
+  }
+  uint row_bytes_u16 = (bpr * BPB) / 2u;
+  device const uchar* blk_g = Ag + (row0_base / QK + ib) * BPB;
+  device const uchar* blk_u = Au + (row0_base / QK + ib) * BPB;
+  device const uint16_t* sc_g = ((device const uint16_t*)(blk_g + 4)) + iq;
+  device const uint16_t* q1_g = ((device const uint16_t*)(blk_g + 16)) + 16u * iq + 4u * ir;
+  device const half* dh_g = (device const half*)(blk_g);
+  device const uint16_t* sc_u = ((device const uint16_t*)(blk_u + 4)) + iq;
+  device const uint16_t* q1_u = ((device const uint16_t*)(blk_u + 16)) + 16u * iq + 4u * ir;
+  device const half* dh_u = (device const half*)(blk_u);
+  float sumg[4] = {0.f, 0.f, 0.f, 0.f};
+  float sumu[4] = {0.f, 0.f, 0.f, 0.f};
+  uint16_t sc16[4];
+  thread const uchar* sc8 = (thread const uchar*)sc16;
+  for (uint row = 0u; row < 4u; row++) {
+    float4 a1g = float4(0.0f), a2g = float4(0.0f);
+    float4 a1u = float4(0.0f), a2u = float4(0.0f);
+    sc16[0] = sc_g[0] & kmask1;
+    sc16[1] = sc_g[2] & kmask1;
+    sc16[2] = ((sc_g[4] >> 0) & kmask2) | ((sc_g[0] & kmask3) >> 2);
+    sc16[3] = ((sc_g[4] >> 4) & kmask2) | ((sc_g[2] & kmask3) >> 2);
+    device const uint16_t* q2_g = q1_g + 32;
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) {
+      a1g[0] += yl[2u * i + 0u] * float(q1_g[i] & 0x000Fu);
+      a1g[1] += yl[2u * i + 1u] * float(q1_g[i] & 0x0F00u);
+      a1g[2] += yl[2u * i + 8u] * float(q1_g[i] & 0x00F0u);
+      a1g[3] += yl[2u * i + 9u] * float(q1_g[i] & 0xF000u);
+      a2g[0] += yh[2u * i + 0u] * float(q2_g[i] & 0x000Fu);
+      a2g[1] += yh[2u * i + 1u] * float(q2_g[i] & 0x0F00u);
+      a2g[2] += yh[2u * i + 8u] * float(q2_g[i] & 0x00F0u);
+      a2g[3] += yh[2u * i + 9u] * float(q2_g[i] & 0xF000u);
+    }
+    sumg[row] += float(dh_g[0]) * ((a1g[0] + (1.0f / 256.0f) * a1g[1]) * float(sc8[0]) +
+                                   (a1g[2] + (1.0f / 256.0f) * a1g[3]) * float(sc8[1]) * (1.0f / 16.0f) +
+                                   (a2g[0] + (1.0f / 256.0f) * a2g[1]) * float(sc8[4]) +
+                                   (a2g[2] + (1.0f / 256.0f) * a2g[3]) * float(sc8[5]) * (1.0f / 16.0f)) -
+                float(dh_g[1]) * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                                  sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+    sc16[0] = sc_u[0] & kmask1;
+    sc16[1] = sc_u[2] & kmask1;
+    sc16[2] = ((sc_u[4] >> 0) & kmask2) | ((sc_u[0] & kmask3) >> 2);
+    sc16[3] = ((sc_u[4] >> 4) & kmask2) | ((sc_u[2] & kmask3) >> 2);
+    device const uint16_t* q2_u = q1_u + 32;
+    #pragma unroll
+    for (uint i = 0u; i < 4u; i++) {
+      a1u[0] += yl[2u * i + 0u] * float(q1_u[i] & 0x000Fu);
+      a1u[1] += yl[2u * i + 1u] * float(q1_u[i] & 0x0F00u);
+      a1u[2] += yl[2u * i + 8u] * float(q1_u[i] & 0x00F0u);
+      a1u[3] += yl[2u * i + 9u] * float(q1_u[i] & 0xF000u);
+      a2u[0] += yh[2u * i + 0u] * float(q2_u[i] & 0x000Fu);
+      a2u[1] += yh[2u * i + 1u] * float(q2_u[i] & 0x0F00u);
+      a2u[2] += yh[2u * i + 8u] * float(q2_u[i] & 0x00F0u);
+      a2u[3] += yh[2u * i + 9u] * float(q2_u[i] & 0xF000u);
+    }
+    sumu[row] += float(dh_u[0]) * ((a1u[0] + (1.0f / 256.0f) * a1u[1]) * float(sc8[0]) +
+                                   (a1u[2] + (1.0f / 256.0f) * a1u[3]) * float(sc8[1]) * (1.0f / 16.0f) +
+                                   (a2u[0] + (1.0f / 256.0f) * a2u[1]) * float(sc8[4]) +
+                                   (a2u[2] + (1.0f / 256.0f) * a2u[3]) * float(sc8[5]) * (1.0f / 16.0f)) -
+                float(dh_u[1]) * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                                  sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+    q1_g += row_bytes_u16; sc_g += row_bytes_u16; dh_g += row_bytes_u16;
+    q1_u += row_bytes_u16; sc_u += row_bytes_u16; dh_u += row_bytes_u16;
+  }
+  *g0 += sumg[0]; *g1 += sumg[1]; *g2 += sumg[2]; *g3 += sumg[3];
+  *u0 += sumu[0]; *u1 += sumu[1]; *u2 += sumu[2]; *u3 += sumu[3];
+}
+inline void ksearch_q4k_coop_frag_nr4(
+    device const uchar* A, uint row0_base, uint cols, uint ib,
+    threadgroup const float* x, uint lane,
+    thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  constexpr uint16_t kmask1 = 0x3f3f;
+  constexpr uint16_t kmask2 = 0x0f0f;
+  constexpr uint16_t kmask3 = 0xc0c0;
+  uint it = lane % 8u;
+  uint iq = it / 4u;
+  uint ir = it % 4u;
+  uint bpr = cols / QK;
+  float yl[16];
+  float yh[16];
+  threadgroup const float* y4 = x + ib * QK + 64u * iq + 8u * ir;
+  float4 sumy = float4(0.0f);
+  for (uint i = 0u; i < 8u; i++) {
+    yl[i + 0u] = y4[i + 0u];   sumy[0] += yl[i + 0u];
+    yl[i + 8u] = y4[i + 32u];  sumy[1] += yl[i + 8u];
+    yh[i + 0u] = y4[i + 128u]; sumy[2] += yh[i + 0u];
+    yh[i + 8u] = y4[i + 160u]; sumy[3] += yh[i + 8u];
+  }
+  device const uchar* blk0 = A + (row0_base / QK + ib) * BPB;
+  device const uint16_t* sc = ((device const uint16_t*)(blk0 + 4)) + iq;
+  device const uint16_t* q1 = ((device const uint16_t*)(blk0 + 16)) + 16u * iq + 4u * ir;
+  device const half* dh = (device const half*)(blk0);
+  thread float* accs[4] = { a0, a1, a2, a3 };
+  uint row_bytes_u16 = (bpr * BPB) / 2u;
+  for (uint row = 0u; row < 4u; row++) {
+    uint16_t sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+    sc16[0] = sc[0] & kmask1;
+    sc16[1] = sc[2] & kmask1;
+    sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+    sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+    device const uint16_t* q2 = q1 + 32;
+    float4 acc1 = float4(0.0f);
+    float4 acc2 = float4(0.0f);
+    for (uint i = 0u; i < 4u; i++) {
+      acc1[0] += yl[2u * i + 0u] * float(q1[i] & 0x000Fu);
+      acc1[1] += yl[2u * i + 1u] * float(q1[i] & 0x0F00u);
+      acc1[2] += yl[2u * i + 8u] * float(q1[i] & 0x00F0u);
+      acc1[3] += yl[2u * i + 9u] * float(q1[i] & 0xF000u);
+      acc2[0] += yh[2u * i + 0u] * float(q2[i] & 0x000Fu);
+      acc2[1] += yh[2u * i + 1u] * float(q2[i] & 0x0F00u);
+      acc2[2] += yh[2u * i + 8u] * float(q2[i] & 0x00F0u);
+      acc2[3] += yh[2u * i + 9u] * float(q2[i] & 0xF000u);
+    }
+    float d = float(dh[0]);
+    float dmin = float(dh[1]);
+    *accs[row] += d * ((acc1[0] + (1.0f / 256.0f) * acc1[1]) * float(sc8[0]) +
+                       (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1]) * (1.0f / 16.0f) +
+                       (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4]) +
+                       (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5]) * (1.0f / 16.0f)) -
+                  dmin * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                          sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+    q1 += row_bytes_u16;
+    sc += row_bytes_u16;
+    dh += row_bytes_u16;
+  }
+}
+
+"#;
+
+pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSource, CodegenError> {
+    // Q4_K is a Load dtype like F16: generic expand to float (tinygrad ggml_data_to_tensor ops).
+    // No named matvec_q4k kernel template — only dtype expansion on Load / VecMulSum.
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
+    if body_needs_q4(&kir.body) {
+        src.push_str(Q4K_LOAD_HELPER);
+    }
     let n_in = kir.n_inputs as u32;
     let (params, launch, guard) = match &kir.launch {
         KirLaunch::Elementwise { n } => {
@@ -43,6 +422,22 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
                     tg: (*tg).max(1),
                 },
                 format!("  if (gid >= {}u) return;\n", (*rows).max(1)),
+            )
+        }
+        KirLaunch::RowsParallelSg { rows, nsg } => {
+            let p = buffer_params(kir);
+            (
+                format!(
+                    "{p}  uint gid [[threadgroup_position_in_grid]],\n  uint tiisg [[thread_index_in_simdgroup]],\n  uint sgitg [[simdgroup_index_in_threadgroup]]"
+                ),
+                LaunchHint::RowsParallelSg {
+                    rows: (*rows).max(1),
+                    nsg: (*nsg).max(1),
+                },
+                format!(
+                    "  if (gid >= {}u) return;\n  uint lid = sgitg * 32u + tiisg;\n",
+                    (*rows).max(1)
+                ),
             )
         }
     };
@@ -107,6 +502,36 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
                 infer_load_expr(val, in_dt);
             }
             KirStmt::TgDeclF32 { .. } | KirStmt::Barrier | KirStmt::ThreadgroupReduce { .. } => {}
+            KirStmt::Q4kCoopNr4 {
+                w_buf,
+                row0_base,
+                ib,
+                lane,
+                ..
+            } => {
+                if (*w_buf as usize) < in_dt.len() {
+                    in_dt[*w_buf as usize] = DType::Q4K;
+                }
+                infer_load_expr(row0_base, in_dt);
+                infer_load_expr(ib, in_dt);
+                infer_load_expr(lane, in_dt);
+            }
+            KirStmt::Q4kCoopNr4Dual {
+                row0_base,
+                ib,
+                lane,
+                ..
+            } => {
+                if in_dt.len() > 0 {
+                    in_dt[0] = DType::Q4K;
+                }
+                if in_dt.len() > 1 {
+                    in_dt[1] = DType::Q4K;
+                }
+                infer_load_expr(row0_base, in_dt);
+                infer_load_expr(ib, in_dt);
+                infer_load_expr(lane, in_dt);
+            }
         }
     }
 }
@@ -131,9 +556,9 @@ fn infer_load_expr(e: &KirExpr, in_dt: &mut [DType]) {
             if (*a_buf as usize) < in_dt.len() {
                 in_dt[*a_buf as usize] = *dtype;
             }
-            // B from threadgroup float — do not overwrite device buffer dtype from VecMulSum.
+            // B is always activation float/half (never quantized packing).
             if b_from_tg.is_none() {
-                if (*b_buf as usize) < in_dt.len() {
+                if (*b_buf as usize) < in_dt.len() && dtype.is_float() {
                     in_dt[*b_buf as usize] = *dtype;
                 }
             }
@@ -142,7 +567,22 @@ fn infer_load_expr(e: &KirExpr, in_dt: &mut [DType]) {
         }
         KirExpr::TgLoad { idx, .. } => infer_load_expr(idx, in_dt),
         KirExpr::CastU32ToF32(e) => infer_load_expr(e, in_dt),
+        KirExpr::CastF32ToU32(e) => infer_load_expr(e, in_dt),
         KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => infer_load_expr(a, in_dt),
+        KirExpr::Q4kCoopFrag {
+            w_buf,
+            row_base,
+            ib,
+            lane,
+            ..
+        } => {
+            if (*w_buf as usize) < in_dt.len() {
+                in_dt[*w_buf as usize] = DType::Q4K;
+            }
+            infer_load_expr(row_base, in_dt);
+            infer_load_expr(ib, in_dt);
+            infer_load_expr(lane, in_dt);
+        }
         KirExpr::Bin { a, b, .. } | KirExpr::CmpGt { a, b } | KirExpr::CmpEq { a, b } => {
             infer_load_expr(a, in_dt);
             infer_load_expr(b, in_dt);
@@ -170,13 +610,31 @@ fn walk_expr_q4(e: &KirExpr, buf: u32) -> bool {
         } if *b == buf => true,
         KirExpr::Load { idx, .. } => walk_expr_q4(idx, buf),
         KirExpr::VecMulSum {
+            a_buf,
+            dtype: DType::Q4K,
+            ..
+        } if *a_buf == buf => true,
+        KirExpr::VecMulSum {
             a_idx,
             b_idx,
             ..
         } => walk_expr_q4(a_idx, buf) || walk_expr_q4(b_idx, buf),
         KirExpr::TgLoad { idx, .. } => walk_expr_q4(idx, buf),
         KirExpr::CastU32ToF32(e) => walk_expr_q4(e, buf),
+        KirExpr::CastF32ToU32(e) => walk_expr_q4(e, buf),
         KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => walk_expr_q4(a, buf),
+        KirExpr::Q4kCoopFrag {
+            w_buf,
+            row_base,
+            ib,
+            lane,
+            ..
+        } => {
+            *w_buf == buf
+                || walk_expr_q4(row_base, buf)
+                || walk_expr_q4(ib, buf)
+                || walk_expr_q4(lane, buf)
+        }
         KirExpr::Bin { a, b, .. }
         | KirExpr::CmpGt { a, b }
         | KirExpr::CmpEq { a, b } => walk_expr_q4(a, buf) || walk_expr_q4(b, buf),
@@ -220,6 +678,35 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                 }
             }
             KirStmt::TgDeclF32 { .. } | KirStmt::Barrier | KirStmt::ThreadgroupReduce { .. } => {}
+            KirStmt::Q4kCoopNr4 {
+                w_buf,
+                row0_base,
+                ib,
+                lane,
+                ..
+            } => {
+                if *w_buf == buf
+                    || walk_expr_q4(row0_base, buf)
+                    || walk_expr_q4(ib, buf)
+                    || walk_expr_q4(lane, buf)
+                {
+                    return true;
+                }
+            }
+            KirStmt::Q4kCoopNr4Dual {
+                row0_base,
+                ib,
+                lane,
+                ..
+            } => {
+                if buf <= 1
+                    || walk_expr_q4(row0_base, buf)
+                    || walk_expr_q4(ib, buf)
+                    || walk_expr_q4(lane, buf)
+                {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -330,17 +817,68 @@ fn emit_stmts(
                 if *tg <= 32 {
                     s.push_str(&format!("{pad}v{acc_id} = simd_sum(v{acc_id});\n"));
                 } else {
+                    // Hierarchical: simd_sum per SIMD-group, then short sum over ≤tg/32 partials.
+                    let nsg = (*tg + 31) / 32;
                     s.push_str(&format!(
-                        "{pad}threadgroup float red_{acc_id}[{tg}];\n\
-                         {pad}red_{acc_id}[lid] = v{acc_id};\n\
+                        "{pad}v{acc_id} = simd_sum(v{acc_id});\n\
+                         {pad}threadgroup float red_{acc_id}[{nsg}];\n\
+                         {pad}if ((lid & 31u) == 0u) red_{acc_id}[lid / 32u] = v{acc_id};\n\
                          {pad}threadgroup_barrier(mem_flags::mem_threadgroup);\n\
-                         {pad}for (uint stride = {tg}u / 2u; stride > 0u; stride >>= 1u) {{\n\
-                         {pad}  if (lid < stride) red_{acc_id}[lid] += red_{acc_id}[lid + stride];\n\
-                         {pad}  threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                         {pad}if (lid == 0u) {{\n\
+                         {pad}  float s = red_{acc_id}[0];\n"
+                    ));
+                    for i in 1..nsg {
+                        s.push_str(&format!("{pad}  s += red_{acc_id}[{i}];\n"));
+                    }
+                    s.push_str(&format!(
+                        "{pad}  red_{acc_id}[0] = s;\n\
                          {pad}}}\n\
+                         {pad}threadgroup_barrier(mem_flags::mem_threadgroup);\n\
                          {pad}v{acc_id} = red_{acc_id}[0];\n"
                     ));
                 }
+            }
+            KirStmt::Q4kCoopNr4 {
+                w_buf,
+                row0_base,
+                cols,
+                ib,
+                b_from_tg,
+                lane,
+                acc_ids,
+            } => {
+                let a = buf_name(*w_buf, n_in, n_out);
+                let rb = emit_expr_ty(row0_base, n_in, n_out, false, elem)?;
+                let ib_s = emit_expr_ty(ib, n_in, n_out, false, elem)?;
+                let lane_s = emit_expr_ty(lane, n_in, n_out, false, elem)?;
+                s.push_str(&format!(
+                    "{pad}ksearch_q4k_coop_frag_nr4({a}, ({rb}), {cols}u, ({ib_s}), tg{b_from_tg}, ({lane_s}), &v{}, &v{}, &v{}, &v{});\n",
+                    acc_ids[0], acc_ids[1], acc_ids[2], acc_ids[3]
+                ));
+            }
+            KirStmt::Q4kCoopNr4Dual {
+                row0_base,
+                cols,
+                ib,
+                b_from_tg,
+                lane,
+                acc_g,
+                acc_u,
+            } => {
+                let rb = emit_expr_ty(row0_base, n_in, n_out, false, elem)?;
+                let ib_s = emit_expr_ty(ib, n_in, n_out, false, elem)?;
+                let lane_s = emit_expr_ty(lane, n_in, n_out, false, elem)?;
+                s.push_str(&format!(
+                    "{pad}ksearch_q4k_coop_frag_nr4_dual(in0, in1, ({rb}), {cols}u, ({ib_s}), tg{b_from_tg}, ({lane_s}), &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{});\n",
+                    acc_g[0],
+                    acc_g[1],
+                    acc_g[2],
+                    acc_g[3],
+                    acc_u[0],
+                    acc_u[1],
+                    acc_u[2],
+                    acc_u[3]
+                ));
             }
         }
     }
@@ -403,9 +941,14 @@ fn emit_expr_ty(
             match dtype {
                 DType::F32 => load,
                 DType::F16 => format!("float({load})"),
+                DType::Q4K => format!(
+                    "ksearch_load_q4k({}, {})",
+                    buf_name(*buf, n_in, n_out),
+                    idx_u
+                ),
                 other => {
                     return Err(CodegenError::Msg(format!(
-                        "render load: dtype {other:?} — dequant to float first (tinygrad style)"
+                        "render load: unsupported dtype {other:?}"
                     )))
                 }
             }
@@ -434,6 +977,21 @@ fn emit_expr_ty(
             if let Some(tg_id) = b_from_tg {
                 // A from device (dtype); B from threadgroup float.
                 match width {
+                    1 if *dtype == DType::Q4K => format!(
+                        "(ksearch_load_q4k({a}, {ai}) * tg{tg_id}[{bi}])"
+                    ),
+                    2 if *dtype == DType::Q4K => format!(
+                        "dot(ksearch_load_q4k2({a}, ({ai})), *(threadgroup const float2*)(tg{tg_id} + ({bi})))"
+                    ),
+                    4 if *dtype == DType::Q4K => format!(
+                        "dot(ksearch_load_q4k4({a}, ({ai})), *(threadgroup const float4*)(tg{tg_id} + ({bi})))"
+                    ),
+                    32 if *dtype == DType::Q4K => format!(
+                        "ksearch_dot_q4k32({a}, ({ai}), tg{tg_id}, ({bi}))"
+                    ),
+                    256 if *dtype == DType::Q4K => format!(
+                        "ksearch_dot_q4k256({a}, ({ai}), tg{tg_id}, ({bi}))"
+                    ),
                     4 if *dtype == DType::F16 => format!(
                         "dot(float4(*(device const half4*)({a} + ({ai}))), *(threadgroup const float4*)(tg{tg_id} + ({bi})))"
                     ),
@@ -465,6 +1023,21 @@ fn emit_expr_ty(
                     _ => ("float", ""),
                 };
                 match width {
+                    1 if *dtype == DType::Q4K => format!(
+                        "(ksearch_load_q4k({a}, {ai}) * float({b}[{bi}]))"
+                    ),
+                    2 if *dtype == DType::Q4K => format!(
+                        "dot(ksearch_load_q4k2({a}, ({ai})), float2(float({b}[({bi})]), float({b}[({bi}) + 1u])))"
+                    ),
+                    4 if *dtype == DType::Q4K => format!(
+                        "dot(ksearch_load_q4k4({a}, ({ai})), float4(float({b}[({bi})]), float({b}[({bi}) + 1u]), float({b}[({bi}) + 2u]), float({b}[({bi}) + 3u])))"
+                    ),
+                    32 if *dtype == DType::Q4K => format!(
+                        "ksearch_dot_q4k32_dev({a}, ({ai}), {b}, ({bi}))"
+                    ),
+                    256 if *dtype == DType::Q4K => format!(
+                        "ksearch_dot_q4k256_dev({a}, ({ai}), {b}, ({bi}))"
+                    ),
                     4 if *dtype == DType::F16 => format!(
                         "dot(float4(*(device const half4*)({a} + ({ai}))), float4(*(device const half4*)({b} + ({bi}))))"
                     ),
@@ -493,8 +1066,24 @@ fn emit_expr_ty(
             }
         }
         KirExpr::SimdSum(a) => format!("simd_sum({})", emit_expr_ty(a, n_in, n_out, true, elem)?),
+        KirExpr::Q4kCoopFrag {
+            w_buf,
+            row_base,
+            cols,
+            ib,
+            b_from_tg,
+            lane,
+        } => {
+            let a = buf_name(*w_buf, n_in, n_out);
+            let rb = emit_expr_ty(row_base, n_in, n_out, false, elem)?;
+            let ib_s = emit_expr_ty(ib, n_in, n_out, false, elem)?;
+            let lane_s = emit_expr_ty(lane, n_in, n_out, false, elem)?;
+            format!(
+                "ksearch_q4k_coop_frag({a}, ({rb}), {cols}u, ({ib_s}), tg{b_from_tg}, ({lane_s}))"
+            )
+        }
         KirExpr::Bin { op, a, b } => {
-            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
                 && is_uintish(a)
                 && is_uintish(b)
                 && !as_float
@@ -503,6 +1092,7 @@ fn emit_expr_ty(
                     BinOp::Add => "+",
                     BinOp::Sub => "-",
                     BinOp::Mul => "*",
+                    BinOp::Div => "/",
                     _ => unreachable!(),
                 };
                 format!(
@@ -560,16 +1150,22 @@ fn emit_expr_ty(
         KirExpr::CastU32ToF32(e) => {
             format!("float({})", emit_expr_ty(e, n_in, n_out, false, elem)?)
         }
+        KirExpr::CastF32ToU32(e) => {
+            format!("uint({})", emit_expr_ty(e, n_in, n_out, true, elem)?)
+        }
     })
 }
 
 fn is_uintish(e: &KirExpr) -> bool {
     match e {
-        KirExpr::Gid | KirExpr::Lid | KirExpr::ForVar(_) | KirExpr::ConstU32(_) | KirExpr::UVar(_) => {
-            true
-        }
+        KirExpr::Gid
+        | KirExpr::Lid
+        | KirExpr::ForVar(_)
+        | KirExpr::ConstU32(_)
+        | KirExpr::UVar(_)
+        | KirExpr::CastF32ToU32(_) => true,
         KirExpr::Bin {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul,
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div,
             a,
             b,
         } => is_uintish(a) && is_uintish(b),

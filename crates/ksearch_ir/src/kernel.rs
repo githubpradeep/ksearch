@@ -42,7 +42,14 @@ impl OptSchedule {
         }
     }
     pub fn q4k_default() -> Self {
-        Self::default()
+        // Seed TG; lower clamps to cols/256 (or /32). nr0 amortizes LOCAL x (lm_head).
+        Self {
+            tg: 32,
+            vec: 1,
+            unroll: 1,
+            nsg: 2,
+            nr0: 16,
+        }
     }
 }
 
@@ -342,6 +349,8 @@ pub enum KirLaunch {
     Rows { rows: usize },
     /// `rows` threadgroups; each TG may cover `OptSchedule.nr0` output rows (`gid`=TG index).
     RowsParallel { rows: usize, tg: u64 },
+    /// ggml mul_vec layout: threadsPerThreadgroup=(32, nsg).
+    RowsParallelSg { rows: usize, nsg: u64 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -397,6 +406,16 @@ pub enum KirExpr {
         idx: Box<KirExpr>,
     },
     SimdSum(Box<KirExpr>),
+    /// One simdgroup-lane partial for a Q4_K superblock (ggml `mul_vec_q4_K` layout).
+    /// `row_base` = row * cols (element index); `ib` = superblock index; `lane` = lid%32.
+    Q4kCoopFrag {
+        w_buf: u32,
+        row_base: Box<KirExpr>,
+        cols: u32,
+        ib: Box<KirExpr>,
+        b_from_tg: u32,
+        lane: Box<KirExpr>,
+    },
     Bin {
         op: BinOp,
         a: Box<KirExpr>,
@@ -416,6 +435,8 @@ pub enum KirExpr {
     },
     /// `float(uint_expr)` for storing indices in float tg/regs.
     CastU32ToF32(Box<KirExpr>),
+    /// `uint(float_expr)` — e.g. SDPA meta tlen/start from F16 buffers.
+    CastF32ToU32(Box<KirExpr>),
 }
 
 #[derive(Clone, Debug)]
@@ -466,6 +487,26 @@ pub enum KirStmt {
     },
     /// Tree reduce `acc` across threadgroup (`tg` lanes). Uses simd_sum when tg≤32.
     ThreadgroupReduce { acc_id: u32, tg: u64 },
+    /// ggml-style Q4_K: one y-load, accumulate 4 consecutive rows into `acc_ids`.
+    Q4kCoopNr4 {
+        w_buf: u32,
+        row0_base: KirExpr,
+        cols: u32,
+        ib: KirExpr,
+        b_from_tg: u32,
+        lane: KirExpr,
+        acc_ids: [u32; 4],
+    },
+    /// Dual gate∥up: one y-load, 4 rows × two weight streams.
+    Q4kCoopNr4Dual {
+        row0_base: KirExpr,
+        cols: u32,
+        ib: KirExpr,
+        b_from_tg: u32,
+        lane: KirExpr,
+        acc_g: [u32; 4],
+        acc_u: [u32; 4],
+    },
 }
 
 #[derive(Clone, Debug)]

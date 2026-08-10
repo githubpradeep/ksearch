@@ -36,6 +36,7 @@ impl Eng {
         match src.launch {
             LaunchHint::Elementwise { .. } | LaunchHint::Rows { .. } => 256,
             LaunchHint::RowsParallel { tg, .. } => tg,
+            LaunchHint::RowsParallelSg { nsg, .. } => nsg * 32,
             LaunchHint::RowsParallel2D { tg, .. } => tg,
             LaunchHint::MulMm { tw, nsg, .. } => tw * nsg,
         }
@@ -96,10 +97,25 @@ impl Eng {
         x: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
-        let key = format!("mv_f16_{rows}x{cols}");
+        self.matvec_wd(ctx, rows, cols, DType::F16, a, x, y)
+    }
+
+    /// Matvec with explicit weight dtype (`F16` or `Q4K`; activations always F16).
+    pub fn matvec_wd(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        weight_dtype: DType,
+        a: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("mv_{tag}_{rows}x{cols}");
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
-            let w = g.input(Shape(vec![rows, cols]), DType::F16);
+            let w = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_prim(w, v)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
@@ -107,7 +123,7 @@ impl Eng {
         self.run(ctx, &key, &[a, x], y)
     }
 
-    /// Fused Q/K/V F16 matvecs (one launch; LOCAL-stages `x`; three outputs).
+    /// Fused Q/K/V matvecs (one launch; LOCAL-stages `x`; three outputs).
     pub fn matvec_qkv(
         &mut self,
         ctx: &MetalContext,
@@ -122,12 +138,44 @@ impl Eng {
         k: &Buffer,
         v: &Buffer,
     ) -> Result<()> {
-        let key = format!("mv_qkv_f16_{q_rows}x{kv_rows}x{cols}");
+        self.matvec_qkv_wd(
+            ctx,
+            q_rows,
+            kv_rows,
+            cols,
+            DType::F16,
+            wq,
+            wk,
+            wv,
+            x,
+            q,
+            k,
+            v,
+        )
+    }
+
+    pub fn matvec_qkv_wd(
+        &mut self,
+        ctx: &MetalContext,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        weight_dtype: DType,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        x: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("mv_qkv_{tag}_{q_rows}x{kv_rows}x{cols}");
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
-            let wq_i = g.input(Shape(vec![q_rows, cols]), DType::F16);
-            let wk_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
-            let wv_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
+            let wq_i = g.input(Shape(vec![q_rows, cols]), weight_dtype);
+            let wk_i = g.input(Shape(vec![kv_rows, cols]), weight_dtype);
+            let wv_i = g.input(Shape(vec![kv_rows, cols]), weight_dtype);
             let x_i = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_qkv(wq_i, wk_i, wv_i, x_i)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
@@ -135,7 +183,7 @@ impl Eng {
         self.run_multi(ctx, &key, &[wq, wk, wv, x], &[q, k, v])
     }
 
-    /// RMSNorm(x,w_norm) fused into dense F16 matvec (LOCAL-stages `x_hat`).
+    /// RMSNorm(x,w_norm) fused into dense matvec (LOCAL-stages `x_hat`).
     pub fn rmsnorm_matvec(
         &mut self,
         ctx: &MetalContext,
@@ -147,10 +195,26 @@ impl Eng {
         w_mat: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
-        let key = format!("rms_mv_f16_{rows}x{cols}_{}", eps.to_bits());
+        self.rmsnorm_matvec_wd(ctx, rows, cols, eps, DType::F16, x, w_norm, w_mat, y)
+    }
+
+    pub fn rmsnorm_matvec_wd(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        weight_dtype: DType,
+        x: &Buffer,
+        w_norm: &Buffer,
+        w_mat: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("rms_mv_{tag}_{rows}x{cols}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
-            let wm = g.input(Shape(vec![rows, cols]), DType::F16);
+            let wm = g.input(Shape(vec![rows, cols]), weight_dtype);
             let xi = g.input(Shape(vec![cols]), DType::F16);
             let wn = g.input(Shape(vec![cols]), DType::F16);
             let out = g.rmsnorm_matvec(wm, xi, wn, eps)?;
@@ -159,7 +223,7 @@ impl Eng {
         self.run(ctx, &key, &[w_mat, x, w_norm], y)
     }
 
-    /// RMSNorm into LOCAL `x_hat`, then fused Q/K/V F16 matvecs (3 outputs).
+    /// RMSNorm into LOCAL `x_hat`, then fused Q/K/V matvecs (3 outputs).
     pub fn rmsnorm_matvec_qkv(
         &mut self,
         ctx: &MetalContext,
@@ -176,12 +240,48 @@ impl Eng {
         k: &Buffer,
         v: &Buffer,
     ) -> Result<()> {
-        let key = format!("rms_mv_qkv_f16_{q_rows}x{kv_rows}x{cols}_{}", eps.to_bits());
+        self.rmsnorm_matvec_qkv_wd(
+            ctx,
+            q_rows,
+            kv_rows,
+            cols,
+            eps,
+            DType::F16,
+            x,
+            w_norm,
+            wq,
+            wk,
+            wv,
+            q,
+            k,
+            v,
+        )
+    }
+
+    pub fn rmsnorm_matvec_qkv_wd(
+        &mut self,
+        ctx: &MetalContext,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        eps: f32,
+        weight_dtype: DType,
+        x: &Buffer,
+        w_norm: &Buffer,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("rms_mv_qkv_{tag}_{q_rows}x{kv_rows}x{cols}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
-            let wq_i = g.input(Shape(vec![q_rows, cols]), DType::F16);
-            let wk_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
-            let wv_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
+            let wq_i = g.input(Shape(vec![q_rows, cols]), weight_dtype);
+            let wk_i = g.input(Shape(vec![kv_rows, cols]), weight_dtype);
+            let wv_i = g.input(Shape(vec![kv_rows, cols]), weight_dtype);
             let x_i = g.input(Shape(vec![cols]), DType::F16);
             let wn = g.input(Shape(vec![cols]), DType::F16);
             let out = g.rmsnorm_matvec_qkv(wq_i, wk_i, wv_i, x_i, wn, eps)?;
@@ -190,35 +290,42 @@ impl Eng {
         self.run_multi(ctx, &key, &[wq, wk, wv, x, w_norm], &[q, k, v])
     }
 
-    /// Removed: tinygrad dequants to float then uses generic matvec.
+    /// Thin Q4_K weight matvec (activations F16); Graph uses `DType::Q4K` → generic Load expand.
     pub fn matvec_q4k_prim(
         &mut self,
-        _ctx: &MetalContext,
-        _rows: usize,
-        _cols: usize,
-        _a: &Buffer,
-        _x: &Buffer,
-        _y: &Buffer,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        a: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
     ) -> Result<()> {
-        anyhow::bail!(
-            "matvec_q4k_prim removed — dequant to F32 then matvec (tinygrad ggml_data_to_tensor)"
-        )
+        self.matvec_wd(ctx, rows, cols, DType::Q4K, a, x, y)
     }
 
     pub fn matvec_q4k_prim_at(
         &mut self,
-        _ctx: &MetalContext,
-        _rows: usize,
-        _cols: usize,
-        _a: &Buffer,
-        _x: &Buffer,
-        _x_off_elems: usize,
-        _y: &Buffer,
-        _y_off_elems: usize,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        a: &Buffer,
+        x: &Buffer,
+        x_off_elems: usize,
+        y: &Buffer,
+        y_off_elems: usize,
     ) -> Result<()> {
-        anyhow::bail!(
-            "matvec_q4k_prim_at removed — dequant to F32 then matvec (tinygrad style)"
-        )
+        let tag = weight_cache_tag(DType::Q4K);
+        let key = format!("mv_{tag}_{rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let w = g.input(Shape(vec![rows, cols]), DType::Q4K);
+            let v = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.matvec_prim(w, v)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let xb = (x_off_elems * DType::F16.size_bytes()) as u64;
+        let yb = (y_off_elems * DType::F16.size_bytes()) as u64;
+        self.run_offsets(ctx, &key, &[a, x], &[0, xb], y, yb)
     }
 
     pub fn rmsnorm(
@@ -417,7 +524,7 @@ impl Eng {
         self.run(ctx, &key, &[gate, up], y)
     }
 
-    /// Fused gate/up F16 matvecs + GELU*mul (one launch; LOCAL-stages `x`).
+    /// Fused gate/up matvecs + GELU*mul (one launch; LOCAL-stages `x`).
     pub fn matvec_gate_up_gelu(
         &mut self,
         ctx: &MetalContext,
@@ -428,11 +535,26 @@ impl Eng {
         x: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
-        let key = format!("mv_gate_up_gelu_f16_{rows}x{cols}");
+        self.matvec_gate_up_gelu_wd(ctx, rows, cols, DType::F16, gate, up, x, y)
+    }
+
+    pub fn matvec_gate_up_gelu_wd(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        weight_dtype: DType,
+        gate: &Buffer,
+        up: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("mv_gate_up_gelu_{tag}_{rows}x{cols}");
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
-            let wg = g.input(Shape(vec![rows, cols]), DType::F16);
-            let wu = g.input(Shape(vec![rows, cols]), DType::F16);
+            let wg = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let wu = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_gate_up_gelu(wg, wu, v)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
@@ -440,7 +562,7 @@ impl Eng {
         self.run(ctx, &key, &[gate, up, x], y)
     }
 
-    /// RMSNorm into LOCAL `x_hat`, then fused gate/up F16 matvecs + GELU*mul.
+    /// RMSNorm into LOCAL `x_hat`, then fused gate/up matvecs + GELU*mul.
     pub fn rmsnorm_matvec_gate_up_gelu(
         &mut self,
         ctx: &MetalContext,
@@ -453,11 +575,39 @@ impl Eng {
         up: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
-        let key = format!("rms_mv_gate_up_gelu_f16_{rows}x{cols}_{}", eps.to_bits());
+        self.rmsnorm_matvec_gate_up_gelu_wd(
+            ctx,
+            rows,
+            cols,
+            eps,
+            DType::F16,
+            x,
+            w_norm,
+            gate,
+            up,
+            y,
+        )
+    }
+
+    pub fn rmsnorm_matvec_gate_up_gelu_wd(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        weight_dtype: DType,
+        x: &Buffer,
+        w_norm: &Buffer,
+        gate: &Buffer,
+        up: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("rms_mv_gate_up_gelu_{tag}_{rows}x{cols}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
-            let wg = g.input(Shape(vec![rows, cols]), DType::F16);
-            let wu = g.input(Shape(vec![rows, cols]), DType::F16);
+            let wg = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let wu = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let wn = g.input(Shape(vec![cols]), DType::F16);
             let out = g.rmsnorm_matvec_gate_up_gelu(wg, wu, v, wn, eps)?;
@@ -586,23 +736,32 @@ impl Eng {
         self.run(ctx, &key, &[x], out)
     }
 
-    /// BEAM-search one F16 matvec; `weight` must hold `rows*cols` halfs (may be product embd).
-    pub fn beam_f16_matvec(
+    /// BEAM-search one matvec; `weight` must match `weight_dtype` packing.
+    pub fn beam_matvec(
         &mut self,
         ctx: &MetalContext,
         rows: usize,
         cols: usize,
+        weight_dtype: DType,
         weight: &Buffer,
     ) -> Result<()> {
         use ksearch_codegen::{beam_search_matvec, load_plan};
         let chip = ctx.device_name();
+        let plan_kind = match weight_dtype {
+            DType::Q4K => "matvec_q4k",
+            DType::F16 => "matvec_f16_nr",
+            _ => "matvec_f32",
+        };
         let force = std::env::var("KSEARCH_BEAM_FORCE").is_ok();
-        if !force && load_plan("matvec_f16_nr", &[rows, cols], &chip).is_some() {
+        if !force && load_plan(plan_kind, &[rows, cols], &chip).is_some() {
             return Ok(());
         }
-        eprintln!("[beam] searching F16 matvec {rows}x{cols} …");
+        eprintln!(
+            "[beam] searching {} matvec {rows}x{cols} …",
+            weight_cache_tag(weight_dtype)
+        );
         let mut g = Graph::new();
-        let w = g.input(Shape(vec![rows, cols]), DType::F16);
+        let w = g.input(Shape(vec![rows, cols]), weight_dtype);
         let v = g.input(Shape(vec![cols]), DType::F16);
         let y = g.matvec_prim(w, v)?;
         let bx = ctx.buffer_empty_f16(cols);
@@ -637,21 +796,60 @@ impl Eng {
         Ok(())
     }
 
+    /// BEAM-search one F16 matvec; `weight` must hold `rows*cols` halfs (may be product embd).
+    pub fn beam_f16_matvec(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        weight: &Buffer,
+    ) -> Result<()> {
+        self.beam_matvec(ctx, rows, cols, DType::F16, weight)
+    }
+
+    /// Warm plan cache for mid-size matvecs (allocates scratch weights).
+    pub fn warm_matvec_plans(
+        &mut self,
+        ctx: &MetalContext,
+        weight_dtype: DType,
+        shapes: &[(usize, usize)],
+    ) -> Result<()> {
+        const MAX_ELEMS: usize = 12_000_000;
+        for &(rows, cols) in shapes {
+            let n = rows.saturating_mul(cols);
+            if rows == 0 || cols == 0 || n > MAX_ELEMS {
+                continue;
+            }
+            if weight_dtype == DType::Q4K && n % 256 != 0 {
+                continue;
+            }
+            let w = match weight_dtype {
+                DType::Q4K => ctx.buffer_empty_bytes(ksearch_ir::q4k_nbytes(n)),
+                DType::F16 => ctx.buffer_empty_f16(n),
+                DType::F32 => ctx.buffer_empty_f32(n),
+                _ => continue,
+            };
+            self.beam_matvec(ctx, rows, cols, weight_dtype, &w)?;
+        }
+        Ok(())
+    }
+
     /// Warm plan cache for mid-size F16 matvecs (allocates scratch weights).
     pub fn warm_f16_matvec_plans(
         &mut self,
         ctx: &MetalContext,
         shapes: &[(usize, usize)],
     ) -> Result<()> {
-        const MAX_ELEMS: usize = 12_000_000; // ~24MB halfs
-        for &(rows, cols) in shapes {
-            if rows == 0 || cols == 0 || rows.saturating_mul(cols) > MAX_ELEMS {
-                continue;
-            }
-            let w = ctx.buffer_empty_f16(rows * cols);
-            self.beam_f16_matvec(ctx, rows, cols, &w)?;
-        }
-        Ok(())
+        self.warm_matvec_plans(ctx, DType::F16, shapes)
+    }
+}
+
+fn weight_cache_tag(d: DType) -> &'static str {
+    match d {
+        DType::Q4K => "q4k",
+        DType::F16 => "f16",
+        DType::F32 => "f32",
+        _ => "other",
     }
 }
 

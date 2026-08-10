@@ -1,9 +1,10 @@
-//! Thesis A Gemma path: tinygrad-style — dequant GGUF → F16 (`.half()`), then Graph→AST→MSL.
-//! Matches `ggml_data_to_tensor` then float/half Tensor ops (generic kernels).
+//! Thesis A Gemma path: Graph→AST→MSL. Q4_K weights stay packed (`Load(Q4K)` expand);
+//! other quant types dequant → F16. Activations stay F16.
 
 use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
 use anyhow::{anyhow, bail, Result};
-use ksearch_gguf::{f32_to_f16, Gguf};
+use ksearch_gguf::{f32_to_f16, ggml_type, Gguf};
+use ksearch_ir::DType;
 use ksearch_kernels::Eng;
 use ksearch_metal::MetalContext;
 use metal::Buffer;
@@ -15,6 +16,22 @@ const PREFILL_CHUNK: usize = 32;
 
 enum WeightBuf {
     F16(Buffer),
+    Q4K(Buffer),
+}
+
+impl WeightBuf {
+    fn dtype(&self) -> DType {
+        match self {
+            WeightBuf::F16(_) => DType::F16,
+            WeightBuf::Q4K(_) => DType::Q4K,
+        }
+    }
+
+    fn buf(&self) -> &Buffer {
+        match self {
+            WeightBuf::F16(b) | WeightBuf::Q4K(b) => b,
+        }
+    }
 }
 
 pub struct GemmaPrimModel {
@@ -22,8 +39,8 @@ pub struct GemmaPrimModel {
     pub vocab: Option<ksearch_gguf::Vocab>,
     gguf: Gguf,
     ctx: MetalContext,
-    /// Tied lm_head / embed as F16 (tinygrad dequant → `.half()`).
-    token_embd_f16: Buffer,
+    /// Tied lm_head / embed (Q4_K packed when GGUF type is Q4_K, else F16).
+    token_embd: WeightBuf,
     output_norm: Buffer,
     ple_proj_norm: Buffer,
     layer_norms: Vec<LayerNorms>,
@@ -34,6 +51,9 @@ pub struct GemmaPrimModel {
     tmp_k: Buffer,
     tmp_v: Buffer,
     tmp_o: Buffer,
+    /// FFN intermediates (gate/up) when packings differ and fusion cannot share one weight dtype.
+    tmp_ff1: Buffer,
+    tmp_ff2: Buffer,
     tmp_ff3: Buffer,
     logits: Buffer,
     argmax_out: Buffer,
@@ -62,20 +82,27 @@ impl GemmaPrimModel {
         let cfg = GemmaConfig::from_gguf(&g)?;
         let vocab = ksearch_gguf::Vocab::from_gguf(&g);
         eprintln!(
-            "[prim] layers={} hidden={} heads={} vocab={} (tinygrad-style F16 after GGUF dequant)",
+            "[prim] layers={} hidden={} heads={} vocab={} (Q4_K weights packed; acts F16)",
             cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.vocab
         );
 
         let ctx = MetalContext::new()?;
         eprintln!("Metal: {}", ctx.device_name());
 
-        eprintln!("Dequant token_embd → F16 (tinygrad ggml_data_to_tensor + .half())…");
-        let embd_f16 = g.dequant_to_f16_bytes("token_embd.weight");
-        let token_embd_f16 = ctx.buffer_bytes(&embd_f16);
-        eprintln!(
-            "  token_embd F16: {:.1} MB",
-            embd_f16.len() as f64 / 1e6
-        );
+        let embd_name = "token_embd.weight";
+        let token_embd = if g.tensor_type(embd_name) == ggml_type::Q4_K {
+            let raw = g.tensor_raw(embd_name);
+            eprintln!(
+                "Upload token_embd Q4_K ({:.1} MB) — lm_head uses Load(Q4K); embed dequants one row",
+                raw.len() as f64 / 1e6
+            );
+            WeightBuf::Q4K(ctx.buffer_bytes(raw))
+        } else {
+            eprintln!("Dequant token_embd → F16…");
+            let embd_f16 = g.dequant_to_f16_bytes(embd_name);
+            eprintln!("  token_embd F16: {:.1} MB", embd_f16.len() as f64 / 1e6);
+            WeightBuf::F16(ctx.buffer_bytes(&embd_f16))
+        };
 
         let output_norm = ctx.buffer_bytes(&g.dequant_to_f16_bytes("output_norm.weight"));
         let ple_proj_norm = ctx.buffer_bytes(&g.dequant_to_f16_bytes("per_layer_proj_norm.weight"));
@@ -137,6 +164,8 @@ impl GemmaPrimModel {
         let tmp_k = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
         let tmp_v = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
         let tmp_o = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
+        let tmp_ff1 = ctx.buffer_empty_f16(max_ff);
+        let tmp_ff2 = ctx.buffer_empty_f16(max_ff);
         let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
         let logits = ctx.buffer_empty_f16(cfg.vocab);
         let argmax_out = ctx.buffer_empty_f32(1);
@@ -164,22 +193,34 @@ impl GemmaPrimModel {
             }
             shapes.insert((cfg.ple_total(), h));
             let shapes: Vec<_> = shapes.into_iter().collect();
-            eprintln!(
-                "[beam] warm {} mid-size F16 matvec plans (chip={}) …",
-                shapes.len(),
-                ctx.device_name()
-            );
-            eng.warm_f16_matvec_plans(&ctx, &shapes)?;
-            // lm_head / tied embd — reuse dequanted embd buffer (no second 800MB alloc)
-            eng.beam_f16_matvec(&ctx, cfg.vocab, h, &token_embd_f16)?;
+            if std::env::var_os("KSEARCH_SKIP_BEAM").is_none() {
+                eprintln!(
+                    "[beam] warm {} mid-size Q4K matvec plans (chip={}) …",
+                    shapes.len(),
+                    ctx.device_name()
+                );
+                eng.warm_matvec_plans(&ctx, DType::Q4K, &shapes)?;
+                // lm_head / tied embd
+                eng.beam_matvec(
+                    &ctx,
+                    cfg.vocab,
+                    h,
+                    token_embd.dtype(),
+                    token_embd.buf(),
+                )?;
+                ctx.synchronize()?;
+            } else {
+                eprintln!("[beam] skipped (KSEARCH_SKIP_BEAM)");
+            }
         }
 
+        eprintln!("[prim] load complete");
         Ok(Self {
             cfg: cfg.clone(),
             vocab,
             gguf: g,
             ctx,
-            token_embd_f16,
+            token_embd,
             output_norm,
             ple_proj_norm,
             layer_norms,
@@ -190,6 +231,8 @@ impl GemmaPrimModel {
             tmp_k,
             tmp_v,
             tmp_o,
+            tmp_ff1,
+            tmp_ff2,
             tmp_ff3,
             logits,
             argmax_out,
@@ -214,8 +257,12 @@ impl GemmaPrimModel {
         if self.weight_bufs.contains_key(name) {
             return Ok(());
         }
-        // Dequant → F16 (tinygrad: ggml_data_to_tensor → .half()).
-        let buf = WeightBuf::F16(self.ctx.buffer_bytes(&self.gguf.dequant_to_f16_bytes(name)));
+        let buf = if self.gguf.tensor_type(name) == ggml_type::Q4_K {
+            WeightBuf::Q4K(self.ctx.buffer_bytes(self.gguf.tensor_raw(name)))
+        } else {
+            // Non-Q4: dequant → F16 (tinygrad ggml_data_to_tensor → .half()).
+            WeightBuf::F16(self.ctx.buffer_bytes(&self.gguf.dequant_to_f16_bytes(name)))
+        };
         self.weight_bufs.insert(name.to_string(), buf);
         Ok(())
     }
@@ -229,9 +276,11 @@ impl GemmaPrimModel {
         y: Buffer,
     ) -> Result<()> {
         self.ensure_weight(name)?;
-        let WeightBuf::F16(w) = self.weight_bufs.get(name).unwrap();
-        let w = w.clone();
-        self.eng.matvec(&self.ctx, rows, cols, &w, &x, &y)
+        let w = self.weight_bufs.get(name).unwrap();
+        let wd = w.dtype();
+        let w = w.buf().clone();
+        self.eng
+            .matvec_wd(&self.ctx, rows, cols, wd, &w, &x, &y)
     }
 
     fn rmsnorm_matvec_w(
@@ -245,10 +294,11 @@ impl GemmaPrimModel {
         y: Buffer,
     ) -> Result<()> {
         self.ensure_weight(w_name)?;
-        let WeightBuf::F16(w) = self.weight_bufs.get(w_name).unwrap();
-        let w = w.clone();
+        let w = self.weight_bufs.get(w_name).unwrap();
+        let wd = w.dtype();
+        let w = w.buf().clone();
         self.eng
-            .rmsnorm_matvec(&self.ctx, rows, cols, eps, &x, w_norm, &w, &y)
+            .rmsnorm_matvec_wd(&self.ctx, rows, cols, eps, wd, &x, w_norm, &w, &y)
     }
 
     fn rmsnorm_matvec_qkv_w(
@@ -269,27 +319,40 @@ impl GemmaPrimModel {
         self.ensure_weight(q_name)?;
         self.ensure_weight(k_name)?;
         self.ensure_weight(v_name)?;
-        let WeightBuf::F16(wq) = self.weight_bufs.get(q_name).unwrap();
-        let wq = wq.clone();
-        let WeightBuf::F16(wk) = self.weight_bufs.get(k_name).unwrap();
-        let wk = wk.clone();
-        let WeightBuf::F16(wv) = self.weight_bufs.get(v_name).unwrap();
-        let wv = wv.clone();
-        self.eng.rmsnorm_matvec_qkv(
-            &self.ctx,
-            q_rows,
-            kv_rows,
-            cols,
-            eps,
-            &x,
-            w_norm,
-            &wq,
-            &wk,
-            &wv,
-            &q,
-            &k,
-            &v,
-        )
+        let dq = self.weight_bufs.get(q_name).unwrap().dtype();
+        let dk = self.weight_bufs.get(k_name).unwrap().dtype();
+        let dv = self.weight_bufs.get(v_name).unwrap().dtype();
+        let wq = self.weight_bufs.get(q_name).unwrap().buf().clone();
+        let wk = self.weight_bufs.get(k_name).unwrap().buf().clone();
+        let wv = self.weight_bufs.get(v_name).unwrap().buf().clone();
+        if dq == dk && dk == dv {
+            return self.eng.rmsnorm_matvec_qkv_wd(
+                &self.ctx,
+                q_rows,
+                kv_rows,
+                cols,
+                eps,
+                dq,
+                &x,
+                w_norm,
+                &wq,
+                &wk,
+                &wv,
+                &q,
+                &k,
+                &v,
+            );
+        }
+        // Mixed packings: rms once, then three matvecs.
+        self.eng
+            .rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+        self.eng
+            .matvec_wd(&self.ctx, q_rows, cols, dq, &wq, &self.x2, &q)?;
+        self.eng
+            .matvec_wd(&self.ctx, kv_rows, cols, dk, &wk, &self.x2, &k)?;
+        self.eng
+            .matvec_wd(&self.ctx, kv_rows, cols, dv, &wv, &self.x2, &v)?;
+        Ok(())
     }
 
     fn rmsnorm_matvec_gate_up_gelu_w(
@@ -305,21 +368,34 @@ impl GemmaPrimModel {
     ) -> Result<()> {
         self.ensure_weight(gate_name)?;
         self.ensure_weight(up_name)?;
-        let WeightBuf::F16(wg) = self.weight_bufs.get(gate_name).unwrap();
-        let wg = wg.clone();
-        let WeightBuf::F16(wu) = self.weight_bufs.get(up_name).unwrap();
-        let wu = wu.clone();
-        self.eng.rmsnorm_matvec_gate_up_gelu(
-            &self.ctx,
-            rows,
-            cols,
-            eps,
-            &x,
-            w_norm,
-            &wg,
-            &wu,
-            &y,
-        )
+        let dg = self.weight_bufs.get(gate_name).unwrap().dtype();
+        let du = self.weight_bufs.get(up_name).unwrap().dtype();
+        let wg = self.weight_bufs.get(gate_name).unwrap().buf().clone();
+        let wu = self.weight_bufs.get(up_name).unwrap().buf().clone();
+        if dg == du {
+            return self.eng.rmsnorm_matvec_gate_up_gelu_wd(
+                &self.ctx,
+                rows,
+                cols,
+                eps,
+                dg,
+                &x,
+                w_norm,
+                &wg,
+                &wu,
+                &y,
+            );
+        }
+        // Mixed packings: rms once, separate matvecs, then gelu*mul.
+        self.eng
+            .rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+        self.eng
+            .matvec_wd(&self.ctx, rows, cols, dg, &wg, &self.x2, &self.tmp_ff1)?;
+        self.eng
+            .matvec_wd(&self.ctx, rows, cols, du, &wu, &self.x2, &self.tmp_ff2)?;
+        self.eng
+            .gelu_mul(&self.ctx, rows, &self.tmp_ff1, &self.tmp_ff2, &y)?;
+        Ok(())
     }
 
     fn write_meta(&self, layer: usize, tlen: u32, start: u32) {
@@ -352,15 +428,33 @@ impl GemmaPrimModel {
     fn embed_token(&mut self, token: u32) -> Result<()> {
         let h = self.cfg.hidden;
         let scale = (h as f32).sqrt();
-        self.eng.copy_scale(
-            &self.ctx,
-            h,
-            scale,
-            &self.token_embd_f16,
-            token as usize * h,
-            &self.x,
-            0,
-        )?;
+        match &self.token_embd {
+            WeightBuf::F16(embd) => {
+                self.eng.copy_scale(
+                    &self.ctx,
+                    h,
+                    scale,
+                    embd,
+                    token as usize * h,
+                    &self.x,
+                    0,
+                )?;
+            }
+            WeightBuf::Q4K(_) => {
+                // Row lookup: host-dequant one Q4_K row → F16 activation (acts stay F16).
+                let mut row = self
+                    .gguf
+                    .dequant_row("token_embd.weight", token as usize);
+                for v in &mut row {
+                    *v *= scale;
+                }
+                let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
+                if self.ctx.has_gpu_work() {
+                    self.ctx.synchronize()?;
+                }
+                self.ctx.write_u16s_nosync(&self.x, &row_h);
+            }
+        }
         Ok(())
     }
 
@@ -696,18 +790,21 @@ impl GemmaPrimModel {
             return Ok(None);
         }
 
-        // Thesis-A fused output head (min): RmsNormMatvec(output_norm, token_embd)
-        // then parallel softcap_argmax — saves the standalone output rmsnorm launch.
+        // Thesis-A fused output head: RmsNormMatvec(output_norm, token_embd)
+        // then parallel softcap_argmax — Q4_K embd uses Load(Q4K) expand.
         let vocab = self.cfg.vocab;
         let cap = self.cfg.softcap;
-        self.eng.rmsnorm_matvec(
+        let embd_dt = self.token_embd.dtype();
+        let embd = self.token_embd.buf().clone();
+        self.eng.rmsnorm_matvec_wd(
             &self.ctx,
             vocab,
             h,
             eps,
+            embd_dt,
             &self.x,
             &self.output_norm,
-            &self.token_embd_f16,
+            &embd,
             &self.logits,
         )?;
         self.eng
