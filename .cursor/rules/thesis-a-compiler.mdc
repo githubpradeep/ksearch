@@ -1,0 +1,50 @@
+---
+description: Thesis A lock — ksearch is a Metal kernel COMPILER (tinygrad-shaped), not a fused-op Metal catalog
+alwaysApply: true
+---
+
+# Thesis A (non-negotiable)
+
+ksearch is **tinygrad-shaped**, not metal-llm-server-shaped.
+
+## Mental model
+
+- **Allowed:** graph of **primitive** ops → scheduler invents kernel boundaries → lower / search / render MSL.
+- **Forbidden:** growing `Op` into a catalog of already-fused kernels where codegen is “match this op → paste this Metal template.”
+
+```
+tinygrad:  primitives → compiler invents kernels
+ksearch:   MUST stay on that path
+NOT:       fused-op enum → call kernel template
+```
+
+Study source: `reference/tinygrad` UOp `Ops` (ALU / movement / REDUCE / LOAD-STORE). No `Ops.MATMUL` / `RMSNORM` / `FLASH_ATTN` / `GELU` — those are Tensor sugar.
+
+## Oracle (`reference/metal-llm-server`)
+
+Use only as:
+
+1. **Scoreboard** (tok/s, Hi gate, semantics)
+2. **Structure** hints (chunked prefill order, Q4_K as dtype, etc.)
+
+Do **NOT**:
+
+- Paste oracle `.metal` / fused attention / mul_mm blobs as the product
+- Add `Op::AttnGqaQ4Fused`, `Op::MulMmQ4K`, `Op::MatVecQ4KRmsGateUpGelu`, etc.
+- Chase tok/s by promoting hand fusion into named Graph Ops
+- Revive `debt/` or `GemmaModel` / `KSEARCH_DEBT`
+
+Layer sugar (RMSNorm / GeLU / RoPE) may schedule to a fused **Kernel IR** region (`KirBody`) — that is CALL fusion, not a Graph catalog Op.
+
+## When optimizing decode/prefill
+
+1. Prefer IR rewrites + schedule search over new fused `Op` variants.
+2. Quant belongs as **dtype** (e.g. Q4_K) that fused lowers can *discover*, not a zoo of `MatVecQ4K*` ops.
+3. If a change would add a fused catalog op “because the oracle has that kernel,” **stop** and compose primitives instead.
+
+## Source of truth
+
+- `docs/DESIGN.md` — Thesis A lock + tinygrad IR map
+- `README.md` — “IR → generate MSL → search schedules”
+
+If speed work conflicts with this rule, **this rule wins**. Ask the user before any exception.

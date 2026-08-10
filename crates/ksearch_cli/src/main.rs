@@ -2,12 +2,12 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use ksearch_codegen::{beam_tg_candidates, lower_to_metal};
-use ksearch_gemma::GemmaModel;
+use ksearch_codegen::{beam_search_matvec, lower_to_metal, lower_with_schedule, CodegenError};
+use ksearch_gemma::GemmaPrimModel;
 use ksearch_gguf::{
     build_tokenizer_from_gguf, encode_prompt, gemma4_chat_prompt, Gguf,
 };
-use ksearch_ir::{DType, Graph, Shape};
+use ksearch_ir::{DType, Graph, OptSchedule, Shape};
 use ksearch_metal::MetalContext;
 use std::path::{Path, PathBuf};
 
@@ -110,8 +110,9 @@ fn bench(
     eprintln!("bench gguf={}", gguf.display());
     let hi_ids = encode_user_prompt(&gguf, "Hi")?;
     let essay_ids = encode_user_prompt(&gguf, ESSAY_PROMPT)?;
-    let mut model = GemmaModel::load(&gguf, max_seq)?;
 
+    eprintln!("path: Thesis A GemmaPrim (tinygrad-shaped IR)");
+    let mut model = GemmaPrimModel::load(&gguf, max_seq)?;
     let hi = model.generate_timed(&hi_ids, n_predict_hi, false)?;
     let hi_text = model
         .vocab
@@ -163,15 +164,13 @@ fn generate(
         bail!("provide --prompt TEXT or --tokens id,id,...");
     };
 
-    let mut model = GemmaModel::load(&gguf, max_seq)?;
+    eprintln!("path: Thesis A GemmaPrim");
+    let mut model = GemmaPrimModel::load(&gguf, max_seq)?;
     let out = model.generate(&prompt_ids, n_predict)?;
-
     println!("prompt tokens: {prompt_ids:?}");
     println!("generated ids: {out:?}");
     if let Some(ref vocab) = model.vocab {
-        let text = vocab.decode(&out, true);
-        println!("---");
-        println!("{text}");
+        println!("---\n{}", vocab.decode(&out, true));
     } else {
         eprintln!("(no tokenizer.ggml.tokens in GGUF — cannot decode to text)");
     }
@@ -228,9 +227,9 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
     let ax = g.mul_broadcast_row(a, x)?;
     let y = g.sum_reduce(ax, 1)?;
 
-    let base = lower_to_metal(&g, y)?;
     let ctx = MetalContext::new()?;
     println!("Metal device: {}", ctx.device_name());
+    println!("path: Graph → schedule → Kernel IR → MSL");
 
     let mut va = vec![0f32; rows * cols];
     let mut vx = vec![0f32; cols];
@@ -253,38 +252,98 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
     let bx = ctx.buffer_f32(&vx);
     let by = ctx.buffer_empty_f32(rows);
 
-    let candidates = if beam {
-        beam_tg_candidates(rows)
-    } else {
-        vec![128]
-    };
-    let mut best_ms = f64::INFINITY;
-    let mut best_tg = candidates[0];
-    for &tg in &candidates {
-        let pipe = ctx.compile(&base)?;
-        let _ = ctx.run(&pipe, &base, &[&ba, &bx], &by, tg)?;
-        let ms = ctx.run(&pipe, &base, &[&ba, &bx], &by, tg)?;
-        let gflops = (2.0 * rows as f64 * cols as f64) / (ms * 1e6);
-        println!("matvec {rows}x{cols} tg={tg}: {ms:.3} ms  {gflops:.1} GFLOP/s");
-        if ms < best_ms {
-            best_ms = ms;
-            best_tg = tg;
+    let time_one = |kernel: &ksearch_codegen::MetalKernelSource| -> Result<f64, CodegenError> {
+        let pipe = ctx
+            .compile(kernel)
+            .map_err(|e| CodegenError::Msg(e.to_string()))?;
+        // Warmup + median of 3 timed runs (Metal launch noise).
+        let _ = ctx
+            .run(&pipe, kernel, &[&ba, &bx], &by, kernel_tg(kernel))
+            .map_err(|e| CodegenError::Msg(e.to_string()))?;
+        let mut samples = [0f64; 3];
+        for s in &mut samples {
+            *s = ctx
+                .run(&pipe, kernel, &[&ba, &bx], &by, kernel_tg(kernel))
+                .map_err(|e| CodegenError::Msg(e.to_string()))?;
         }
-    }
-    let pipe = ctx.compile(&base)?;
-    let _ = ctx.run(&pipe, &base, &[&ba, &bx], &by, best_tg)?;
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Ok(samples[1])
+    };
+
+    let (best_kernel, best_ms, label) = if beam {
+        let untuned = lower_with_schedule(&g, y, OptSchedule::untuned())?;
+        let base_ms = time_one(&untuned)?;
+        let base_gflops = (2.0 * rows as f64 * cols as f64) / (base_ms * 1e6);
+        println!(
+            "untuned TG={} VEC={} UNROLL={}: {base_ms:.3} ms  {base_gflops:.1} GFLOP/s",
+            OptSchedule::untuned().tg,
+            OptSchedule::untuned().vec,
+            OptSchedule::untuned().unroll
+        );
+
+        let chip = ctx.device_name();
+        // Bust cache so this CLI run always searches (cache still written).
+        if std::env::var_os("KSEARCH_BEAM_FORCE").is_some() {
+            let key = ksearch_codegen::beam_cache_key("matvec", rows, cols, &chip);
+            let _ = std::fs::remove_file(
+                ksearch_codegen::beam_cache_dir().join(format!("{key}.txt")),
+            );
+        }
+        let result = beam_search_matvec(&g, y, &chip, time_one)?;
+        let gflops = (2.0 * rows as f64 * cols as f64) / (result.ms * 1e6);
+        let src = if result.from_cache { "cache" } else { "search" };
+        println!(
+            "beam ({src}) TG={} VEC={} UNROLL={}: {:.3} ms  {gflops:.1} GFLOP/s  ({:.2}x vs untuned)",
+            result.schedule.tg,
+            result.schedule.vec,
+            result.schedule.unroll,
+            result.ms,
+            base_ms / result.ms
+        );
+        (
+            result.kernel,
+            result.ms,
+            format!(
+                "tg={} vec={} unroll={}",
+                result.schedule.tg, result.schedule.vec, result.schedule.unroll
+            ),
+        )
+    } else {
+        let kernel = lower_to_metal(&g, y)?;
+        let ms = time_one(&kernel)?;
+        let gflops = (2.0 * rows as f64 * cols as f64) / (ms * 1e6);
+        println!("matvec {rows}x{cols}: {ms:.3} ms  {gflops:.1} GFLOP/s");
+        (kernel, ms, "default".into())
+    };
+
+    let pipe = ctx.compile(&best_kernel)?;
+    let _ = ctx.run(
+        &pipe,
+        &best_kernel,
+        &[&ba, &bx],
+        &by,
+        kernel_tg(&best_kernel),
+    )?;
     let got = ctx.read_f32(&by, rows);
     let max_err = expect
         .iter()
         .zip(got.iter())
         .map(|(e, o)| (e - o).abs())
         .fold(0f32, f32::max);
-    println!("best tg={best_tg}  max|err|={max_err:.3e}");
+    println!("best ({label})  {best_ms:.3} ms  max|err|={max_err:.3e}");
     if max_err > 1e-2 {
         anyhow::bail!("CPU/GPU mismatch");
     }
     println!("OK");
     Ok(())
+}
+
+fn kernel_tg(kernel: &ksearch_codegen::MetalKernelSource) -> u64 {
+    match &kernel.launch {
+        ksearch_codegen::LaunchHint::RowsParallel { tg, .. } => *tg,
+        ksearch_codegen::LaunchHint::Elementwise { .. } => 256,
+        _ => 32,
+    }
 }
 
 // temporary - no, use a small bin

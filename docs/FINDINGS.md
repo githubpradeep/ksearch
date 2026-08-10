@@ -105,3 +105,16 @@ Role for ksearch: **scoreboard + Gemma semantics**, not shader source of truth f
 - Motivation: MLX-class stacks show Mac LLM can be useful without FA theater; we push how far **generated** kernels get.
 
 See [DESIGN.md](./DESIGN.md).
+
+---
+
+## 9. Tinygrad-only purge (2026-08)
+
+Locked IR study against local `reference/tinygrad` UOp model:
+
+- Graph product = ALU + movement + REDUCE (+ load/store), matching `GroupOp` / `Ops`.
+- Sugar (`rmsnorm_expand`, `gelu_tanh`, `softcap`, `matvec_prim`, `sdpa_naive`) expands like tinygrad nn/Tensor mixins.
+- BEAM = OptOps tilings (`OptSchedule`); Q4_K = dtype fusion at matvec render.
+- **Removed:** `debt/` fused catalog, `GemmaModel`, `KSEARCH_DEBT`. Only `GemmaPrimModel` remains.
+
+Risk accepted: more launches until schedule fusion matches tinygrad’s CALL fusion; correctness (Hi) before tok/s.

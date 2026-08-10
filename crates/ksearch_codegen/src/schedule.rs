@@ -1,0 +1,270 @@
+//! Naive Graph → ScheduledKernel for Thesis A primitives + sugar fusion.
+
+use crate::rewrite;
+use crate::CodegenError;
+use ksearch_ir::{ElemExpr, Graph, KernelKind, Op, ScheduledKernel, TensorId};
+
+/// True if `out` is a clean-path primitive / sugar region (no catalog ops).
+pub fn is_primitive_region(graph: &Graph, out: TensorId) -> Result<bool, CodegenError> {
+    let node = graph.node(out)?;
+    Ok(matches!(
+        &node.op,
+        Op::Add { .. }
+            | Op::Mul { .. }
+            | Op::SumReduce { .. }
+            | Op::MulBroadcastRow { .. }
+            | Op::SdpaNaive { .. }
+            | Op::ScaleConst { .. }
+            | Op::CopySlice { .. }
+            | Op::Rsqrt { .. }
+            | Op::Tanh { .. }
+            | Op::Exp { .. }
+            | Op::Const { .. }
+            | Op::Expand { .. }
+            | Op::MaxReduce { .. }
+    ))
+}
+
+/// Schedule one kernel covering `out` (fuse Add/Mul; materialize at SumReduce).
+pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, CodegenError> {
+    let _ = rewrite::validate_q4_matvec_pattern(graph, out)?;
+
+    let node = graph.node(out)?;
+    let sk = match &node.op {
+        Op::ScaleConst { x, scale } => {
+            let n = graph.shape_dtype(out)?.0.numel();
+            ScheduledKernel {
+                name: format!("k_scale_{}", out.0),
+                inputs: vec![*x],
+                output: out,
+                kind: KernelKind::Elementwise {
+                    n,
+                    expr: ElemExpr::Scale(Box::new(ElemExpr::Load(0)), *scale),
+                },
+            }
+        }
+        Op::Add { .. } | Op::Mul { .. } | Op::Tanh { .. } | Op::Rsqrt { .. } | Op::Exp { .. } => {
+            // Multi-op elemwise chains: only Add/Mul/Scale fuse today; unary alone → single load op.
+            if matches!(&node.op, Op::Add { .. } | Op::Mul { .. }) {
+                let mut inputs = Vec::new();
+                let expr = build_elem_expr(graph, out, &mut inputs)?;
+                let n = graph.shape_dtype(out)?.0.numel();
+                ScheduledKernel {
+                    name: format!("k_elem_{}", out.0),
+                    inputs,
+                    output: out,
+                    kind: KernelKind::Elementwise { n, expr },
+                }
+            } else {
+                return Err(CodegenError::Msg(
+                    "schedule: unary ALU without fused ElemExpr yet — use layer KirBody".into(),
+                ));
+            }
+        }
+        Op::SumReduce { inp, axis } => {
+            let last = graph.node(*inp)?.shape.rank().saturating_sub(1);
+            if *axis != last {
+                return Err(CodegenError::Msg(
+                    "schedule: only last-axis SumReduce supported".into(),
+                ));
+            }
+            if let Op::MulBroadcastRow { left, row } = &graph.node(*inp)?.op {
+                let (ms, wd) = graph.shape_dtype(*left)?;
+                if ms.rank() != 2 {
+                    return Err(CodegenError::Msg("matvec matrix must be rank-2".into()));
+                }
+                ScheduledKernel {
+                    name: format!("k_matvec_{}", out.0),
+                    inputs: vec![*left, *row],
+                    output: out,
+                    kind: KernelKind::Matvec {
+                        rows: ms.0[0],
+                        cols: ms.0[1],
+                        matrix: *left,
+                        vector: *row,
+                        weight_dtype: wd,
+                    },
+                }
+            } else {
+                let (is, _) = graph.shape_dtype(*inp)?;
+                if is.rank() != 2 {
+                    return Err(CodegenError::Msg("sum_last input must be rank-2".into()));
+                }
+                ScheduledKernel {
+                    name: format!("k_sumlast_{}", out.0),
+                    inputs: vec![*inp],
+                    output: out,
+                    kind: KernelKind::SumLast {
+                        rows: is.0[0],
+                        cols: is.0[1],
+                        inp: *inp,
+                    },
+                }
+            }
+        }
+        Op::SdpaNaive {
+            q,
+            k,
+            v,
+            meta,
+            n_q,
+            hd,
+            max_t,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_naive_{}", out.0),
+            inputs: vec![*q, *k, *v, *meta],
+            output: out,
+            kind: KernelKind::SdpaNaive {
+                n_q: *n_q,
+                hd: *hd,
+                max_t: *max_t,
+                q: *q,
+                k: *k,
+                v: *v,
+                meta: *meta,
+            },
+        },
+        Op::CopySlice {
+            src,
+            src_off,
+            dst_off,
+            n,
+        } => ScheduledKernel {
+            name: format!("k_copy_slice_{}", out.0),
+            inputs: vec![*src],
+            output: out,
+            kind: KernelKind::CopySlice {
+                src_off: *src_off,
+                dst_off: *dst_off,
+                n: *n,
+                src: *src,
+            },
+        },
+        other => {
+            return Err(CodegenError::Msg(format!(
+                "schedule: not a Thesis A primitive region ({other:?})"
+            )));
+        }
+    };
+    Ok(vec![sk])
+}
+
+/// Expand a scheduled kernel into Kernel IR.
+pub fn lower_kernel(
+    graph: &Graph,
+    sk: &ScheduledKernel,
+) -> Result<ksearch_ir::KernelIr, CodegenError> {
+    let (out_shape, out_dtype) = graph.shape_dtype(sk.output)?;
+    let body = match &sk.kind {
+        KernelKind::Elementwise { n, expr } => ksearch_ir::KirBody::Elementwise {
+            n: *n,
+            expr: expr.clone(),
+        },
+        KernelKind::Matvec {
+            rows,
+            cols,
+            weight_dtype,
+            ..
+        } => ksearch_ir::KirBody::Matvec {
+            rows: *rows,
+            cols: *cols,
+            weight_dtype: *weight_dtype,
+        },
+        KernelKind::SumLast { rows, cols, .. } => ksearch_ir::KirBody::SumLast {
+            rows: *rows,
+            cols: *cols,
+        },
+        KernelKind::SdpaNaive { n_q, hd, max_t, .. } => ksearch_ir::KirBody::SdpaNaive {
+            n_q: *n_q,
+            hd: *hd,
+            max_t: *max_t,
+        },
+        KernelKind::RmsNorm { n, eps, .. } => ksearch_ir::KirBody::RmsNorm { n: *n, eps: *eps },
+        KernelKind::RmsNormAdd { n, eps, .. } => {
+            ksearch_ir::KirBody::RmsNormAdd { n: *n, eps: *eps }
+        }
+        KernelKind::RmsNormAddScale {
+            n, eps, scale, ..
+        } => ksearch_ir::KirBody::RmsNormAddScale {
+            n: *n,
+            eps: *eps,
+            scale: *scale,
+        },
+        KernelKind::RmsNormPerHead {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            ..
+        } => ksearch_ir::KirBody::RmsNormPerHead {
+            n_heads: *n_heads,
+            hd: *hd,
+            eps: *eps,
+            with_weight: *with_weight,
+        },
+        KernelKind::Rope { n_heads, hd, .. } => {
+            ksearch_ir::KirBody::Rope {
+                n_heads: *n_heads,
+                hd: *hd,
+            }
+        }
+        KernelKind::GeluMul { n, up_off, .. } => {
+            ksearch_ir::KirBody::GeluMul {
+                n: *n,
+                up_off: *up_off,
+            }
+        }
+        KernelKind::CopySlice {
+            src_off,
+            dst_off,
+            n,
+            ..
+        } => ksearch_ir::KirBody::CopySlice {
+            src_off: *src_off,
+            dst_off: *dst_off,
+            n: *n,
+        },
+        KernelKind::SoftcapArgmax { n, cap, .. } => {
+            ksearch_ir::KirBody::SoftcapArgmax { n: *n, cap: *cap }
+        }
+    };
+    Ok(ksearch_ir::KernelIr {
+        name: sk.name.clone(),
+        n_inputs: sk.inputs.len(),
+        out_shape,
+        out_dtype,
+        body,
+    })
+}
+
+fn build_elem_expr(
+    graph: &Graph,
+    id: TensorId,
+    inputs: &mut Vec<TensorId>,
+) -> Result<ElemExpr, CodegenError> {
+    let node = graph.node(id)?;
+    match &node.op {
+        Op::Input { .. } => {
+            let bi = inputs.iter().position(|t| *t == id).unwrap_or_else(|| {
+                inputs.push(id);
+                inputs.len() - 1
+            });
+            Ok(ElemExpr::Load(bi))
+        }
+        Op::Add { a, b } => Ok(ElemExpr::Add(
+            Box::new(build_elem_expr(graph, *a, inputs)?),
+            Box::new(build_elem_expr(graph, *b, inputs)?),
+        )),
+        Op::Mul { a, b } => Ok(ElemExpr::Mul(
+            Box::new(build_elem_expr(graph, *a, inputs)?),
+            Box::new(build_elem_expr(graph, *b, inputs)?),
+        )),
+        Op::ScaleConst { x, scale } => Ok(ElemExpr::Scale(
+            Box::new(build_elem_expr(graph, *x, inputs)?),
+            *scale,
+        )),
+        _ => Err(CodegenError::Msg(
+            "elementwise region may only contain Add/Mul/ScaleConst/Input".into(),
+        )),
+    }
+}
