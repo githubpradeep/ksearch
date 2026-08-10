@@ -29,8 +29,8 @@ pub fn is_primitive_region(graph: &Graph, out: TensorId) -> Result<bool, Codegen
     ))
 }
 
-fn sk_from_hint(out: TensorId, hint: &FuseHint) -> ScheduledKernel {
-    match hint {
+fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<ScheduledKernel, CodegenError> {
+    Ok(match hint {
         FuseHint::RmsNorm { n, eps, x, w } => ScheduledKernel {
             name: format!("k_rmsnorm_{}", out.0),
             inputs: vec![*x, *w],
@@ -172,6 +172,140 @@ fn sk_from_hint(out: TensorId, hint: &FuseHint) -> ScheduledKernel {
                 up: *up,
             },
         },
+        FuseHint::MatvecGateUpGelu {
+            rows,
+            cols,
+            gate,
+            up,
+            x,
+        } => {
+            let wd = graph.shape_dtype(*gate)?.1;
+            ScheduledKernel {
+                name: format!("k_mv_gate_up_gelu_{}", out.0),
+                inputs: vec![*gate, *up, *x],
+                output: out,
+                kind: KernelKind::MatvecGateUpGelu {
+                    rows: *rows,
+                    cols: *cols,
+                    gate: *gate,
+                    up: *up,
+                    x: *x,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::MatvecQkv {
+            q_rows,
+            kv_rows,
+            cols,
+            wq,
+            wk,
+            wv,
+            x,
+        } => {
+            let wd = graph.shape_dtype(*wq)?.1;
+            ScheduledKernel {
+                name: format!("k_mv_qkv_{}", out.0),
+                inputs: vec![*wq, *wk, *wv, *x],
+                output: out,
+                kind: KernelKind::MatvecQkv {
+                    q_rows: *q_rows,
+                    kv_rows: *kv_rows,
+                    cols: *cols,
+                    wq: *wq,
+                    wk: *wk,
+                    wv: *wv,
+                    x: *x,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::RmsNormMatvec {
+            n,
+            eps,
+            rows,
+            cols,
+            x,
+            w_norm,
+            w_mat,
+        } => {
+            let wd = graph.shape_dtype(*w_mat)?.1;
+            ScheduledKernel {
+                name: format!("k_rms_mv_{}", out.0),
+                inputs: vec![*w_mat, *x, *w_norm],
+                output: out,
+                kind: KernelKind::RmsNormMatvec {
+                    n: *n,
+                    eps: *eps,
+                    rows: *rows,
+                    cols: *cols,
+                    x: *x,
+                    w_norm: *w_norm,
+                    w_mat: *w_mat,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::RmsNormMatvecGateUpGelu {
+            n,
+            eps,
+            rows,
+            cols,
+            x,
+            w_norm,
+            gate,
+            up,
+        } => {
+            let wd = graph.shape_dtype(*gate)?.1;
+            ScheduledKernel {
+                name: format!("k_rms_mv_gate_up_gelu_{}", out.0),
+                inputs: vec![*gate, *up, *x, *w_norm],
+                output: out,
+                kind: KernelKind::RmsNormMatvecGateUpGelu {
+                    n: *n,
+                    eps: *eps,
+                    rows: *rows,
+                    cols: *cols,
+                    x: *x,
+                    w_norm: *w_norm,
+                    gate: *gate,
+                    up: *up,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::RmsNormMatvecQkv {
+            n,
+            eps,
+            q_rows,
+            kv_rows,
+            cols,
+            x,
+            w_norm,
+            wq,
+            wk,
+            wv,
+        } => {
+            let wd = graph.shape_dtype(*wq)?.1;
+            ScheduledKernel {
+                name: format!("k_rms_mv_qkv_{}", out.0),
+                inputs: vec![*wq, *wk, *wv, *x, *w_norm],
+                output: out,
+                kind: KernelKind::RmsNormMatvecQkv {
+                    n: *n,
+                    eps: *eps,
+                    q_rows: *q_rows,
+                    kv_rows: *kv_rows,
+                    cols: *cols,
+                    x: *x,
+                    w_norm: *w_norm,
+                    wq: *wq,
+                    wk: *wk,
+                    wv: *wv,
+                    weight_dtype: wd,
+                },
+            }
+        }
         FuseHint::SdpaNaive {
             n_q,
             hd,
@@ -204,7 +338,7 @@ fn sk_from_hint(out: TensorId, hint: &FuseHint) -> ScheduledKernel {
                 x: *x,
             },
         },
-    }
+    })
 }
 
 /// Schedule one kernel covering `out` (fuse hints / matvec / elemwise / copy).
@@ -212,7 +346,7 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
     let _ = rewrite::validate_q4_matvec_pattern(graph, out)?;
 
     if let Some(hint) = graph.fuse_hint(out) {
-        return Ok(vec![sk_from_hint(out, hint)]);
+        return Ok(vec![sk_from_hint(graph, out, hint)?]);
     }
 
     let node = graph.node(out)?;

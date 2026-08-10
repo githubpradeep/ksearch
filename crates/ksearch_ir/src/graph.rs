@@ -532,6 +532,204 @@ impl Graph {
         Ok(out)
     }
 
+    /// Fused gate/up matvecs + GELU*mul: `out[i] = gelu(W_gate[i]·x) * (W_up[i]·x)`.
+    pub fn matvec_gate_up_gelu(
+        &mut self,
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+    ) -> Result<TensorId, IrError> {
+        let (sg, dg) = self.shape_dtype(gate)?;
+        let (su, du) = self.shape_dtype(up)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if sg.rank() != 2 || su != sg || sx.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dg.is_float() || du != dg || dx != dg || sx.0[0] != sg.0[1] {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sg.0[0];
+        let cols = sg.0[1];
+        Ok(self.call(
+            vec![gate, up, x],
+            Shape(vec![rows]),
+            dg,
+            FuseHint::MatvecGateUpGelu {
+                rows,
+                cols,
+                gate,
+                up,
+                x,
+            },
+        ))
+    }
+
+    /// Fused Q/K/V matvecs sharing `x`: Metal emits 3 outputs; Call root shape is Q.
+    pub fn matvec_qkv(
+        &mut self,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+        x: TensorId,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(wq)?;
+        let (sk, dk) = self.shape_dtype(wk)?;
+        let (sv, dv) = self.shape_dtype(wv)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if sq.rank() != 2 || sk.rank() != 2 || sv.rank() != 2 || sx.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sk != sv || sq.0[1] != sk.0[1] || sx.0[0] != sq.0[1] {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dq.is_float() || dk != dq || dv != dq || dx != dq {
+            return Err(IrError::ShapeMismatch);
+        }
+        let q_rows = sq.0[0];
+        let kv_rows = sk.0[0];
+        let cols = sq.0[1];
+        Ok(self.call(
+            vec![wq, wk, wv, x],
+            Shape(vec![q_rows]),
+            dq,
+            FuseHint::MatvecQkv {
+                q_rows,
+                kv_rows,
+                cols,
+                wq,
+                wk,
+                wv,
+                x,
+            },
+        ))
+    }
+
+    /// RMSNorm(x,w_norm) fused into dense matvec: LOCAL `x_hat`, `y = W @ x_hat`.
+    pub fn rmsnorm_matvec(
+        &mut self,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w_mat)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sn, dn) = self.shape_dtype(w_norm)?;
+        if sw.rank() != 2 || sx.rank() != 1 || sn.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dw.is_float() || dx != dw || dn != dw {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sx.0[0] != sw.0[1] || sn.0[0] != sx.0[0] {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sw.0[0];
+        let cols = sw.0[1];
+        Ok(self.call(
+            vec![w_mat, x, w_norm],
+            Shape(vec![rows]),
+            dw,
+            FuseHint::RmsNormMatvec {
+                n: cols,
+                eps,
+                rows,
+                cols,
+                x,
+                w_norm,
+                w_mat,
+            },
+        ))
+    }
+
+    /// RMSNorm into LOCAL `x_hat`, then fused gate/up matvec+GELU.
+    pub fn rmsnorm_matvec_gate_up_gelu(
+        &mut self,
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sg, dg) = self.shape_dtype(gate)?;
+        let (su, du) = self.shape_dtype(up)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sn, dn) = self.shape_dtype(w_norm)?;
+        if sg.rank() != 2 || su != sg || sx.rank() != 1 || sn.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dg.is_float() || du != dg || dx != dg || dn != dg {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sx.0[0] != sg.0[1] || sn.0[0] != sx.0[0] {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sg.0[0];
+        let cols = sg.0[1];
+        Ok(self.call(
+            vec![gate, up, x, w_norm],
+            Shape(vec![rows]),
+            dg,
+            FuseHint::RmsNormMatvecGateUpGelu {
+                n: cols,
+                eps,
+                rows,
+                cols,
+                x,
+                w_norm,
+                gate,
+                up,
+            },
+        ))
+    }
+
+    /// RMSNorm into LOCAL `x_hat`, then fused Q/K/V matvecs (3 outputs).
+    pub fn rmsnorm_matvec_qkv(
+        &mut self,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(wq)?;
+        let (sk, dk) = self.shape_dtype(wk)?;
+        let (sv, dv) = self.shape_dtype(wv)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sn, dn) = self.shape_dtype(w_norm)?;
+        if sq.rank() != 2 || sk.rank() != 2 || sv.rank() != 2 || sx.rank() != 1 || sn.rank() != 1
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sk != sv || sq.0[1] != sk.0[1] || sx.0[0] != sq.0[1] || sn.0[0] != sx.0[0] {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dq.is_float() || dk != dq || dv != dq || dx != dq || dn != dq {
+            return Err(IrError::ShapeMismatch);
+        }
+        let q_rows = sq.0[0];
+        let kv_rows = sk.0[0];
+        let cols = sq.0[1];
+        Ok(self.call(
+            vec![wq, wk, wv, x, w_norm],
+            Shape(vec![q_rows]),
+            dq,
+            FuseHint::RmsNormMatvecQkv {
+                n: cols,
+                eps,
+                q_rows,
+                kv_rows,
+                cols,
+                x,
+                w_norm,
+                wq,
+                wk,
+                wv,
+            },
+        ))
+    }
+
     pub fn softcap_argmax(&mut self, x: TensorId, cap: f32) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
         if !dx.is_float() || sx.rank() != 1 {

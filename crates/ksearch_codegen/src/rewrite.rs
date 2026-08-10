@@ -50,8 +50,25 @@ pub fn validate_q4_matvec_pattern(graph: &Graph, out: TensorId) -> Result<bool, 
     Ok(wd == DType::Q4K && xd == DType::F32)
 }
 
-/// Classify weight dtype for a scheduled matvec root (`SumReduce` of `MulBroadcastRow`).
+/// Classify weight dtype for a scheduled matvec root (`SumReduce` of `MulBroadcastRow`
+/// or fused matvec / rmsnorm+matvec Call).
 pub fn matvec_weight_dtype(graph: &Graph, out: TensorId) -> Result<Option<DType>, CodegenError> {
+    if let Some(ksearch_ir::FuseHint::MatvecGateUpGelu { gate, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*gate)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecQkv { wq, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*wq)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvec { w_mat, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*w_mat)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvecGateUpGelu { gate, .. }) = graph.fuse_hint(out)
+    {
+        return Ok(Some(graph.shape_dtype(*gate)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvecQkv { wq, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*wq)?.1));
+    }
     let node = graph.node(out)?;
     let Op::SumReduce { inp, .. } = &node.op else {
         return Ok(None);

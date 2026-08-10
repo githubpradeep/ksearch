@@ -48,9 +48,19 @@ impl Eng {
         inputs: &[&Buffer],
         output: &Buffer,
     ) -> Result<()> {
+        self.run_multi(ctx, key, inputs, &[output])
+    }
+
+    fn run_multi(
+        &self,
+        ctx: &MetalContext,
+        key: &str,
+        inputs: &[&Buffer],
+        outputs: &[&Buffer],
+    ) -> Result<()> {
         let (src, pipe) = self.cache.get(key).expect("ensure first");
         let tg = Self::tg_for(src);
-        ctx.encode(pipe, src, inputs, output, tg)?;
+        ctx.encode_multi(pipe, src, inputs, outputs, tg)?;
         Ok(())
     }
 
@@ -95,6 +105,89 @@ impl Eng {
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
         self.run(ctx, &key, &[a, x], y)
+    }
+
+    /// Fused Q/K/V F16 matvecs (one launch; LOCAL-stages `x`; three outputs).
+    pub fn matvec_qkv(
+        &mut self,
+        ctx: &MetalContext,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        x: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+    ) -> Result<()> {
+        let key = format!("mv_qkv_f16_{q_rows}x{kv_rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wq_i = g.input(Shape(vec![q_rows, cols]), DType::F16);
+            let wk_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
+            let wv_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
+            let x_i = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.matvec_qkv(wq_i, wk_i, wv_i, x_i)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run_multi(ctx, &key, &[wq, wk, wv, x], &[q, k, v])
+    }
+
+    /// RMSNorm(x,w_norm) fused into dense F16 matvec (LOCAL-stages `x_hat`).
+    pub fn rmsnorm_matvec(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        x: &Buffer,
+        w_norm: &Buffer,
+        w_mat: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let key = format!("rms_mv_f16_{rows}x{cols}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wm = g.input(Shape(vec![rows, cols]), DType::F16);
+            let xi = g.input(Shape(vec![cols]), DType::F16);
+            let wn = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.rmsnorm_matvec(wm, xi, wn, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[w_mat, x, w_norm], y)
+    }
+
+    /// RMSNorm into LOCAL `x_hat`, then fused Q/K/V F16 matvecs (3 outputs).
+    pub fn rmsnorm_matvec_qkv(
+        &mut self,
+        ctx: &MetalContext,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        eps: f32,
+        x: &Buffer,
+        w_norm: &Buffer,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+    ) -> Result<()> {
+        let key = format!("rms_mv_qkv_f16_{q_rows}x{kv_rows}x{cols}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wq_i = g.input(Shape(vec![q_rows, cols]), DType::F16);
+            let wk_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
+            let wv_i = g.input(Shape(vec![kv_rows, cols]), DType::F16);
+            let x_i = g.input(Shape(vec![cols]), DType::F16);
+            let wn = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.rmsnorm_matvec_qkv(wq_i, wk_i, wv_i, x_i, wn, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run_multi(ctx, &key, &[wq, wk, wv, x, w_norm], &[q, k, v])
     }
 
     /// Removed: tinygrad dequants to float then uses generic matvec.
@@ -324,6 +417,55 @@ impl Eng {
         self.run(ctx, &key, &[gate, up], y)
     }
 
+    /// Fused gate/up F16 matvecs + GELU*mul (one launch; LOCAL-stages `x`).
+    pub fn matvec_gate_up_gelu(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        gate: &Buffer,
+        up: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let key = format!("mv_gate_up_gelu_f16_{rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wg = g.input(Shape(vec![rows, cols]), DType::F16);
+            let wu = g.input(Shape(vec![rows, cols]), DType::F16);
+            let v = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.matvec_gate_up_gelu(wg, wu, v)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[gate, up, x], y)
+    }
+
+    /// RMSNorm into LOCAL `x_hat`, then fused gate/up F16 matvecs + GELU*mul.
+    pub fn rmsnorm_matvec_gate_up_gelu(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        x: &Buffer,
+        w_norm: &Buffer,
+        gate: &Buffer,
+        up: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let key = format!("rms_mv_gate_up_gelu_f16_{rows}x{cols}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wg = g.input(Shape(vec![rows, cols]), DType::F16);
+            let wu = g.input(Shape(vec![rows, cols]), DType::F16);
+            let v = g.input(Shape(vec![cols]), DType::F16);
+            let wn = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.rmsnorm_matvec_gate_up_gelu(wg, wu, v, wn, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[gate, up, x, w_norm], y)
+    }
+
     pub fn scale_const(
         &mut self,
         ctx: &MetalContext,
@@ -455,7 +597,7 @@ impl Eng {
         use ksearch_codegen::{beam_search_matvec, load_plan};
         let chip = ctx.device_name();
         let force = std::env::var("KSEARCH_BEAM_FORCE").is_ok();
-        if !force && load_plan("matvec_f16", &[rows, cols], &chip).is_some() {
+        if !force && load_plan("matvec_f16_nr", &[rows, cols], &chip).is_some() {
             return Ok(());
         }
         eprintln!("[beam] searching F16 matvec {rows}x{cols} …");
@@ -484,10 +626,11 @@ impl Eng {
         };
         let result = beam_search_matvec(&g, y, &chip, time_one).map_err(|e| anyhow::anyhow!(e))?;
         eprintln!(
-            "[beam] {rows}x{cols} → tg={} vec={} unroll={} ({:.3} ms{})",
+            "[beam] {rows}x{cols} → tg={} vec={} unroll={} nr0={} ({:.3} ms{})",
             result.schedule.tg,
             result.schedule.vec,
             result.schedule.unroll,
+            result.schedule.nr0,
             result.ms,
             if result.from_cache { ", cache" } else { "" }
         );

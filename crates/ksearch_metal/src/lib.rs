@@ -110,6 +110,12 @@ impl MetalContext {
 
     pub fn write_u16s(&self, buf: &Buffer, data: &[u16]) {
         self.synchronize().ok();
+        self.write_u16s_nosync(buf, data);
+    }
+
+    /// Host write without flushing GPU. Caller must ensure `buf` is not a pending GPU read target
+    /// (e.g. double-buffer + [`wait_inflight_at_most`]).
+    pub fn write_u16s_nosync(&self, buf: &Buffer, data: &[u16]) {
         let ptr = buf.contents() as *mut u16;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
@@ -135,11 +141,39 @@ impl MetalContext {
         pending.cmd
     }
 
+    /// True if a compute encoder is open or command buffers are in flight.
+    pub fn has_gpu_work(&self) -> bool {
+        self.pending.borrow().is_some() || !self.inflight.borrow().is_empty()
+    }
+
     /// Commit pending work without waiting (overlap CPU encode with GPU).
     pub fn flush_async(&self) {
         if let Some(p) = self.pending.borrow_mut().take() {
             let cmd = Self::end_pending(p, false);
             self.inflight.borrow_mut().push(cmd);
+        }
+    }
+
+    /// Block until at most `max_inflight` command buffers remain (drop completed from the front).
+    /// Use with double-buffered host writes: `max_inflight=1` keeps one CB in flight.
+    pub fn wait_inflight_at_most(&self, max_inflight: usize) {
+        let mut inflight = self.inflight.borrow_mut();
+        while inflight.len() > max_inflight {
+            if let Some(cmd) = inflight.first() {
+                cmd.wait_until_completed();
+            }
+            inflight.remove(0);
+        }
+        // Also reap any already-completed CBs at the front.
+        while let Some(cmd) = inflight.first() {
+            // status 4 == Completed in metal-rs; fall back to not spinning — only peek via wait with timeout unavailable.
+            // If still running, stop reaping.
+            use metal::MTLCommandBufferStatus;
+            if cmd.status() == MTLCommandBufferStatus::Completed {
+                inflight.remove(0);
+            } else {
+                break;
+            }
         }
     }
 
@@ -176,8 +210,21 @@ impl MetalContext {
         output: &Buffer,
         tg_size: u64,
     ) -> Result<()> {
+        self.encode_multi(pipeline, kernel, inputs, &[output], tg_size)
+    }
+
+    /// Like [`encode`] with one or more output buffers (`n_outputs`).
+    pub fn encode_multi(
+        &self,
+        pipeline: &ComputePipelineState,
+        kernel: &MetalKernelSource,
+        inputs: &[&Buffer],
+        outputs: &[&Buffer],
+        tg_size: u64,
+    ) -> Result<()> {
         let in_offs: Vec<u64> = inputs.iter().map(|_| 0u64).collect();
-        self.encode_offsets(pipeline, kernel, inputs, &in_offs, output, 0, tg_size)
+        let out_offs: Vec<u64> = outputs.iter().map(|_| 0u64).collect();
+        self.encode_offsets_multi(pipeline, kernel, inputs, &in_offs, outputs, &out_offs, tg_size)
     }
 
     /// Like [`encode`], but each input/output may start at a byte offset into its buffer.
@@ -191,6 +238,29 @@ impl MetalContext {
         output_byte_offset: u64,
         tg_size: u64,
     ) -> Result<()> {
+        self.encode_offsets_multi(
+            pipeline,
+            kernel,
+            inputs,
+            input_byte_offsets,
+            &[output],
+            &[output_byte_offset],
+            tg_size,
+        )
+    }
+
+    /// Multi-output encode with per-buffer byte offsets.
+    pub fn encode_offsets_multi(
+        &self,
+        pipeline: &ComputePipelineState,
+        kernel: &MetalKernelSource,
+        inputs: &[&Buffer],
+        input_byte_offsets: &[u64],
+        outputs: &[&Buffer],
+        output_byte_offsets: &[u64],
+        tg_size: u64,
+    ) -> Result<()> {
+        let n_out = kernel.n_outputs.max(1);
         if inputs.len() != kernel.n_inputs {
             return Err(anyhow!(
                 "expected {} inputs, got {}",
@@ -205,6 +275,20 @@ impl MetalContext {
                 input_byte_offsets.len()
             ));
         }
+        if outputs.len() != n_out {
+            return Err(anyhow!(
+                "expected {} outputs, got {}",
+                n_out,
+                outputs.len()
+            ));
+        }
+        if output_byte_offsets.len() != outputs.len() {
+            return Err(anyhow!(
+                "expected {} output offsets, got {}",
+                outputs.len(),
+                output_byte_offsets.len()
+            ));
+        }
         autoreleasepool(|| {
             let mut slot = self.ensure_pending();
             let pending = slot.as_mut().unwrap();
@@ -213,11 +297,13 @@ impl MetalContext {
             for (i, b) in inputs.iter().enumerate() {
                 enc.set_buffer(i as u64, Some(b), input_byte_offsets[i]);
             }
-            enc.set_buffer(
-                kernel.n_inputs as u64,
-                Some(output),
-                output_byte_offset,
-            );
+            for (o, b) in outputs.iter().enumerate() {
+                enc.set_buffer(
+                    (kernel.n_inputs + o) as u64,
+                    Some(b),
+                    output_byte_offsets[o],
+                );
+            }
 
             let (n_tg, tg) = match &kernel.launch {
                 LaunchHint::Elementwise { n } => {

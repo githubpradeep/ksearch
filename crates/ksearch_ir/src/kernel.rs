@@ -105,6 +105,58 @@ pub enum FuseHint {
         gate: TensorId,
         up: TensorId,
     },
+    /// Fused MLP gate/up matvecs + GELU*mul: `out[i] = gelu(dot(W_gate[i],x)) * dot(W_up[i],x)`.
+    MatvecGateUpGelu {
+        rows: usize,
+        cols: usize,
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+    },
+    /// Fused Q/K/V matvecs sharing one LOCAL `x`: `Q=Wq@x`, `K=Wk@x`, `V=Wv@x` (3 outputs).
+    MatvecQkv {
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+        x: TensorId,
+    },
+    /// RMSNorm(x,w_norm) then dense matvec: LOCAL-stage `x_hat`, `y = W @ x_hat`.
+    RmsNormMatvec {
+        n: usize,
+        eps: f32,
+        rows: usize,
+        cols: usize,
+        x: TensorId,
+        w_norm: TensorId,
+        w_mat: TensorId,
+    },
+    /// RMSNorm into LOCAL `x_hat`, then fused gate/up matvec+GELU.
+    RmsNormMatvecGateUpGelu {
+        n: usize,
+        eps: f32,
+        rows: usize,
+        cols: usize,
+        x: TensorId,
+        w_norm: TensorId,
+        gate: TensorId,
+        up: TensorId,
+    },
+    /// RMSNorm into LOCAL `x_hat`, then fused Q/K/V matvecs.
+    RmsNormMatvecQkv {
+        n: usize,
+        eps: f32,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        x: TensorId,
+        w_norm: TensorId,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+    },
     SdpaNaive {
         n_q: usize,
         hd: usize,
@@ -210,6 +262,58 @@ pub enum KernelKind {
         gate: TensorId,
         up: TensorId,
     },
+    MatvecGateUpGelu {
+        rows: usize,
+        cols: usize,
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+        weight_dtype: DType,
+    },
+    MatvecQkv {
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+        x: TensorId,
+        weight_dtype: DType,
+    },
+    RmsNormMatvec {
+        n: usize,
+        eps: f32,
+        rows: usize,
+        cols: usize,
+        x: TensorId,
+        w_norm: TensorId,
+        w_mat: TensorId,
+        weight_dtype: DType,
+    },
+    RmsNormMatvecGateUpGelu {
+        n: usize,
+        eps: f32,
+        rows: usize,
+        cols: usize,
+        x: TensorId,
+        w_norm: TensorId,
+        gate: TensorId,
+        up: TensorId,
+        weight_dtype: DType,
+    },
+    RmsNormMatvecQkv {
+        n: usize,
+        eps: f32,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        x: TensorId,
+        w_norm: TensorId,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+        weight_dtype: DType,
+    },
     CopySlice {
         src_off: usize,
         dst_off: usize,
@@ -236,7 +340,7 @@ pub enum KirLaunch {
     Elementwise { n: usize },
     /// One thread per row (`thread_position_in_grid`).
     Rows { rows: usize },
-    /// One threadgroup per row; `gid`=row, `lid`=lane (`OptSchedule.tg`).
+    /// `rows` threadgroups; each TG may cover `OptSchedule.nr0` output rows (`gid`=TG index).
     RowsParallel { rows: usize, tg: u64 },
 }
 
@@ -277,6 +381,7 @@ pub enum KirExpr {
         dtype: DType,
     },
     /// `dot(floatN(a[idx_a..]), floatN(b[idx_b..]))` for width 1/2/4 (promote half→float).
+    /// When `b_from_tg` is `Some(id)`, B is loaded from `threadgroup float tg{id}` (already float).
     VecMulSum {
         a_buf: u32,
         a_idx: Box<KirExpr>,
@@ -284,6 +389,12 @@ pub enum KirExpr {
         b_idx: Box<KirExpr>,
         width: u32,
         dtype: DType,
+        b_from_tg: Option<u32>,
+    },
+    /// Load from `threadgroup float tg{id}[idx]` (LOCAL staging).
+    TgLoad {
+        id: u32,
+        idx: Box<KirExpr>,
     },
     SimdSum(Box<KirExpr>),
     Bin {
@@ -303,6 +414,8 @@ pub enum KirExpr {
         a: Box<KirExpr>,
         b: Box<KirExpr>,
     },
+    /// `float(uint_expr)` for storing indices in float tg/regs.
+    CastU32ToF32(Box<KirExpr>),
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +450,16 @@ pub enum KirStmt {
         idx: KirExpr,
         val: KirExpr,
     },
+    /// `threadgroup float tg{id}[n];` (static LOCAL; Apple needs no set_threadgroup_memory_length).
+    TgDeclF32 { id: u32, n: usize },
+    /// Cooperative store into LOCAL: `tg{id}[idx] = val`.
+    TgStore {
+        id: u32,
+        idx: KirExpr,
+        val: KirExpr,
+    },
+    /// `threadgroup_barrier(mem_flags::mem_threadgroup)`.
+    Barrier,
     If {
         cond: KirExpr,
         body: Vec<KirStmt>,
@@ -349,6 +472,8 @@ pub enum KirStmt {
 pub struct KernelIr {
     pub name: String,
     pub n_inputs: usize,
+    /// Device output buffers (`out` / `out0..`). Default 1.
+    pub n_outputs: usize,
     pub out_shape: Shape,
     pub out_dtype: DType,
     pub launch: KirLaunch,

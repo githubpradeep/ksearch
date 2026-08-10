@@ -294,7 +294,7 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
 
         let chip = ctx.device_name();
         if std::env::var_os("KSEARCH_BEAM_FORCE").is_some() {
-            let key = ksearch_codegen::plan_key("matvec_f16", &[rows, cols], &chip);
+            let key = ksearch_codegen::plan_key("matvec_f16_nr", &[rows, cols], &chip);
             let _ = std::fs::remove_file(
                 ksearch_codegen::beam_cache_dir().join(format!("{key}.txt")),
             );

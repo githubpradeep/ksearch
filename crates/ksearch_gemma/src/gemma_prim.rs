@@ -34,8 +34,6 @@ pub struct GemmaPrimModel {
     tmp_k: Buffer,
     tmp_v: Buffer,
     tmp_o: Buffer,
-    tmp_ff1: Buffer,
-    tmp_ff2: Buffer,
     tmp_ff3: Buffer,
     logits: Buffer,
     argmax_out: Buffer,
@@ -139,8 +137,6 @@ impl GemmaPrimModel {
         let tmp_k = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
         let tmp_v = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
         let tmp_o = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
-        let tmp_ff1 = ctx.buffer_empty_f16(max_ff.max(ple_total));
-        let tmp_ff2 = ctx.buffer_empty_f16(max_ff.max(ple_total));
         let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
         let logits = ctx.buffer_empty_f16(cfg.vocab);
         let argmax_out = ctx.buffer_empty_f32(1);
@@ -194,8 +190,6 @@ impl GemmaPrimModel {
             tmp_k,
             tmp_v,
             tmp_o,
-            tmp_ff1,
-            tmp_ff2,
             tmp_ff3,
             logits,
             argmax_out,
@@ -238,6 +232,94 @@ impl GemmaPrimModel {
         let WeightBuf::F16(w) = self.weight_bufs.get(name).unwrap();
         let w = w.clone();
         self.eng.matvec(&self.ctx, rows, cols, &w, &x, &y)
+    }
+
+    fn rmsnorm_matvec_w(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        w_name: &str,
+        x: Buffer,
+        w_norm: &Buffer,
+        y: Buffer,
+    ) -> Result<()> {
+        self.ensure_weight(w_name)?;
+        let WeightBuf::F16(w) = self.weight_bufs.get(w_name).unwrap();
+        let w = w.clone();
+        self.eng
+            .rmsnorm_matvec(&self.ctx, rows, cols, eps, &x, w_norm, &w, &y)
+    }
+
+    fn rmsnorm_matvec_qkv_w(
+        &mut self,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        eps: f32,
+        q_name: &str,
+        k_name: &str,
+        v_name: &str,
+        x: Buffer,
+        w_norm: &Buffer,
+        q: Buffer,
+        k: Buffer,
+        v: Buffer,
+    ) -> Result<()> {
+        self.ensure_weight(q_name)?;
+        self.ensure_weight(k_name)?;
+        self.ensure_weight(v_name)?;
+        let WeightBuf::F16(wq) = self.weight_bufs.get(q_name).unwrap();
+        let wq = wq.clone();
+        let WeightBuf::F16(wk) = self.weight_bufs.get(k_name).unwrap();
+        let wk = wk.clone();
+        let WeightBuf::F16(wv) = self.weight_bufs.get(v_name).unwrap();
+        let wv = wv.clone();
+        self.eng.rmsnorm_matvec_qkv(
+            &self.ctx,
+            q_rows,
+            kv_rows,
+            cols,
+            eps,
+            &x,
+            w_norm,
+            &wq,
+            &wk,
+            &wv,
+            &q,
+            &k,
+            &v,
+        )
+    }
+
+    fn rmsnorm_matvec_gate_up_gelu_w(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        gate_name: &str,
+        up_name: &str,
+        x: Buffer,
+        w_norm: &Buffer,
+        y: Buffer,
+    ) -> Result<()> {
+        self.ensure_weight(gate_name)?;
+        self.ensure_weight(up_name)?;
+        let WeightBuf::F16(wg) = self.weight_bufs.get(gate_name).unwrap();
+        let wg = wg.clone();
+        let WeightBuf::F16(wu) = self.weight_bufs.get(up_name).unwrap();
+        let wu = wu.clone();
+        self.eng.rmsnorm_matvec_gate_up_gelu(
+            &self.ctx,
+            rows,
+            cols,
+            eps,
+            &x,
+            w_norm,
+            &wg,
+            &wu,
+            &y,
+        )
     }
 
     fn write_meta(&self, layer: usize, tlen: u32, start: u32) {
@@ -291,7 +373,12 @@ impl GemmaPrimModel {
             *v *= scale;
         }
         let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
-        self.ctx.write_u16s(&self.ple_tok, &row_h);
+        // Avoid a full GPU sync on every token: decode already synced on prior argmax read;
+        // during prefill, flush+wait only if work is in flight.
+        if self.ctx.has_gpu_work() {
+            self.ctx.synchronize()?;
+        }
+        self.ctx.write_u16s_nosync(&self.ple_tok, &row_h);
         Ok(())
     }
 
@@ -364,9 +451,14 @@ impl GemmaPrimModel {
         if self.pos >= self.max_seq {
             bail!("max_seq exceeded");
         }
+        let profile = std::env::var_os("KSEARCH_PROFILE").is_some();
+        let t0 = Instant::now();
         self.embed_token(token)?;
+        let t_embed = t0.elapsed();
         self.load_ple_token(token)?;
+        let t_ple = t0.elapsed();
         self.ple_prepass()?;
+        let t_pre = t0.elapsed();
 
         let h = self.cfg.hidden;
         let eps = self.cfg.rms_eps;
@@ -375,8 +467,17 @@ impl GemmaPrimModel {
         let max_seq = self.max_seq;
         let window = self.cfg.sliding_window;
         let ple_dim = self.cfg.ple_dim;
+        let mut ms_attn = 0.0f64;
+        let mut ms_mlp = 0.0f64;
+        let mut ms_ple_l = 0.0f64;
 
         for layer in 0..n_layers {
+            let t_section = if profile {
+                self.ctx.synchronize()?;
+                Some(Instant::now())
+            } else {
+                None
+            };
             let (q_rows, kv_rows, o_in, ffn_inter, hd) = {
                 let lw = &self.layers[layer];
                 (lw.q_rows, lw.kv_rows, lw.o_in, lw.ffn_inter, lw.hd)
@@ -397,18 +498,33 @@ impl GemmaPrimModel {
             let owns_kv = self.cfg.owns_kv(layer);
             let kv_src = self.cfg.kv_source(layer);
 
-            self.eng.rmsnorm(
-                &self.ctx,
-                h,
-                eps,
-                &self.x,
-                &self.layer_norms[layer].attn_norm,
-                &self.x2,
-            )?;
-            self.matvec_w(q_rows, h, &format!("{pref}attn_q.weight"), self.x2.clone(), self.tmp_q.clone())?;
             if owns_kv {
-                self.matvec_w(kv_rows, h, &format!("{pref}attn_k.weight"), self.x2.clone(), self.tmp_k.clone())?;
-                self.matvec_w(kv_rows, h, &format!("{pref}attn_v.weight"), self.x2.clone(), self.tmp_v.clone())?;
+                let attn_norm = self.layer_norms[layer].attn_norm.clone();
+                self.rmsnorm_matvec_qkv_w(
+                    q_rows,
+                    kv_rows,
+                    h,
+                    eps,
+                    &format!("{pref}attn_q.weight"),
+                    &format!("{pref}attn_k.weight"),
+                    &format!("{pref}attn_v.weight"),
+                    self.x.clone(),
+                    &attn_norm,
+                    self.tmp_q.clone(),
+                    self.tmp_k.clone(),
+                    self.tmp_v.clone(),
+                )?;
+            } else {
+                let attn_norm = self.layer_norms[layer].attn_norm.clone();
+                self.rmsnorm_matvec_w(
+                    q_rows,
+                    h,
+                    eps,
+                    &format!("{pref}attn_q.weight"),
+                    self.x.clone(),
+                    &attn_norm,
+                    self.tmp_q.clone(),
+                )?;
             }
 
             self.fill_cos_sin(layer, self.pos, hd, theta, rope_angles);
@@ -474,32 +590,28 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x,
             )?;
+            if let Some(ts) = t_section {
+                self.ctx.synchronize()?;
+                ms_attn += ts.elapsed().as_secs_f64() * 1e3;
+            }
+            let t_mlp = if profile {
+                Some(Instant::now())
+            } else {
+                None
+            };
 
-            // MLP: rms → gate/up matvecs → gelu_mul → down
-            self.eng.rmsnorm(
-                &self.ctx,
+            // MLP: fused rms → gate/up matvec+gelu → down
+            let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
+            self.rmsnorm_matvec_gate_up_gelu_w(
+                ffn_inter,
                 h,
                 eps,
-                &self.x,
-                &self.layer_norms[layer].ffn_norm,
-                &self.x2,
-            )?;
-            self.matvec_w(
-                ffn_inter,
-                h,
                 &format!("{pref}ffn_gate.weight"),
-                self.x2.clone(),
-                self.tmp_ff1.clone(),
-            )?;
-            self.matvec_w(
-                ffn_inter,
-                h,
                 &format!("{pref}ffn_up.weight"),
-                self.x2.clone(),
-                self.tmp_ff2.clone(),
+                self.x.clone(),
+                &ffn_norm,
+                self.tmp_ff3.clone(),
             )?;
-            self.eng
-                .gelu_mul(&self.ctx, ffn_inter, &self.tmp_ff1, &self.tmp_ff2, &self.tmp_ff3)?;
             self.matvec_w(
                 h,
                 ffn_inter,
@@ -516,6 +628,15 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x,
             )?;
+            if let Some(ts) = t_mlp {
+                self.ctx.synchronize()?;
+                ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+            }
+            let t_ple_l = if profile {
+                Some(Instant::now())
+            } else {
+                None
+            };
 
             // PLE
             self.matvec_w(
@@ -550,29 +671,63 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x,
             )?;
+            if let Some(ts) = t_ple_l {
+                self.ctx.synchronize()?;
+                ms_ple_l += ts.elapsed().as_secs_f64() * 1e3;
+            }
         }
 
+        let t_layers = t0.elapsed();
         self.pos += 1;
         if !want_logits {
-            self.ctx.synchronize()?;
+            // Keep GPU pipeline full — host only syncs when reading argmax / generate end.
+            if profile {
+                self.ctx.synchronize()?;
+                eprintln!(
+                    "[profile] prefill pos={} embed={:.1}ms ple_load={:.1}ms prepass={:.1}ms layers={:.1}ms total={:.1}ms",
+                    self.pos - 1,
+                    t_embed.as_secs_f64() * 1e3,
+                    (t_ple - t_embed).as_secs_f64() * 1e3,
+                    (t_pre - t_ple).as_secs_f64() * 1e3,
+                    (t_layers - t_pre).as_secs_f64() * 1e3,
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
             return Ok(None);
         }
 
-        self.eng
-            .rmsnorm(&self.ctx, h, eps, &self.x, &self.output_norm, &self.x2)?;
+        // Thesis-A fused output head (min): RmsNormMatvec(output_norm, token_embd)
+        // then parallel softcap_argmax — saves the standalone output rmsnorm launch.
         let vocab = self.cfg.vocab;
         let cap = self.cfg.softcap;
-        self.eng.matvec(
+        self.eng.rmsnorm_matvec(
             &self.ctx,
             vocab,
             h,
+            eps,
+            &self.x,
+            &self.output_norm,
             &self.token_embd_f16,
-            &self.x2,
             &self.logits,
         )?;
         self.eng
             .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &self.argmax_out)?;
+        let t_logits = t0.elapsed();
         let best = self.ctx.read_f32(&self.argmax_out, 1)[0] as u32;
+        if profile {
+            eprintln!(
+                "[profile] decode pos={} embed={:.1}ms ple_load={:.1}ms prepass={:.1}ms attn={:.1}ms mlp={:.1}ms ple={:.1}ms logits+sync={:.1}ms total={:.1}ms",
+                self.pos - 1,
+                t_embed.as_secs_f64() * 1e3,
+                (t_ple - t_embed).as_secs_f64() * 1e3,
+                (t_pre - t_ple).as_secs_f64() * 1e3,
+                ms_attn,
+                ms_mlp,
+                ms_ple_l,
+                (t0.elapsed() - t_logits).as_secs_f64() * 1e3 + (t_logits - t_layers).as_secs_f64() * 1e3,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(Some(best))
     }
 

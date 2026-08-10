@@ -35,6 +35,8 @@ pub struct MetalKernelSource {
     pub name: String,
     pub source: String,
     pub n_inputs: usize,
+    /// Number of device output buffers (`out` or `out0..out{n-1}`).
+    pub n_outputs: usize,
     pub out_shape: Shape,
     pub out_dtype: DType,
     pub launch: LaunchHint,
@@ -76,7 +78,7 @@ pub fn lower_to_metal_chip(
     let sched = match matvec_weight_dtype(graph, out)? {
         Some(DType::Q4K) => load_plan("matvec_q4k", &matvec_dims(graph, out)?, chip)
             .unwrap_or_else(OptSchedule::q4k_default),
-        Some(DType::F16) => load_plan("matvec_f16", &matvec_dims(graph, out)?, chip)
+        Some(DType::F16) => load_plan("matvec_f16_nr", &matvec_dims(graph, out)?, chip)
             .unwrap_or_default(),
         Some(DType::F32) => load_plan("matvec_f32", &matvec_dims(graph, out)?, chip)
             .unwrap_or_default(),
@@ -86,6 +88,35 @@ pub fn lower_to_metal_chip(
 }
 
 fn matvec_dims(graph: &Graph, out: TensorId) -> Result<Vec<usize>, CodegenError> {
+    if let Some(ksearch_ir::FuseHint::MatvecGateUpGelu { rows, cols, .. }) = graph.fuse_hint(out) {
+        return Ok(vec![*rows, *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvecGateUpGelu { rows, cols, .. }) =
+        graph.fuse_hint(out)
+    {
+        return Ok(vec![*rows, *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvec { rows, cols, .. }) = graph.fuse_hint(out) {
+        return Ok(vec![*rows, *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecQkv {
+        q_rows,
+        kv_rows,
+        cols,
+        ..
+    }) = graph.fuse_hint(out)
+    {
+        return Ok(vec![(*q_rows).max(*kv_rows), *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvecQkv {
+        q_rows,
+        kv_rows,
+        cols,
+        ..
+    }) = graph.fuse_hint(out)
+    {
+        return Ok(vec![(*q_rows).max(*kv_rows), *cols]);
+    }
     let node = graph.node(out)?;
     if let Op::SumReduce { inp, .. } = &node.op {
         if let Op::MulBroadcastRow { left, .. } = &graph.node(*inp)?.op {
@@ -143,7 +174,7 @@ where
     };
     let dims = [rows, cols];
     let plan_kind = match matvec_weight_dtype(graph, out)? {
-        Some(DType::F16) => "matvec_f16",
+        Some(DType::F16) => "matvec_f16_nr",
         Some(DType::Q4K) => "matvec_q4k",
         _ => "matvec_f32",
     };
