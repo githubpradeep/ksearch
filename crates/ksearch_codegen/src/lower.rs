@@ -365,6 +365,34 @@ pub fn lower_to_kir(
                 1,
             )
         },
+        KernelKind::SdpaMwgPart {
+            n_q,
+            hd,
+            max_t,
+            nwg,
+            kv_dtype,
+            ..
+        } => {
+            let _ = max_t;
+            // One TG per KV partition; all Q heads share K/V tile (MQA bandwidth).
+            let tg = (*n_q as u64).saturating_mul(32).max(32);
+            (
+                KirLaunch::RowsParallel {
+                    rows: (*nwg).max(1),
+                    tg,
+                },
+                lower_sdpa_mwg_part(*n_q, *hd, *nwg, DType::F16, *kv_dtype, tg, &mut next),
+                1,
+            )
+        },
+        KernelKind::SdpaMwgReduce { n_q, hd, nwg, .. } => (
+            KirLaunch::RowsParallel {
+                rows: (*n_q).max(1),
+                tg: 32,
+            },
+            lower_sdpa_mwg_reduce(*n_q, *hd, *nwg, out_dtype, &mut next),
+            1,
+        ),
         KernelKind::QuantizeQ40 { n, .. } => (
             KirLaunch::Elementwise { n: *n / 32 },
             lower_quantize_q40(sk.inputs.len() as u32, &mut next),
@@ -3946,6 +3974,603 @@ fn lower_sdpa_online(
 
 fn lower_sdpa(n_q: usize, hd: usize, max_t: usize, dt: DType, next: &mut u32) -> Vec<KirStmt> {
     lower_sdpa_online(n_q, hd, max_t, dt, dt, (n_q as u64) * 32, next)
+}
+
+/// MWG pass1: one TG per KV partition; all Q heads share K/V TG tile (MQA-friendly).
+/// Writes F32 partials at `(head * nwg + part) * (hd + 2)` → (m, l, O[hd]).
+fn lower_sdpa_mwg_part(
+    n_q: usize,
+    hd: usize,
+    nwg: usize,
+    q_dt: DType,
+    kv_dt: DType,
+    tg: u64,
+    next: &mut u32,
+) -> Vec<KirStmt> {
+    let _ = n_q;
+    assert!(hd % 32 == 0, "sdpa mwg hd must be multiple of 32");
+    assert!(nwg > 0);
+    // Use full TG float budget (hd=256→tile16, hd=512→tile8).
+    let tile = (32768 / (2 * hd * 4)).max(1);
+    assert!(2 * tile * hd * 4 <= 32768, "SDPA K+V tile exceeds TG budget");
+    let n_own = hd / 32;
+    let k_tg = 0u32;
+    let v_tg = 1u32;
+    let q_th = 0u32;
+    let o_th = 1u32;
+    let nwg_u = nwg as u32;
+    let stride = (hd + 2) as u32;
+
+    let head = fresh(next);
+    let lane = fresh(next);
+    let part = fresh(next);
+    let base = fresh(next);
+    let tlen_f = fresh(next);
+    let start_f = fresh(next);
+    let tlen = fresh(next);
+    let start = fresh(next);
+    let chunk = fresh(next);
+    let p0 = fresh(next);
+    let p1 = fresh(next);
+    let m = fresh(next);
+    let lsum = fresh(next);
+    let t_base = fresh(next);
+    let s = fresh(next);
+    let m2 = fresh(next);
+    let alpha = fresh(next);
+    let e = fresh(next);
+    let iq = fresh(next);
+    let io = fresh(next);
+    let iw = fresh(next);
+    let q_base = fresh(next);
+    let tmp_base = fresh(next);
+    let mut d_load = Vec::with_capacity(tile);
+    let mut d_score = Vec::with_capacity(tile);
+    for _ in 0..tile {
+        d_load.push(fresh(next));
+        d_score.push(fresh(next));
+    }
+
+    let mut stmts = vec![
+        KirStmt::TgDeclF32 {
+            id: k_tg,
+            n: tile * hd,
+        },
+        KirStmt::TgDeclF32 {
+            id: v_tg,
+            n: tile * hd,
+        },
+        KirStmt::ThreadDeclF32 { id: q_th, n: n_own },
+        KirStmt::ThreadDeclF32 { id: o_th, n: n_own },
+        KirStmt::LetU32 {
+            id: part,
+            expr: gid(),
+        },
+        KirStmt::LetU32 {
+            id: head,
+            expr: bin(BinOp::Div, lid(), cu(32)),
+        },
+        KirStmt::LetU32 {
+            id: lane,
+            expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(head), cu(32))),
+        },
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, uv(lane), cu(n_own as u32)),
+        },
+        KirStmt::Let {
+            id: tlen_f,
+            expr: ld(3, cu(0), q_dt),
+        },
+        KirStmt::Let {
+            id: start_f,
+            expr: ld(3, cu(1), q_dt),
+        },
+        KirStmt::LetU32 {
+            id: tlen,
+            expr: KirExpr::CastF32ToU32(Box::new(v(tlen_f))),
+        },
+        KirStmt::LetU32 {
+            id: start,
+            expr: KirExpr::CastF32ToU32(Box::new(v(start_f))),
+        },
+        KirStmt::LetU32 {
+            id: chunk,
+            expr: bin(
+                BinOp::Div,
+                bin(BinOp::Add, uv(tlen), cu(nwg_u - 1)),
+                cu(nwg_u),
+            ),
+        },
+        KirStmt::LetU32 {
+            id: p0,
+            expr: bin(BinOp::Mul, uv(part), uv(chunk)),
+        },
+        KirStmt::LetU32 {
+            id: p1,
+            expr: bin(
+                BinOp::Min,
+                bin(BinOp::Add, uv(p0), uv(chunk)),
+                uv(tlen),
+            ),
+        },
+        KirStmt::LetU32 {
+            id: q_base,
+            expr: bin(BinOp::Mul, uv(head), cu(hd as u32)),
+        },
+        KirStmt::LetU32 {
+            id: tmp_base,
+            expr: bin(
+                BinOp::Mul,
+                bin(
+                    BinOp::Add,
+                    bin(BinOp::Mul, uv(head), cu(nwg_u)),
+                    uv(part),
+                ),
+                cu(stride),
+            ),
+        },
+        KirStmt::Let {
+            id: m,
+            expr: c(-1.0e30),
+        },
+        KirStmt::Let {
+            id: lsum,
+            expr: c(0.0),
+        },
+        KirStmt::For {
+            id: iq,
+            n: n_own,
+            body: vec![
+                th_store(
+                    q_th,
+                    fv(iq),
+                    ld(
+                        0,
+                        bin(BinOp::Add, uv(q_base), bin(BinOp::Add, uv(base), fv(iq))),
+                        q_dt,
+                    ),
+                ),
+                th_store(o_th, fv(iq), c(0.0)),
+            ],
+        },
+        KirStmt::LetU32 {
+            id: t_base,
+            expr: uv(p0),
+        },
+    ];
+
+    let mut pass = Vec::new();
+    for r in 0..tile {
+        let row_off = (r * hd) as u32;
+        let row_base = bin(
+            BinOp::Mul,
+            bin(
+                BinOp::Add,
+                uv(start),
+                bin(BinOp::Add, uv(t_base), cu(r as u32)),
+            ),
+            cu(hd as u32),
+        );
+        let load_body = {
+            let hd4 = (hd as u32) / 4;
+            let d = d_load[r];
+            let off4 = |base: KirExpr| bin(BinOp::Add, base, bin(BinOp::Mul, uv(d), cu(4)));
+            vec![
+                KirStmt::LetU32 {
+                    id: d,
+                    expr: lid(),
+                },
+                KirStmt::ForRange {
+                    id: d,
+                    limit_off: cu(0),
+                    bound: cu(hd4),
+                    step: cu(tg as u32),
+                    body: vec![
+                        KirStmt::TgStoreF4FromLoad {
+                            tg_id: k_tg,
+                            tg_off: off4(cu(row_off)),
+                            src_buf: 1,
+                            src_elem: off4(row_base.clone()),
+                            dtype: kv_dt,
+                        },
+                        KirStmt::TgStoreF4FromLoad {
+                            tg_id: v_tg,
+                            tg_off: off4(cu(row_off)),
+                            src_buf: 2,
+                            src_elem: off4(row_base.clone()),
+                            dtype: kv_dt,
+                        },
+                    ],
+                },
+            ]
+        };
+        if tile == 1 {
+            pass.extend(load_body);
+        } else {
+            pass.push(KirStmt::If {
+                cond: gt(uv(p1), bin(BinOp::Add, uv(t_base), cu(r as u32))),
+                body: load_body,
+            });
+        }
+    }
+    pass.push(KirStmt::Barrier);
+
+    for r in 0..tile {
+        let row_off = (r * hd) as u32;
+        let mut body = Vec::new();
+        body.push(KirStmt::Let {
+            id: s,
+            expr: c(0.0),
+        });
+        if n_own % 4 == 0 {
+            let n4 = n_own / 4;
+            body.push(KirStmt::For {
+                id: d_score[r],
+                n: n4,
+                body: vec![KirStmt::Assign {
+                    id: s,
+                    expr: bin(
+                        BinOp::Add,
+                        v(s),
+                        bin(
+                            BinOp::Add,
+                            bin(
+                                BinOp::Add,
+                                bin(
+                                    BinOp::Mul,
+                                    th_load(q_th, bin(BinOp::Mul, fv(d_score[r]), cu(4))),
+                                    tg_load(
+                                        k_tg,
+                                        bin(
+                                            BinOp::Add,
+                                            cu(row_off),
+                                            bin(
+                                                BinOp::Add,
+                                                uv(base),
+                                                bin(BinOp::Mul, fv(d_score[r]), cu(4)),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                bin(
+                                    BinOp::Mul,
+                                    th_load(
+                                        q_th,
+                                        bin(BinOp::Add, bin(BinOp::Mul, fv(d_score[r]), cu(4)), cu(1)),
+                                    ),
+                                    tg_load(
+                                        k_tg,
+                                        bin(
+                                            BinOp::Add,
+                                            cu(row_off),
+                                            bin(
+                                                BinOp::Add,
+                                                uv(base),
+                                                bin(
+                                                    BinOp::Add,
+                                                    bin(BinOp::Mul, fv(d_score[r]), cu(4)),
+                                                    cu(1),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                            bin(
+                                BinOp::Add,
+                                bin(
+                                    BinOp::Mul,
+                                    th_load(
+                                        q_th,
+                                        bin(BinOp::Add, bin(BinOp::Mul, fv(d_score[r]), cu(4)), cu(2)),
+                                    ),
+                                    tg_load(
+                                        k_tg,
+                                        bin(
+                                            BinOp::Add,
+                                            cu(row_off),
+                                            bin(
+                                                BinOp::Add,
+                                                uv(base),
+                                                bin(
+                                                    BinOp::Add,
+                                                    bin(BinOp::Mul, fv(d_score[r]), cu(4)),
+                                                    cu(2),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                bin(
+                                    BinOp::Mul,
+                                    th_load(
+                                        q_th,
+                                        bin(BinOp::Add, bin(BinOp::Mul, fv(d_score[r]), cu(4)), cu(3)),
+                                    ),
+                                    tg_load(
+                                        k_tg,
+                                        bin(
+                                            BinOp::Add,
+                                            cu(row_off),
+                                            bin(
+                                                BinOp::Add,
+                                                uv(base),
+                                                bin(
+                                                    BinOp::Add,
+                                                    bin(BinOp::Mul, fv(d_score[r]), cu(4)),
+                                                    cu(3),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                }],
+            });
+        } else {
+            body.push(KirStmt::For {
+                id: d_score[r],
+                n: n_own,
+                body: vec![KirStmt::Assign {
+                    id: s,
+                    expr: bin(
+                        BinOp::Add,
+                        v(s),
+                        bin(
+                            BinOp::Mul,
+                            th_load(q_th, fv(d_score[r])),
+                            tg_load(
+                                k_tg,
+                                bin(BinOp::Add, cu(row_off), bin(BinOp::Add, uv(base), fv(d_score[r]))),
+                            ),
+                        ),
+                    ),
+                }],
+            });
+        }
+        body.push(KirStmt::Assign {
+            id: s,
+            expr: KirExpr::SimdSum(Box::new(v(s))),
+        });
+        body.push(KirStmt::Let {
+            id: m2,
+            expr: bin(BinOp::Max, v(m), v(s)),
+        });
+        body.push(KirStmt::Let {
+            id: alpha,
+            expr: un(UnaryOp::Exp, bin(BinOp::Sub, v(m), v(m2))),
+        });
+        body.push(KirStmt::Let {
+            id: e,
+            expr: un(UnaryOp::Exp, bin(BinOp::Sub, v(s), v(m2))),
+        });
+        body.push(KirStmt::Assign {
+            id: lsum,
+            expr: bin(BinOp::Add, bin(BinOp::Mul, v(lsum), v(alpha)), v(e)),
+        });
+        body.push(KirStmt::Assign {
+            id: m,
+            expr: v(m2),
+        });
+        body.push(KirStmt::For {
+            id: io,
+            n: n_own,
+            body: vec![th_store(
+                o_th,
+                fv(io),
+                bin(
+                    BinOp::Add,
+                    bin(BinOp::Mul, th_load(o_th, fv(io)), v(alpha)),
+                    bin(
+                        BinOp::Mul,
+                        v(e),
+                        tg_load(
+                            v_tg,
+                            bin(BinOp::Add, cu(row_off), bin(BinOp::Add, uv(base), fv(io))),
+                        ),
+                    ),
+                ),
+            )],
+        });
+        if tile == 1 {
+            pass.extend(body);
+        } else {
+            pass.push(KirStmt::If {
+                cond: gt(uv(p1), bin(BinOp::Add, uv(t_base), cu(r as u32))),
+                body,
+            });
+        }
+    }
+
+    stmts.push(KirStmt::ForRange {
+        id: t_base,
+        limit_off: cu(0),
+        bound: uv(p1),
+        step: cu(tile as u32),
+        body: pass,
+    });
+    // Store m,l (lane 0 of each head) and partial O.
+    stmts.push(KirStmt::If {
+        cond: eq(uv(lane), cu(0)),
+        body: vec![
+            st(4, uv(tmp_base), v(m)),
+            st(4, bin(BinOp::Add, uv(tmp_base), cu(1)), v(lsum)),
+        ],
+    });
+    stmts.push(KirStmt::For {
+        id: iw,
+        n: n_own,
+        body: vec![st(
+            4,
+            bin(
+                BinOp::Add,
+                uv(tmp_base),
+                bin(BinOp::Add, cu(2), bin(BinOp::Add, uv(base), fv(iw))),
+            ),
+            th_load(o_th, fv(iw)),
+        )],
+    });
+    stmts
+}
+
+/// MWG pass2: per-head log-sum-exp merge of NWG F32 partials → F16 O.
+fn lower_sdpa_mwg_reduce(
+    n_q: usize,
+    hd: usize,
+    nwg: usize,
+    out_dt: DType,
+    next: &mut u32,
+) -> Vec<KirStmt> {
+    let _ = (n_q, out_dt);
+    assert!(hd % 32 == 0);
+    assert!(nwg > 0);
+    let n_own = hd / 32;
+    let o_th = 0u32;
+    let stride = (hd + 2) as u32;
+    let nwg_u = nwg as u32;
+
+    let head = fresh(next);
+    let base = fresh(next);
+    let m = fresh(next);
+    let lsum = fresh(next);
+    let p = fresh(next);
+    let part_base = fresh(next);
+    let mp = fresh(next);
+    let lp = fresh(next);
+    let m2 = fresh(next);
+    let alpha = fresh(next);
+    let beta = fresh(next);
+    let io = fresh(next);
+    let iw = fresh(next);
+    let inv_l = fresh(next);
+    let q_base = fresh(next);
+    let op = fresh(next);
+
+    vec![
+        KirStmt::ThreadDeclF32 { id: o_th, n: n_own },
+        KirStmt::LetU32 {
+            id: head,
+            expr: gid(),
+        },
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, lid(), cu(n_own as u32)),
+        },
+        KirStmt::LetU32 {
+            id: q_base,
+            expr: bin(BinOp::Mul, uv(head), cu(hd as u32)),
+        },
+        KirStmt::Let {
+            id: m,
+            expr: c(-1.0e30),
+        },
+        KirStmt::Let {
+            id: lsum,
+            expr: c(0.0),
+        },
+        KirStmt::For {
+            id: io,
+            n: n_own,
+            body: vec![th_store(o_th, fv(io), c(0.0))],
+        },
+        KirStmt::For {
+            id: p,
+            n: nwg,
+            body: vec![
+                KirStmt::LetU32 {
+                    id: part_base,
+                    expr: bin(
+                        BinOp::Mul,
+                        bin(
+                            BinOp::Add,
+                            bin(BinOp::Mul, uv(head), cu(nwg_u)),
+                            fv(p),
+                        ),
+                        cu(stride),
+                    ),
+                },
+                KirStmt::Let {
+                    id: mp,
+                    expr: ld(0, uv(part_base), DType::F32),
+                },
+                KirStmt::Let {
+                    id: lp,
+                    expr: ld(0, bin(BinOp::Add, uv(part_base), cu(1)), DType::F32),
+                },
+                KirStmt::Let {
+                    id: m2,
+                    expr: bin(BinOp::Max, v(m), v(mp)),
+                },
+                KirStmt::Let {
+                    id: alpha,
+                    expr: un(UnaryOp::Exp, bin(BinOp::Sub, v(m), v(m2))),
+                },
+                KirStmt::Let {
+                    id: beta,
+                    expr: un(UnaryOp::Exp, bin(BinOp::Sub, v(mp), v(m2))),
+                },
+                KirStmt::Assign {
+                    id: lsum,
+                    expr: bin(
+                        BinOp::Add,
+                        bin(BinOp::Mul, v(lsum), v(alpha)),
+                        bin(BinOp::Mul, v(lp), v(beta)),
+                    ),
+                },
+                KirStmt::Assign {
+                    id: m,
+                    expr: v(m2),
+                },
+                KirStmt::For {
+                    id: io,
+                    n: n_own,
+                    body: vec![
+                        KirStmt::Let {
+                            id: op,
+                            expr: ld(
+                                0,
+                                bin(
+                                    BinOp::Add,
+                                    uv(part_base),
+                                    bin(
+                                        BinOp::Add,
+                                        cu(2),
+                                        bin(BinOp::Add, uv(base), fv(io)),
+                                    ),
+                                ),
+                                DType::F32,
+                            ),
+                        },
+                        th_store(
+                            o_th,
+                            fv(io),
+                            bin(
+                                BinOp::Add,
+                                bin(BinOp::Mul, th_load(o_th, fv(io)), v(alpha)),
+                                bin(BinOp::Mul, v(op), v(beta)),
+                            ),
+                        ),
+                    ],
+                },
+            ],
+        },
+        KirStmt::Let {
+            id: inv_l,
+            expr: bin(BinOp::Div, c(1.0), v(lsum)),
+        },
+        KirStmt::For {
+            id: iw,
+            n: n_own,
+            body: vec![st(
+                1,
+                bin(BinOp::Add, uv(q_base), bin(BinOp::Add, uv(base), fv(iw))),
+                bin(BinOp::Mul, th_load(o_th, fv(iw)), v(inv_l)),
+            )],
+        },
+    ]
 }
 
 

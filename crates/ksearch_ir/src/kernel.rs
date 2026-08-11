@@ -251,6 +251,25 @@ pub enum FuseHint {
         /// K/V Load dtype (F16 or Q40 dequant-at-load).
         kv_dtype: DType,
     },
+    /// Partitioned MWG SDPA pass1: per (head, part) online softmax → F32 tmp `(m,l,O)`.
+    SdpaMwgPart {
+        n_q: usize,
+        hd: usize,
+        max_t: usize,
+        nwg: usize,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        meta: TensorId,
+        kv_dtype: DType,
+    },
+    /// Partitioned MWG SDPA pass2: log-sum-exp merge of NWG partials → F16 O.
+    SdpaMwgReduce {
+        n_q: usize,
+        hd: usize,
+        nwg: usize,
+        tmp: TensorId,
+    },
     /// Pack F16 activations into Q4_0 blocks (KV append).
     QuantizeQ40 {
         n: usize,
@@ -295,6 +314,23 @@ pub enum KernelKind {
         v: TensorId,
         meta: TensorId,
         kv_dtype: DType,
+    },
+    SdpaMwgPart {
+        n_q: usize,
+        hd: usize,
+        max_t: usize,
+        nwg: usize,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        meta: TensorId,
+        kv_dtype: DType,
+    },
+    SdpaMwgReduce {
+        n_q: usize,
+        hd: usize,
+        nwg: usize,
+        tmp: TensorId,
     },
     QuantizeQ40 {
         n: usize,

@@ -1020,6 +1020,70 @@ impl Eng {
         self.run(ctx, &key, &[q, k, v, meta], out)
     }
 
+    /// Oracle-shaped hybrid: shared-head online for short KV; partitioned MWG for long.
+    pub const SDPA_MWG_NWG: usize = 16;
+    pub const SDPA_MWG_THRESHOLD: u32 = 128;
+
+    /// Partitioned MWG SDPA (pass1 + reduce). `tmp` is F32 `[n_q * NWG * (hd + 2)]`.
+    pub fn sdpa_mwg_kv(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        hd: usize,
+        max_t: usize,
+        kv_dtype: DType,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+    ) -> Result<()> {
+        let nwg = Self::SDPA_MWG_NWG;
+        let part_key = format!("sdpa_mwg_part_{n_q}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
+        if !self.cache.contains_key(&part_key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
+            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let mi = g.input(Shape(vec![2]), DType::F16);
+            let o = g.sdpa_mwg_part(qi, ki, vi, mi, n_q, hd, max_t, nwg)?;
+            self.ensure(ctx, &part_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+        }
+        let red_key = format!("sdpa_mwg_reduce_{n_q}_{hd}_{nwg}");
+        if !self.cache.contains_key(&red_key) {
+            let mut g = Graph::new();
+            let ti = g.input(Shape(vec![n_q * nwg * (hd + 2)]), DType::F32);
+            let o = g.sdpa_mwg_reduce(ti, n_q, hd, nwg)?;
+            self.ensure(ctx, &red_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &part_key, &[q, k, v, meta], tmp)?;
+        self.run(ctx, &red_key, &[tmp], out)
+    }
+
+    /// Hybrid SDPA: online shared-head if `attn_t < THRESHOLD`, else MWG.
+    pub fn sdpa_hybrid_kv(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        hd: usize,
+        max_t: usize,
+        attn_t: u32,
+        kv_dtype: DType,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+    ) -> Result<()> {
+        if attn_t >= Self::SDPA_MWG_THRESHOLD {
+            self.sdpa_mwg_kv(ctx, n_q, hd, max_t, kv_dtype, q, k, v, meta, tmp, out)
+        } else {
+            self.sdpa_naive_kv(ctx, n_q, hd, max_t, kv_dtype, q, k, v, meta, out)
+        }
+    }
+
     /// Pack `n` F16 elems (n%32==0) into Q4_0 at `dst` (+ byte offset).
     pub fn quantize_q40(
         &mut self,

@@ -84,6 +84,8 @@ pub struct GemmaPrimModel {
     tmp_k: Buffer,
     tmp_v: Buffer,
     tmp_o: Buffer,
+    /// F32 MWG SDPA scratch: `n_heads * NWG * (max_hd + 2)`.
+    tmp_attn_mwg: Buffer,
     /// FFN intermediates (gate/up) when packings differ and fusion cannot share one weight dtype.
     tmp_ff1: Buffer,
     tmp_ff2: Buffer,
@@ -212,6 +214,7 @@ impl GemmaPrimModel {
         let tmp_k = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
         let tmp_v = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
         let tmp_o = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
+        let tmp_attn_mwg = ctx.buffer_empty_f32(cfg.n_heads * Eng::SDPA_MWG_NWG * (max_hd + 2));
         let tmp_ff1 = ctx.buffer_empty_f16(max_ff);
         let tmp_ff2 = ctx.buffer_empty_f16(max_ff);
         let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
@@ -283,6 +286,7 @@ impl GemmaPrimModel {
             tmp_k,
             tmp_v,
             tmp_o,
+            tmp_attn_mwg,
             tmp_ff1,
             tmp_ff2,
             tmp_ff3,
@@ -755,16 +759,18 @@ impl GemmaPrimModel {
                 (kv_len as u32, 0u32)
             };
             self.write_meta(layer, attn_t, attn_start);
-            self.eng.sdpa_naive_kv(
+            self.eng.sdpa_hybrid_kv(
                 &self.ctx,
                 n_heads,
                 hd,
                 max_seq,
+                attn_t,
                 DType::Q40,
                 &self.tmp_q,
                 &self.kv_k[kv_src],
                 &self.kv_v[kv_src],
                 &self.meta[layer],
+                &self.tmp_attn_mwg,
                 &self.tmp_o,
             )?;
 

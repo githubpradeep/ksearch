@@ -643,6 +643,84 @@ impl Graph {
         ))
     }
 
+    /// MWG pass1: `n_q * nwg` TGs write F32 partials `(m, l, O[hd])` per (head, part).
+    pub fn sdpa_mwg_part(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        meta: TensorId,
+        n_q: usize,
+        hd: usize,
+        max_t: usize,
+        nwg: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
+        if !dq.is_float()
+            || !kv_ok
+            || sq.numel() != n_q * hd
+            || sk.numel() != max_t * hd
+            || sv.numel() != max_t * hd
+            || n_q == 0
+            || hd == 0
+            || max_t == 0
+            || nwg == 0
+            || hd % 32 != 0
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, k, v, meta],
+            Shape(vec![n_q * nwg * (hd + 2)]),
+            DType::F32,
+            FuseHint::SdpaMwgPart {
+                n_q,
+                hd,
+                max_t,
+                nwg,
+                q,
+                k,
+                v,
+                meta,
+                kv_dtype: dk,
+            },
+        ))
+    }
+
+    /// MWG pass2: merge NWG F32 partials → F16 attention output.
+    pub fn sdpa_mwg_reduce(
+        &mut self,
+        tmp: TensorId,
+        n_q: usize,
+        hd: usize,
+        nwg: usize,
+    ) -> Result<TensorId, IrError> {
+        let (st, dt) = self.shape_dtype(tmp)?;
+        if dt != DType::F32
+            || st.numel() != n_q * nwg * (hd + 2)
+            || n_q == 0
+            || hd == 0
+            || nwg == 0
+            || hd % 32 != 0
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![tmp],
+            Shape(vec![n_q * hd]),
+            DType::F16,
+            FuseHint::SdpaMwgReduce {
+                n_q,
+                hd,
+                nwg,
+                tmp,
+            },
+        ))
+    }
+
     /// Pack `n` F16 elems (n%32==0) into Q4_0 blocks (logical shape stays `n`).
     pub fn quantize_q40(&mut self, x: TensorId, n: usize) -> Result<TensorId, IrError> {
         let (sx, dx) = self.shape_dtype(x)?;
