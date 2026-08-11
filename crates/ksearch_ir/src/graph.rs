@@ -479,6 +479,67 @@ impl Graph {
         ))
     }
 
+
+    /// Per-head RMSNorm + RoPE, pack Q4_0 (KV K append; one CALL).
+    pub fn rmsnorm_per_head_rope_q40(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || sx.numel() != n_heads * hd || hd % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w, cos_sin],
+            Shape(vec![n_heads * hd]),
+            DType::Q40,
+            FuseHint::RmsNormPerHeadRopeQ40 {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                x,
+                w,
+                cos_sin,
+            },
+        ))
+    }
+
+    /// Per-head RMSNorm, pack Q4_0 (KV V append; one CALL).
+    pub fn rmsnorm_per_head_q40(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || sx.numel() != n_heads * hd || hd % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w],
+            Shape(vec![n_heads * hd]),
+            DType::Q40,
+            FuseHint::RmsNormPerHeadQ40 {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                x,
+                w,
+            },
+        ))
+    }
+
     pub fn copy_scale(
         &mut self,
         src: TensorId,
@@ -539,6 +600,7 @@ impl Graph {
     }
 
     /// SDPA sugar → CALL (Q@Kᵀ→softmax→@V fused by schedule; not a Graph catalog Op).
+    /// K/V may be F16 or Q40 (Load expand → float in the generic renderer).
     pub fn sdpa_naive(
         &mut self,
         q: TensorId,
@@ -550,12 +612,14 @@ impl Graph {
         max_t: usize,
     ) -> Result<TensorId, IrError> {
         let (sq, dq) = self.shape_dtype(q)?;
-        let (_, dk) = self.shape_dtype(k)?;
-        let (_, dv) = self.shape_dtype(v)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
         if !dq.is_float()
-            || dk != dq
-            || dv != dq
+            || !kv_ok
             || sq.numel() != n_q * hd
+            || sk.numel() != max_t * hd
+            || sv.numel() != max_t * hd
             || n_q == 0
             || hd == 0
             || max_t == 0
@@ -574,7 +638,22 @@ impl Graph {
                 k,
                 v,
                 meta,
+                kv_dtype: dk,
             },
+        ))
+    }
+
+    /// Pack `n` F16 elems (n%32==0) into Q4_0 blocks (logical shape stays `n`).
+    pub fn quantize_q40(&mut self, x: TensorId, n: usize) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if dx != DType::F16 || sx.numel() < n || n == 0 || n % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x],
+            Shape(vec![n]),
+            DType::Q40,
+            FuseHint::QuantizeQ40 { n, src: x },
         ))
     }
 

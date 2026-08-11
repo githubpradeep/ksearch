@@ -102,6 +102,25 @@ pub enum FuseHint {
         w: TensorId,
         cos_sin: TensorId,
     },
+    /// Per-head RMSNorm (+ optional RoPE) then pack Q4_0 into KV (one CALL).
+    RmsNormPerHeadRopeQ40 {
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+    },
+    /// Per-head RMSNorm (no RoPE) then pack Q4_0 into KV (V append).
+    RmsNormPerHeadQ40 {
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+        x: TensorId,
+        w: TensorId,
+    },
     Rope {
         n_heads: usize,
         hd: usize,
@@ -229,6 +248,13 @@ pub enum FuseHint {
         k: TensorId,
         v: TensorId,
         meta: TensorId,
+        /// K/V Load dtype (F16 or Q40 dequant-at-load).
+        kv_dtype: DType,
+    },
+    /// Pack F16 activations into Q4_0 blocks (KV append).
+    QuantizeQ40 {
+        n: usize,
+        src: TensorId,
     },
     SoftcapArgmax {
         n: usize,
@@ -268,6 +294,11 @@ pub enum KernelKind {
         k: TensorId,
         v: TensorId,
         meta: TensorId,
+        kv_dtype: DType,
+    },
+    QuantizeQ40 {
+        n: usize,
+        src: TensorId,
     },
     RmsNorm {
         n: usize,
@@ -315,6 +346,23 @@ pub enum KernelKind {
         x: TensorId,
         w: TensorId,
         cos_sin: TensorId,
+    },
+    RmsNormPerHeadRopeQ40 {
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+    },
+    RmsNormPerHeadQ40 {
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+        x: TensorId,
+        w: TensorId,
     },
     Rope {
         n_heads: usize,
@@ -524,6 +572,11 @@ pub enum KirExpr {
         id: u32,
         idx: Box<KirExpr>,
     },
+    /// Load from `thread float th{id}[idx]` (per-lane regs).
+    ThreadLoad {
+        id: u32,
+        idx: Box<KirExpr>,
+    },
     SimdSum(Box<KirExpr>),
     /// One simdgroup-lane partial for a Q4_K superblock (ggml `mul_vec_q4_K` layout).
     /// `row_base` = row * cols (element index); `ib` = superblock index; `lane` = lid%32.
@@ -613,6 +666,13 @@ pub enum KirStmt {
         idx: KirExpr,
         val: KirExpr,
     },
+    /// `thread float th{id}[n];` — per-lane register file array.
+    ThreadDeclF32 { id: u32, n: usize },
+    ThreadStore {
+        id: u32,
+        idx: KirExpr,
+        val: KirExpr,
+    },
     /// `threadgroup_barrier(mem_flags::mem_threadgroup)`.
     Barrier,
     If {
@@ -659,6 +719,35 @@ pub enum KirStmt {
         x_off: KirExpr,
         lane: KirExpr,
         acc_ids: [u32; 4],
+    },
+    /// Pack one Q4_0 block (32 elems → 18 bytes) into `dst_buf` at `block` index.
+    Q40PackBlock {
+        dst_buf: u32,
+        block: KirExpr,
+        src_buf: u32,
+        src_elem: KirExpr,
+    },
+    /// Pack one Q4_0 block from `thread float th{th_id}[th_off .. +32]`.
+    Q40PackFromThread {
+        dst_buf: u32,
+        block: KirExpr,
+        th_id: u32,
+        th_off: KirExpr,
+    },
+    /// Dequant one Q4_0 block into `threadgroup float tg{tg_id}[tg_off .. +32]`.
+    Q40DequantToTg {
+        tg_id: u32,
+        tg_off: KirExpr,
+        src_buf: u32,
+        src_elem: KirExpr,
+    },
+    /// Store float4 from Load expand into `tg{tg_id}[tg_off .. +4]` (idx multiple of 4).
+    TgStoreF4FromLoad {
+        tg_id: u32,
+        tg_off: KirExpr,
+        src_buf: u32,
+        src_elem: KirExpr,
+        dtype: DType,
     },
 }
 

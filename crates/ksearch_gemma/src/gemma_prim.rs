@@ -4,7 +4,7 @@
 use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
 use anyhow::{anyhow, bail, Result};
 use ksearch_gguf::{f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
-use ksearch_ir::DType;
+use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
 use ksearch_kernels::Eng;
 use ksearch_metal::MetalContext;
 use metal::Buffer;
@@ -103,7 +103,7 @@ pub struct GemmaPrimModel {
     rope_full: Buffer,
     hd_swa: usize,
     hd_full: usize,
-    /// F16 KV caches [max_seq × hd] per owning layer.
+    /// Device Q4_0 KV [max_seq × hd] per owning layer (Load(Q40) expand in SDPA).
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
     eng: Eng,
@@ -182,8 +182,9 @@ impl GemmaPrimModel {
         let mut kv_v = Vec::new();
         for i in 0..n_kv_owners {
             let hd = cfg.head_dim(i);
-            kv_k.push(ctx.buffer_empty_f16(max_seq * hd));
-            kv_v.push(ctx.buffer_empty_f16(max_seq * hd));
+            // Q4_0 packed KV (Thesis A Load(Q40) expand in SDPA).
+            kv_k.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq, hd)));
+            kv_v.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq, hd)));
         }
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
@@ -718,8 +719,15 @@ impl GemmaPrimModel {
                     &self.layer_norms[layer].k_norm,
                     &rope_buf,
                     rope_off,
+                    &self.tmp_k,
+                    0,
+                )?;
+                self.eng.quantize_q40(
+                    &self.ctx,
+                    self.cfg.n_kv * hd,
+                    &self.tmp_k,
                     &self.kv_k[kv_src],
-                    self.pos * hd,
+                    self.pos * q40_row_bytes(hd),
                 )?;
                 self.eng.rmsnorm_noweight_off(
                     &self.ctx,
@@ -727,8 +735,15 @@ impl GemmaPrimModel {
                     hd,
                     eps,
                     &self.tmp_v,
+                    &self.tmp_v,
+                    0,
+                )?;
+                self.eng.quantize_q40(
+                    &self.ctx,
+                    self.cfg.n_kv * hd,
+                    &self.tmp_v,
                     &self.kv_v[kv_src],
-                    self.pos * hd,
+                    self.pos * q40_row_bytes(hd),
                 )?;
             }
 
@@ -740,11 +755,12 @@ impl GemmaPrimModel {
                 (kv_len as u32, 0u32)
             };
             self.write_meta(layer, attn_t, attn_start);
-            self.eng.sdpa_naive(
+            self.eng.sdpa_naive_kv(
                 &self.ctx,
                 n_heads,
                 hd,
                 max_seq,
+                DType::Q40,
                 &self.tmp_q,
                 &self.kv_k[kv_src],
                 &self.kv_v[kv_src],
@@ -983,7 +999,7 @@ impl GemmaPrimModel {
             .count()
             .max(1);
         let hd = self.cfg.head_dim_full.max(self.cfg.head_dim_swa);
-        KvPool::new_f16(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
+        KvPool::new(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
     }
 
     pub fn reset(&mut self) {

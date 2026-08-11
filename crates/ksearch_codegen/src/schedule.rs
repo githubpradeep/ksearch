@@ -142,6 +142,48 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 cos_sin: *cos_sin,
             },
         },
+        FuseHint::RmsNormPerHeadRopeQ40 {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            x,
+            w,
+            cos_sin,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_rope_q40_{}", out.0),
+            inputs: vec![*x, *w, *cos_sin],
+            output: out,
+            kind: KernelKind::RmsNormPerHeadRopeQ40 {
+                n_heads: *n_heads,
+                hd: *hd,
+                eps: *eps,
+                with_weight: *with_weight,
+                x: *x,
+                w: *w,
+                cos_sin: *cos_sin,
+            },
+        },
+        FuseHint::RmsNormPerHeadQ40 {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            x,
+            w,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_q40_{}", out.0),
+            inputs: vec![*x, *w],
+            output: out,
+            kind: KernelKind::RmsNormPerHeadQ40 {
+                n_heads: *n_heads,
+                hd: *hd,
+                eps: *eps,
+                with_weight: *with_weight,
+                x: *x,
+                w: *w,
+            },
+        },
         FuseHint::Rope {
             n_heads,
             hd,
@@ -458,6 +500,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             k,
             v,
             meta,
+            kv_dtype,
         } => ScheduledKernel {
             name: format!("k_sdpa_naive_{}", out.0),
             inputs: vec![*q, *k, *v, *meta],
@@ -470,6 +513,16 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 k: *k,
                 v: *v,
                 meta: *meta,
+                kv_dtype: *kv_dtype,
+            },
+        },
+        FuseHint::QuantizeQ40 { n, src } => ScheduledKernel {
+            name: format!("k_q40_{}", out.0),
+            inputs: vec![*src],
+            output: out,
+            kind: KernelKind::QuantizeQ40 {
+                n: *n,
+                src: *src,
             },
         },
         FuseHint::SoftcapArgmax { n, cap, x } => ScheduledKernel {

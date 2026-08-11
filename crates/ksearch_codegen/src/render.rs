@@ -820,6 +820,82 @@ inline void ksearch_q6k_coop_frag_nr4_dev(
 
 "#;
 
+/// Generic Q4_0 Load / pack expand (KV cache; same pattern as Q4_K Load expand).
+const Q40_LOAD_HELPER: &str = r#"
+constant uint Q40_QK = 32u;
+constant uint Q40_BS = 18u;
+inline float ksearch_q40_at(device const uchar* blk, float d, uint j) {
+  uchar q = blk[2u + (j & 15u)];
+  int qv = (j < 16u) ? int(q & 0x0Fu) - 8 : int(q >> 4u) - 8;
+  return float(qv) * d;
+}
+inline float ksearch_load_q40(device const uchar* A, uint idx) {
+  uint block = idx / Q40_QK;
+  uint j = idx % Q40_QK;
+  device const uchar* blk = A + block * Q40_BS;
+  float d = float(*(device const half*)blk);
+  return ksearch_q40_at(blk, d, j);
+}
+inline float4 ksearch_load_q404(device const uchar* A, uint idx) {
+  uint block = idx / Q40_QK;
+  uint j = idx % Q40_QK;
+  device const uchar* blk = A + block * Q40_BS;
+  float d = float(*(device const half*)blk);
+  return float4(ksearch_q40_at(blk, d, j),
+                ksearch_q40_at(blk, d, j + 1u),
+                ksearch_q40_at(blk, d, j + 2u),
+                ksearch_q40_at(blk, d, j + 3u));
+}
+inline void ksearch_pack_q40(
+    device uchar* out, uint block, device const half* src, uint src_elem) {
+  float vals[32];
+  float max_abs = 0.0f;
+  for (uint d = 0u; d < 32u; d++) {
+    float v = float(src[src_elem + d]);
+    vals[d] = v;
+    max_abs = max(max_abs, fabs(v));
+  }
+  float scale = (max_abs > 0.0f) ? (max_abs / 7.0f) : 1.0f;
+  float inv = 1.0f / scale;
+  device uchar* blk = out + block * Q40_BS;
+  *((device half*)blk) = half(scale);
+  for (uint i = 0u; i < 16u; i++) {
+    int q_lo = clamp(int(round(vals[i] * inv)) + 8, 0, 15);
+    int q_hi = clamp(int(round(vals[i + 16u] * inv)) + 8, 0, 15);
+    blk[2u + i] = uchar(q_lo | (q_hi << 4));
+  }
+}
+inline void ksearch_pack_q40_th(
+    device uchar* out, uint block, thread const float* src, uint src_off) {
+  float vals[32];
+  float max_abs = 0.0f;
+  for (uint d = 0u; d < 32u; d++) {
+    // Match F16 store/load round-trip before pack.
+    float v = float(half(src[src_off + d]));
+    vals[d] = v;
+    max_abs = max(max_abs, fabs(v));
+  }
+  float scale = (max_abs > 0.0f) ? (max_abs / 7.0f) : 1.0f;
+  float inv = 1.0f / scale;
+  device uchar* blk = out + block * Q40_BS;
+  *((device half*)blk) = half(scale);
+  for (uint i = 0u; i < 16u; i++) {
+    int q_lo = clamp(int(round(vals[i] * inv)) + 8, 0, 15);
+    int q_hi = clamp(int(round(vals[i + 16u] * inv)) + 8, 0, 15);
+    blk[2u + i] = uchar(q_lo | (q_hi << 4));
+  }
+}
+inline void ksearch_dequant_q40_to_tg(
+    threadgroup float* dst, device const uchar* A, uint src_elem) {
+  uint block = src_elem / Q40_QK;
+  device const uchar* blk = A + block * Q40_BS;
+  float d = float(*(device const half*)blk);
+  for (uint j = 0u; j < 32u; j++) {
+    dst[j] = ksearch_q40_at(blk, d, j);
+  }
+}
+"#;
+
 pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSource, CodegenError> {
     // Q4_K is a Load dtype like F16: generic expand to float (tinygrad ggml_data_to_tensor ops).
     // No named matvec_q4k kernel template — only dtype expansion on Load / VecMulSum.
@@ -829,6 +905,9 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
     }
     if body_needs_q6(&kir.body) {
         src.push_str(Q6K_LOAD_HELPER);
+    }
+    if body_needs_q40(&kir.body) {
+        src.push_str(Q40_LOAD_HELPER);
     }
     let n_in = kir.n_inputs as u32;
     let (params, launch, guard) = match &kir.launch {
@@ -936,11 +1015,14 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
             KirStmt::Let { expr, .. } | KirStmt::LetU32 { expr, .. } | KirStmt::Assign { expr, .. } => {
                 infer_load_expr(expr, in_dt);
             }
-            KirStmt::Store { idx, val, .. } | KirStmt::TgStore { idx, val, .. } => {
+            KirStmt::Store { idx, val, .. }
+            | KirStmt::TgStore { idx, val, .. }
+            | KirStmt::ThreadStore { idx, val, .. } => {
                 infer_load_expr(idx, in_dt);
                 infer_load_expr(val, in_dt);
             }
             KirStmt::TgDeclF32 { .. }
+            | KirStmt::ThreadDeclF32 { .. }
             | KirStmt::Barrier
             | KirStmt::ThreadgroupReduce { .. }
             | KirStmt::ThreadgroupArgmax { .. } => {}
@@ -1003,6 +1085,47 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
                 infer_load_expr(ib, in_dt);
                 infer_load_expr(lane, in_dt);
             }
+            KirStmt::Q40PackBlock {
+                src_buf,
+                block,
+                src_elem,
+                ..
+            } => {
+                if (*src_buf as usize) < in_dt.len() {
+                    in_dt[*src_buf as usize] = DType::F16;
+                }
+                infer_load_expr(block, in_dt);
+                infer_load_expr(src_elem, in_dt);
+            }
+            KirStmt::Q40PackFromThread { block, th_off, .. } => {
+                infer_load_expr(block, in_dt);
+                infer_load_expr(th_off, in_dt);
+            }
+            KirStmt::Q40DequantToTg {
+                src_buf,
+                tg_off,
+                src_elem,
+                ..
+            } => {
+                if (*src_buf as usize) < in_dt.len() {
+                    in_dt[*src_buf as usize] = DType::Q40;
+                }
+                infer_load_expr(tg_off, in_dt);
+                infer_load_expr(src_elem, in_dt);
+            }
+            KirStmt::TgStoreF4FromLoad {
+                src_buf,
+                tg_off,
+                src_elem,
+                dtype,
+                ..
+            } => {
+                if (*src_buf as usize) < in_dt.len() {
+                    in_dt[*src_buf as usize] = *dtype;
+                }
+                infer_load_expr(tg_off, in_dt);
+                infer_load_expr(src_elem, in_dt);
+            }
         }
     }
 }
@@ -1036,7 +1159,7 @@ fn infer_load_expr(e: &KirExpr, in_dt: &mut [DType]) {
             infer_load_expr(a_idx, in_dt);
             infer_load_expr(b_idx, in_dt);
         }
-        KirExpr::TgLoad { idx, .. } => infer_load_expr(idx, in_dt),
+        KirExpr::TgLoad { idx, .. } | KirExpr::ThreadLoad { idx, .. } => infer_load_expr(idx, in_dt),
         KirExpr::CastU32ToF32(e) => infer_load_expr(e, in_dt),
         KirExpr::CastF32ToU32(e) => infer_load_expr(e, in_dt),
         KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => infer_load_expr(a, in_dt),
@@ -1109,7 +1232,7 @@ fn walk_expr_q4(e: &KirExpr, buf: u32) -> bool {
             b_idx,
             ..
         } => walk_expr_q4(a_idx, buf) || walk_expr_q4(b_idx, buf),
-        KirExpr::TgLoad { idx, .. } => walk_expr_q4(idx, buf),
+        KirExpr::TgLoad { idx, .. } | KirExpr::ThreadLoad { idx, .. } => walk_expr_q4(idx, buf),
         KirExpr::CastU32ToF32(e) => walk_expr_q4(e, buf),
         KirExpr::CastF32ToU32(e) => walk_expr_q4(e, buf),
         KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => walk_expr_q4(a, buf),
@@ -1177,12 +1300,15 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
-            KirStmt::Store { idx, val, .. } | KirStmt::TgStore { idx, val, .. } => {
+            KirStmt::Store { idx, val, .. }
+            | KirStmt::TgStore { idx, val, .. }
+            | KirStmt::ThreadStore { idx, val, .. } => {
                 if walk_expr_q4(idx, buf) || walk_expr_q4(val, buf) {
                     return true;
                 }
             }
             KirStmt::TgDeclF32 { .. }
+            | KirStmt::ThreadDeclF32 { .. }
             | KirStmt::Barrier
             | KirStmt::ThreadgroupReduce { .. }
             | KirStmt::ThreadgroupArgmax { .. } => {}
@@ -1230,6 +1356,30 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
+            KirStmt::Q40PackBlock {
+                block,
+                src_elem,
+                ..
+            }
+            | KirStmt::Q40DequantToTg {
+                tg_off: block,
+                src_elem,
+                ..
+            } => {
+                if walk_expr_q4(block, buf) || walk_expr_q4(src_elem, buf) {
+                    return true;
+                }
+            }
+            KirStmt::Q40PackFromThread { block, th_off, .. } => {
+                if walk_expr_q4(block, buf) || walk_expr_q4(th_off, buf) {
+                    return true;
+                }
+            }
+            KirStmt::TgStoreF4FromLoad { tg_off, src_elem, .. } => {
+                if walk_expr_q4(tg_off, buf) || walk_expr_q4(src_elem, buf) {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -1262,6 +1412,7 @@ fn walk_expr_q6(e: &KirExpr, buf: u32) -> bool {
         }
         KirExpr::Load { idx, .. }
         | KirExpr::TgLoad { idx, .. }
+        | KirExpr::ThreadLoad { idx, .. }
         | KirExpr::CastU32ToF32(idx)
         | KirExpr::CastF32ToU32(idx)
         | KirExpr::SimdSum(idx)
@@ -1319,12 +1470,15 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
-            KirStmt::Store { idx, val, .. } | KirStmt::TgStore { idx, val, .. } => {
+            KirStmt::Store { idx, val, .. }
+            | KirStmt::TgStore { idx, val, .. }
+            | KirStmt::ThreadStore { idx, val, .. } => {
                 if walk_expr_q6(idx, buf) || walk_expr_q6(val, buf) {
                     return true;
                 }
             }
             KirStmt::TgDeclF32 { .. }
+            | KirStmt::ThreadDeclF32 { .. }
             | KirStmt::Barrier
             | KirStmt::ThreadgroupReduce { .. }
             | KirStmt::ThreadgroupArgmax { .. } => {}
@@ -1358,6 +1512,30 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
+            KirStmt::Q40PackBlock {
+                block,
+                src_elem,
+                ..
+            }
+            | KirStmt::Q40DequantToTg {
+                tg_off: block,
+                src_elem,
+                ..
+            } => {
+                if walk_expr_q6(block, buf) || walk_expr_q6(src_elem, buf) {
+                    return true;
+                }
+            }
+            KirStmt::Q40PackFromThread { block, th_off, .. } => {
+                if walk_expr_q6(block, buf) || walk_expr_q6(th_off, buf) {
+                    return true;
+                }
+            }
+            KirStmt::TgStoreF4FromLoad { tg_off, src_elem, .. } => {
+                if walk_expr_q6(tg_off, buf) || walk_expr_q6(src_elem, buf) {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -1365,6 +1543,81 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
 
 fn body_needs_q6(stmts: &[KirStmt]) -> bool {
     (0..8).any(|b| buf_is_q6(stmts, b))
+}
+
+fn body_needs_q40(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                KirStmt::Q40PackBlock { .. } | KirStmt::Q40PackFromThread { .. } | KirStmt::Q40DequantToTg { .. } | KirStmt::TgStoreF4FromLoad { dtype: DType::Q40, .. } => return true,
+                KirStmt::Let { expr, .. }
+                | KirStmt::LetU32 { expr, .. }
+                | KirStmt::Assign { expr, .. } => {
+                    if expr_needs_q40(expr) {
+                        return true;
+                    }
+                }
+                KirStmt::Store { idx, val, .. }
+                | KirStmt::TgStore { idx, val, .. }
+                | KirStmt::ThreadStore { idx, val, .. } => {
+                    if expr_needs_q40(idx) || expr_needs_q40(val) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    fn expr_needs_q40(e: &KirExpr) -> bool {
+        match e {
+            KirExpr::Load {
+                dtype: DType::Q40, ..
+            }
+            | KirExpr::VecMulSum {
+                dtype: DType::Q40, ..
+            } => true,
+            KirExpr::Load { idx, .. }
+            | KirExpr::TgLoad { idx, .. }
+            | KirExpr::ThreadLoad { idx, .. }
+            | KirExpr::CastU32ToF32(idx)
+            | KirExpr::CastF32ToU32(idx)
+            | KirExpr::SimdSum(idx)
+            | KirExpr::Unary { a: idx, .. } => expr_needs_q40(idx),
+            KirExpr::VecMulSum { a_idx, b_idx, .. } => {
+                expr_needs_q40(a_idx) || expr_needs_q40(b_idx)
+            }
+            KirExpr::Bin { a, b, .. } | KirExpr::CmpGt { a, b } | KirExpr::CmpEq { a, b } => {
+                expr_needs_q40(a) || expr_needs_q40(b)
+            }
+            KirExpr::Q4kCoopFrag {
+                row_base, ib, lane, ..
+            } => {
+                expr_needs_q40(row_base) || expr_needs_q40(ib) || expr_needs_q40(lane)
+            }
+            KirExpr::Q6kCoopFrag {
+                row_base,
+                ib,
+                x_off,
+                lane,
+                ..
+            } => {
+                expr_needs_q40(row_base)
+                    || expr_needs_q40(ib)
+                    || expr_needs_q40(x_off)
+                    || expr_needs_q40(lane)
+            }
+            _ => false,
+        }
+    }
+    walk(stmts)
 }
 
 fn emit_stmts(
@@ -1450,6 +1703,19 @@ fn emit_stmts(
                 };
                 let vs = emit_expr_ty(val, n_in, n_out, true, elem)?;
                 s.push_str(&format!("{pad}tg{id}[{idx_u}] = {vs};\n"));
+            }
+            KirStmt::ThreadDeclF32 { id, n } => {
+                s.push_str(&format!("{pad}thread float th{id}[{n}];\n"));
+            }
+            KirStmt::ThreadStore { id, idx, val } => {
+                let idx_s = emit_expr_ty(idx, n_in, n_out, false, elem)?;
+                let idx_u = if is_uintish(idx) {
+                    idx_s
+                } else {
+                    format!("uint({idx_s})")
+                };
+                let vs = emit_expr_ty(val, n_in, n_out, true, elem)?;
+                s.push_str(&format!("{pad}th{id}[{idx_u}] = {vs};\n"));
             }
             KirStmt::Barrier => {
                 s.push_str(&format!(
@@ -1620,6 +1886,65 @@ fn emit_stmts(
                 };
                 s.push_str(&format!("{pad}{call};\n"));
             }
+            KirStmt::Q40PackBlock {
+                dst_buf,
+                block,
+                src_buf,
+                src_elem,
+            } => {
+                let dst = buf_name(*dst_buf, n_in, n_out);
+                let src = buf_name(*src_buf, n_in, n_out);
+                let blk = emit_expr_ty(block, n_in, n_out, false, elem)?;
+                let se = emit_expr_ty(src_elem, n_in, n_out, false, elem)?;
+                s.push_str(&format!(
+                    "{pad}ksearch_pack_q40({dst}, ({blk}), {src}, ({se}));\n"
+                ));
+            }
+            KirStmt::Q40PackFromThread {
+                dst_buf,
+                block,
+                th_id,
+                th_off,
+            } => {
+                let dst = buf_name(*dst_buf, n_in, n_out);
+                let blk = emit_expr_ty(block, n_in, n_out, false, elem)?;
+                let off = emit_expr_ty(th_off, n_in, n_out, false, elem)?;
+                s.push_str(&format!(
+                    "{pad}ksearch_pack_q40_th({dst}, ({blk}), th{th_id}, ({off}));\n"
+                ));
+            }
+            KirStmt::Q40DequantToTg {
+                tg_id,
+                tg_off,
+                src_buf,
+                src_elem,
+            } => {
+                let src = buf_name(*src_buf, n_in, n_out);
+                let off = emit_expr_ty(tg_off, n_in, n_out, false, elem)?;
+                let se = emit_expr_ty(src_elem, n_in, n_out, false, elem)?;
+                s.push_str(&format!(
+                    "{pad}ksearch_dequant_q40_to_tg(tg{tg_id} + ({off}), {src}, ({se}));\n"
+                ));
+            }
+            KirStmt::TgStoreF4FromLoad {
+                tg_id,
+                tg_off,
+                src_buf,
+                src_elem,
+                dtype,
+            } => {
+                let src = buf_name(*src_buf, n_in, n_out);
+                let off = emit_expr_ty(tg_off, n_in, n_out, false, elem)?;
+                let se = emit_expr_ty(src_elem, n_in, n_out, false, elem)?;
+                let load = match dtype {
+                    DType::Q40 => format!("ksearch_load_q404({src}, ({se}))"),
+                    DType::F16 => format!("float4(*(device const half4*)({src} + ({se})))"),
+                    _ => format!("float4(0.0f)"),
+                };
+                s.push_str(&format!(
+                    "{pad}{{ float4 _t4 = {load}; *(threadgroup float4*)(tg{tg_id} + ({off})) = _t4; }}\n"
+                ));
+            }
         }
     }
     Ok(s)
@@ -1691,6 +2016,11 @@ fn emit_expr_ty(
                     buf_name(*buf, n_in, n_out),
                     idx_u
                 ),
+                DType::Q40 => format!(
+                    "ksearch_load_q40({}, {})",
+                    buf_name(*buf, n_in, n_out),
+                    idx_u
+                ),
                 other => {
                     return Err(CodegenError::Msg(format!(
                         "render load: unsupported dtype {other:?}"
@@ -1706,6 +2036,15 @@ fn emit_expr_ty(
                 format!("uint({idx_s})")
             };
             format!("tg{id}[{idx_u}]")
+        }
+        KirExpr::ThreadLoad { id, idx } => {
+            let idx_s = emit_expr_ty(idx, n_in, n_out, false, elem)?;
+            let idx_u = if is_uintish(idx) {
+                idx_s
+            } else {
+                format!("uint({idx_s})")
+            };
+            format!("th{id}[{idx_u}]")
         }
         KirExpr::VecMulSum {
             a_buf,
@@ -1728,11 +2067,17 @@ fn emit_expr_ty(
                     1 if *dtype == DType::Q6K => format!(
                         "(ksearch_load_q6k({a}, {ai}) * tg{tg_id}[{bi}])"
                     ),
+                    1 if *dtype == DType::Q40 => format!(
+                        "(ksearch_load_q40({a}, {ai}) * tg{tg_id}[{bi}])"
+                    ),
                     2 if *dtype == DType::Q4K => format!(
                         "dot(ksearch_load_q4k2({a}, ({ai})), *(threadgroup const float2*)(tg{tg_id} + ({bi})))"
                     ),
                     4 if *dtype == DType::Q4K => format!(
                         "dot(ksearch_load_q4k4({a}, ({ai})), *(threadgroup const float4*)(tg{tg_id} + ({bi})))"
+                    ),
+                    4 if *dtype == DType::Q40 => format!(
+                        "dot(ksearch_load_q404({a}, ({ai})), *(threadgroup const float4*)(tg{tg_id} + ({bi})))"
                     ),
                     32 if *dtype == DType::Q4K => format!(
                         "ksearch_dot_q4k32({a}, ({ai}), tg{tg_id}, ({bi}))"
@@ -1749,7 +2094,7 @@ fn emit_expr_ty(
                     ),
                     1 if *dtype == DType::F16 => {
                         format!("(float({a}[{ai}]) * tg{tg_id}[{bi}])")
-                    }
+                    },
                     4 => format!(
                         "dot(*(device const float4*)({a} + ({ai})), *(threadgroup const float4*)(tg{tg_id} + ({bi})))"
                     ),
@@ -1780,11 +2125,17 @@ fn emit_expr_ty(
                     1 if *dtype == DType::Q6K => format!(
                         "(ksearch_load_q6k({a}, {ai}) * float({b}[{bi}]))"
                     ),
+                    1 if *dtype == DType::Q40 => format!(
+                        "(ksearch_load_q40({a}, {ai}) * float({b}[{bi}]))"
+                    ),
                     2 if *dtype == DType::Q4K => format!(
                         "dot(ksearch_load_q4k2({a}, ({ai})), float2(float({b}[({bi})]), float({b}[({bi}) + 1u])))"
                     ),
                     4 if *dtype == DType::Q4K => format!(
                         "dot(ksearch_load_q4k4({a}, ({ai})), float4(float({b}[({bi})]), float({b}[({bi}) + 1u]), float({b}[({bi}) + 2u]), float({b}[({bi}) + 3u])))"
+                    ),
+                    4 if *dtype == DType::Q40 => format!(
+                        "dot(ksearch_load_q404({a}, ({ai})), float4(float({b}[({bi})]), float({b}[({bi}) + 1u]), float({b}[({bi}) + 2u]), float({b}[({bi}) + 3u])))"
                     ),
                     32 if *dtype == DType::Q4K => format!(
                         "ksearch_dot_q4k32_dev({a}, ({ai}), {b}, ({bi}))"
