@@ -80,6 +80,8 @@ pub fn lower_to_metal_chip(
     let sched = match matvec_weight_dtype(graph, out)? {
         Some(DType::Q4K) => load_plan("matvec_q4k", &matvec_dims(graph, out)?, chip)
             .unwrap_or_else(OptSchedule::q4k_default),
+        Some(DType::Q6K) => load_plan("matvec_q6k", &matvec_dims(graph, out)?, chip)
+            .unwrap_or_else(OptSchedule::q4k_default),
         Some(DType::F16) => load_plan("matvec_f16_nr", &matvec_dims(graph, out)?, chip)
             .unwrap_or_default(),
         Some(DType::F32) => load_plan("matvec_f32", &matvec_dims(graph, out)?, chip)
@@ -91,6 +93,26 @@ pub fn lower_to_metal_chip(
 
 fn matvec_dims(graph: &Graph, out: TensorId) -> Result<Vec<usize>, CodegenError> {
     if let Some(ksearch_ir::FuseHint::MatvecGateUpGelu { rows, cols, .. }) = graph.fuse_hint(out) {
+        return Ok(vec![*rows, *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecGeluMul { rows, cols, .. }) = graph.fuse_hint(out) {
+        return Ok(vec![*rows, *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecGeluMulProjRmsAddScale {
+        gate_rows,
+        cols,
+        proj_rows,
+        ..
+    }) = graph.fuse_hint(out)
+    {
+        return Ok(vec![*proj_rows.max(gate_rows), *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecRmsNormAdd { rows, cols, .. }) = graph.fuse_hint(out) {
+        return Ok(vec![*rows, *cols]);
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecRmsNormAddScale { rows, cols, .. }) =
+        graph.fuse_hint(out)
+    {
         return Ok(vec![*rows, *cols]);
     }
     if let Some(ksearch_ir::FuseHint::RmsNormMatvecGateUpGelu { rows, cols, .. }) =
@@ -178,6 +200,7 @@ where
     let plan_kind = match matvec_weight_dtype(graph, out)? {
         Some(DType::F16) => "matvec_f16_nr",
         Some(DType::Q4K) => "matvec_q4k",
+        Some(DType::Q6K) => "matvec_q6k",
         _ => "matvec_f32",
     };
     let force = std::env::var("KSEARCH_BEAM_FORCE").is_ok();
@@ -200,7 +223,7 @@ where
     let mut best_kernel = lower_with_schedule(graph, out, untuned)?;
 
     let candidates = match matvec_weight_dtype(graph, out)? {
-        Some(DType::Q4K) => beam_matvec_q4k_candidates(),
+        Some(DType::Q4K) | Some(DType::Q6K) => beam_matvec_q4k_candidates(),
         _ => beam_matvec_candidates(),
     };
     for sched in candidates {

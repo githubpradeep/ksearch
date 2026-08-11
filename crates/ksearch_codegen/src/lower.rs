@@ -6,6 +6,13 @@ use ksearch_ir::{
     ScheduledKernel, UnaryOp,
 };
 
+fn packed_k_quant(d: DType) -> bool {
+    matches!(d, DType::Q4K | DType::Q6K)
+}
+fn allow_matvec_weight(d: DType) -> bool {
+    d.is_float() || packed_k_quant(d)
+}
+
 pub fn lower_to_kir(
     sk: &ScheduledKernel,
     out_shape: ksearch_ir::Shape,
@@ -25,9 +32,9 @@ pub fn lower_to_kir(
             weight_dtype,
             ..
         } => {
-            if !(weight_dtype.is_float() || *weight_dtype == DType::Q4K) {
+            if !allow_matvec_weight(*weight_dtype) {
                 return Err(CodegenError::Msg(
-                    "lower matvec: weight dtype must be float or Q4K".into(),
+                    "lower matvec: weight dtype must be float, Q4K, or Q6K".into(),
                 ));
             }
             validate_sched(sched)?;
@@ -44,13 +51,19 @@ pub fn lower_to_kir(
             weight_dtype,
             ..
         } => {
-            if !(weight_dtype.is_float() || *weight_dtype == DType::Q4K) {
+            if !allow_matvec_weight(*weight_dtype) {
                 return Err(CodegenError::Msg(
                     "lower matvec_gate_up_gelu: weight dtype must be float or Q4K".into(),
                 ));
             }
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let mut sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            // More SGs/TG for dual gate∥up (measure: nsg=4 vs ggml-default 2).
+            if *weight_dtype == DType::Q4K && *cols % 256 == 0 {
+                sched.nsg = 4;
+                sched.tg = 128;
+                sched.nr0 = 16;
+            }
             (
                 matvec_launch(*weight_dtype, *rows, sched),
                 lower_matvec_gate_up_gelu(
@@ -70,24 +83,32 @@ pub fn lower_to_kir(
             q_rows,
             kv_rows,
             cols,
-            weight_dtype,
+            wq_dtype,
+            wk_dtype,
+            wv_dtype,
             ..
         } => {
-            if !(weight_dtype.is_float() || *weight_dtype == DType::Q4K) {
+            if !(allow_matvec_weight(*wq_dtype) && allow_matvec_weight(*wk_dtype) && allow_matvec_weight(*wv_dtype)) {
                 return Err(CodegenError::Msg(
-                    "lower matvec_qkv: weight dtype must be float or Q4K".into(),
+                    "lower matvec_qkv: weight dtype must be float, Q4K, or Q6K".into(),
                 ));
             }
+            if !(*wq_dtype == *wk_dtype && *wk_dtype == *wv_dtype) {
+                // Homogeneous only on HEAD lower; mixed uses wq for schedule, per-buf via separate path later.
+            }
+            let wd = *wq_dtype;
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let sched = apply_matvec_sched(wd, *cols, sched);
             let max_rows = (*q_rows).max(*kv_rows);
             (
-                matvec_launch(*weight_dtype, max_rows, sched),
+                matvec_launch(wd, max_rows, sched),
                 lower_matvec_qkv(
                     *q_rows,
                     *kv_rows,
                     *cols,
-                    *weight_dtype,
+                    *wq_dtype,
+                    *wk_dtype,
+                    *wv_dtype,
                     sched,
                     3,
                     4,
@@ -106,9 +127,9 @@ pub fn lower_to_kir(
             weight_dtype,
             ..
         } => {
-            if !(weight_dtype.is_float() || *weight_dtype == DType::Q4K) {
+            if !allow_matvec_weight(*weight_dtype) {
                 return Err(CodegenError::Msg(
-                    "lower rmsnorm_matvec: weight dtype must be float or Q4K".into(),
+                    "lower rmsnorm_matvec: weight dtype must be float, Q4K, or Q6K".into(),
                 ));
             }
             validate_sched(sched)?;
@@ -135,13 +156,18 @@ pub fn lower_to_kir(
             weight_dtype,
             ..
         } => {
-            if !(weight_dtype.is_float() || *weight_dtype == DType::Q4K) {
+            if !allow_matvec_weight(*weight_dtype) {
                 return Err(CodegenError::Msg(
                     "lower rmsnorm_matvec_gate_up_gelu: weight dtype must be float or Q4K".into(),
                 ));
             }
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let mut sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            if *weight_dtype == DType::Q4K && *cols % 256 == 0 {
+                sched.nsg = 4;
+                sched.tg = 128;
+                sched.nr0 = 16;
+            }
             (
                 matvec_launch(*weight_dtype, *rows, sched),
                 lower_matvec_gate_up_gelu(
@@ -162,24 +188,32 @@ pub fn lower_to_kir(
             q_rows,
             kv_rows,
             cols,
-            weight_dtype,
+            wq_dtype,
+            wk_dtype,
+            wv_dtype,
             ..
         } => {
-            if !(weight_dtype.is_float() || *weight_dtype == DType::Q4K) {
+            if !(allow_matvec_weight(*wq_dtype)
+                && allow_matvec_weight(*wk_dtype)
+                && allow_matvec_weight(*wv_dtype))
+            {
                 return Err(CodegenError::Msg(
-                    "lower rmsnorm_matvec_qkv: weight dtype must be float or Q4K".into(),
+                    "lower rmsnorm_matvec_qkv: weight dtype must be float, Q4K, or Q6K".into(),
                 ));
             }
+            let wd = *wq_dtype;
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let sched = apply_matvec_sched(wd, *cols, sched);
             let max_rows = (*q_rows).max(*kv_rows);
             (
-                matvec_launch(*weight_dtype, max_rows, sched),
+                matvec_launch(wd, max_rows, sched),
                 lower_matvec_qkv(
                     *q_rows,
                     *kv_rows,
                     *cols,
-                    *weight_dtype,
+                    *wq_dtype,
+                    *wk_dtype,
+                    *wv_dtype,
                     sched,
                     3,
                     5,
@@ -238,6 +272,17 @@ pub fn lower_to_kir(
             lower_rmsnorm(*n, *eps, true, Some(*scale), 3, out_dtype, 256, &mut next),
             1,
         ),
+        KernelKind::RmsNormAddThenRmsNorm { n, eps, .. } => {
+            const TG: u64 = 256;
+            (
+                KirLaunch::RowsParallel {
+                    rows: 1,
+                    tg: TG,
+                },
+                lower_rmsnorm_add_then_rmsnorm(*n, *eps, out_dtype, TG, &mut next)?,
+                2,
+            )
+        }
         KernelKind::RmsNormPerHead {
             n_heads,
             hd,
@@ -270,10 +315,12 @@ pub fn lower_to_kir(
             dst_off,
             n,
             scale,
+            src_dtype,
             ..
         } => (
             KirLaunch::Elementwise { n: *n },
-            lower_copy_scale(*src_off, *dst_off, *scale, sk.inputs.len() as u32, out_dtype),
+            // Load uses src_dtype (Q4K/Q6K expand); store uses Call out dtype (F16).
+            lower_copy_scale(*src_off, *dst_off, *scale, sk.inputs.len() as u32, *src_dtype),
             1,
         ),
         KernelKind::GeluMul { n, up_off, .. } => (
@@ -289,13 +336,88 @@ pub fn lower_to_kir(
             lower_sdpa_online(*hd, *max_t, out_dtype, 32, &mut next),
             1,
         ),
+
+        KernelKind::MatvecGeluMul {
+            rows,
+            cols,
+            ctx_off,
+            weight_dtype,
+            ..
+        } => {
+            validate_sched(sched)?;
+            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let epi = MatvecEpi::GeluMulCtx {
+                ctx_buf: 2,
+                ctx_off: *ctx_off as u32,
+                dt: DType::F16,
+            };
+            (
+                matvec_launch(*weight_dtype, *rows, sched),
+                lower_matvec_epi(
+                    *rows, *cols, *weight_dtype, sched, 1, 3, None, epi, &mut next,
+                )?,
+                1,
+            )
+        }
+        KernelKind::MatvecGeluMulProjRmsAddScale {
+            gate_rows,
+            cols,
+            proj_rows,
+            ctx_off,
+            eps,
+            scale,
+            weight_dtype,
+            ..
+        } => {
+            let (launch, body) = lower_ple_gelu_proj_rms_fused(
+                *gate_rows,
+                *cols,
+                *proj_rows,
+                *ctx_off,
+                *eps,
+                *scale,
+                *weight_dtype,
+                &mut next,
+            )?;
+            (launch, body, 1)
+        }
+        KernelKind::MatvecRmsNormAdd {
+            rows,
+            cols,
+            eps,
+            weight_dtype,
+            ..
+        } => {
+            let (launch, body) =
+                lower_matvec_rmsnorm_fused(*rows, *cols, *weight_dtype, *eps, None, &mut next)?;
+            (launch, body, 1)
+        }
+        KernelKind::MatvecRmsNormAddScale {
+            rows,
+            cols,
+            eps,
+            scale,
+            weight_dtype,
+            ..
+        } => {
+            let (launch, body) = lower_matvec_rmsnorm_fused(
+                *rows,
+                *cols,
+                *weight_dtype,
+                *eps,
+                Some(*scale),
+                &mut next,
+            )?;
+            (launch, body, 1)
+        }
+
         KernelKind::SoftcapArgmax { n, cap, .. } => (
             // One threadgroup, lid-strided scan + tg reduce (not 1 thread × vocab).
             KirLaunch::RowsParallel {
                 rows: 1,
-                tg: 256,
+                tg: 1024,
             },
-            lower_softcap_argmax(*n, *cap, DType::F16, 256, &mut next),
+            lower_softcap_argmax(*n, *cap, DType::F16, 1024, &mut next),
             1,
         ),
     };
@@ -543,41 +665,49 @@ fn stage_local_x(
 /// Activations stay float; Q4K applies only to weight loads.
 fn x_dtype(weight_dtype: DType) -> DType {
     match weight_dtype {
-        DType::Q4K => DType::F16,
+        DType::Q4K | DType::Q6K => DType::F16,
         d if d.is_float() => d,
         _ => DType::F16,
     }
 }
 
 fn apply_matvec_sched(weight_dtype: DType, cols: usize, mut sched: OptSchedule) -> OptSchedule {
-    if weight_dtype == DType::Q4K && cols % 256 == 0 {
-        // ggml mul_vec_q4_K: TG=64 (2 SG), 8 rows/TG (4 per SG).
+    if matches!(weight_dtype, DType::Q4K | DType::Q6K) && cols % 256 == 0 {
+        // ggml mul_vec_q{4,6}_K: TG=64 (2 SG), 8 rows/TG (4 per SG).
         sched.tg = 64;
         sched.nr0 = 8;
+        sched.nsg = 2;
     }
     sched
 }
 
 fn matvec_launch(weight_dtype: DType, rows: usize, sched: OptSchedule) -> KirLaunch {
-    let _ = weight_dtype;
     let nr = sched.nr0.max(1) as usize;
     let n_tg = rows.saturating_add(nr - 1) / nr;
-    KirLaunch::RowsParallel {
-        rows: n_tg,
-        tg: sched.tg,
+    // Q4/Q6 coop AST uses `sg = lid()/32` with ggml-style TG=(32, nsg).
+    if matches!(weight_dtype, DType::Q4K | DType::Q6K) && sched.nsg >= 1 {
+        KirLaunch::RowsParallelSg {
+            rows: n_tg,
+            nsg: sched.nsg.max(1) as u64,
+        }
+    } else {
+        KirLaunch::RowsParallel {
+            rows: n_tg,
+            tg: sched.tg,
+        }
     }
 }
 
 fn effective_vec(weight_dtype: DType, cols: usize, sched_vec: u32) -> u32 {
-    if weight_dtype == DType::Q4K {
-        q4k_vec_width(cols)
-    } else {
-        sched_vec
+    match weight_dtype {
+        DType::Q6K => 1,
+        DType::Q4K => q4k_vec_width(cols),
+        _ => sched_vec,
     }
 }
 
 fn effective_tg(weight_dtype: DType, cols: usize, sched_tg: u64) -> u64 {
-    if weight_dtype == DType::Q4K && cols % 256 == 0 {
+    if matches!(weight_dtype, DType::Q4K | DType::Q6K) && cols % 256 == 0 {
         64
     } else {
         sched_tg
@@ -609,6 +739,480 @@ fn lower_elemwise(expr: &ElemExpr, n_in: u32, dt: DType) -> Vec<KirStmt> {
     vec![st(n_in, gid(), elem_kir(expr, &gid(), dt))]
 }
 
+#[derive(Clone, Copy)]
+enum MatvecEpi {
+    None,
+    /// `out = gelu(acc) * ctx[ctx_off + row]` (PLE gate fuse).
+    GeluMulCtx { ctx_buf: u32, ctx_off: u32, dt: DType },
+}
+
+fn emit_gelu_of(x: KirExpr, next: &mut u32) -> (Vec<KirStmt>, u32) {
+    let ax = fresh(next);
+    let u = fresh(next);
+    let gelu = fresh(next);
+    let stmts = vec![
+        KirStmt::Let {
+            id: ax,
+            expr: bin(BinOp::Min, c(20.0), bin(BinOp::Max, c(-20.0), x)),
+        },
+        KirStmt::Let {
+            id: u,
+            expr: bin(
+                BinOp::Mul,
+                c(0.79788456),
+                bin(
+                    BinOp::Add,
+                    v(ax),
+                    bin(
+                        BinOp::Mul,
+                        c(0.044715),
+                        bin(BinOp::Mul, bin(BinOp::Mul, v(ax), v(ax)), v(ax)),
+                    ),
+                ),
+            ),
+        },
+        KirStmt::Let {
+            id: gelu,
+            expr: bin(
+                BinOp::Mul,
+                bin(BinOp::Mul, c(0.5), v(ax)),
+                bin(BinOp::Add, c(1.0), un(UnaryOp::Tanh, v(u))),
+            ),
+        },
+    ];
+    (stmts, gelu)
+}
+
+fn store_row_with_epi(
+    out_buf: u32,
+    row: KirExpr,
+    acc: u32,
+    epi: MatvecEpi,
+    next: &mut u32,
+) -> Vec<KirStmt> {
+    match epi {
+        MatvecEpi::None => vec![st(out_buf, row, v(acc))],
+        MatvecEpi::GeluMulCtx {
+            ctx_buf,
+            ctx_off,
+            dt,
+        } => {
+            let (mut stmts, gelu) = emit_gelu_of(v(acc), next);
+            let out = fresh(next);
+            stmts.push(KirStmt::Let {
+                id: out,
+                expr: bin(
+                    BinOp::Mul,
+                    v(gelu),
+                    ld(ctx_buf, bin(BinOp::Add, cu(ctx_off), row.clone()), dt),
+                ),
+            });
+            stmts.push(st(out_buf, row, v(out)));
+            stmts
+        }
+    }
+}
+
+/// Short-K single-TG fuse: `y = W@x` into LOCAL, then `out = scale*(residual + rms(y)*w)`.
+/// Buffers: `0=W`, `1=x`, `2=w_norm`, `3=residual`, `4=out`. PLE proj is Q4×256×1536.
+fn lower_matvec_rmsnorm_fused(
+    rows: usize,
+    cols: usize,
+    weight_dtype: DType,
+    eps: f32,
+    scale: Option<f32>,
+    next: &mut u32,
+) -> Result<(KirLaunch, Vec<KirStmt>), CodegenError> {
+    const TG: u64 = 256;
+    let y_bytes = rows.saturating_mul(4);
+    let x_bytes = cols.saturating_mul(4);
+    if y_bytes.saturating_add(x_bytes) > TG_X_BYTES_MAX {
+        return Err(CodegenError::Msg(format!(
+            "matvec+rmsnorm fuse: LOCAL y+x too large ({rows}x{cols})"
+        )));
+    }
+    if weight_dtype != DType::Q4K || cols % 256 != 0 {
+        return Err(CodegenError::Msg(format!(
+            "matvec+rmsnorm fuse: need Q4K cols%256==0 (got {weight_dtype:?} cols={cols})"
+        )));
+    }
+
+    let (mut stmts, tg_x) = stage_local_x(cols, 1, TG, DType::F16, None, next)?;
+    let tg_x = tg_x.ok_or_else(|| {
+        CodegenError::Msg("matvec+rmsnorm fuse requires LOCAL staging of x".into())
+    })?;
+    let tg_y = 1u32;
+    stmts.push(KirStmt::TgDeclF32 { id: tg_y, n: rows });
+
+    // Per-lane rows: full Q4K row dots against LOCAL x (no TG reduce — one thread owns the row).
+    let row = fresh(next);
+    stmts.push(KirStmt::LetU32 {
+        id: row,
+        expr: lid(),
+    });
+    let acc = fresh(next);
+    let base = fresh(next);
+    let k = fresh(next);
+    let mv_body = vec![
+        KirStmt::Let {
+            id: acc,
+            expr: c(0.0),
+        },
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, uv(row), cu(cols as u32)),
+        },
+        KirStmt::LetU32 {
+            id: k,
+            expr: cu(0),
+        },
+        KirStmt::ForRange {
+            id: k,
+            limit_off: cu(0),
+            bound: cu(cols as u32),
+            step: cu(256),
+            body: vec![KirStmt::Assign {
+                id: acc,
+                expr: bin(
+                    BinOp::Add,
+                    v(acc),
+                    vec_dot(
+                        0,
+                        bin(BinOp::Add, uv(base), uv(k)),
+                        1,
+                        uv(k),
+                        256,
+                        DType::Q4K,
+                        Some(tg_x),
+                    ),
+                ),
+            }],
+        },
+        KirStmt::TgStore {
+            id: tg_y,
+            idx: uv(row),
+            val: v(acc),
+        },
+    ];
+    stmts.push(KirStmt::ForRange {
+        id: row,
+        limit_off: cu(0),
+        bound: cu(rows as u32),
+        step: cu(TG as u32),
+        body: mv_body,
+    });
+    stmts.push(KirStmt::Barrier);
+
+    // RMS over LOCAL y, then scale*(residual + y*inv*w).
+    let ss = fresh(next);
+    let i = fresh(next);
+    let inv = fresh(next);
+    let j = fresh(next);
+    stmts.push(KirStmt::Let {
+        id: ss,
+        expr: c(0.0),
+    });
+    stmts.push(KirStmt::LetU32 {
+        id: i,
+        expr: lid(),
+    });
+    stmts.push(KirStmt::ForRange {
+        id: i,
+        limit_off: cu(0),
+        bound: cu(rows as u32),
+        step: cu(TG as u32),
+        body: vec![KirStmt::Assign {
+            id: ss,
+            expr: bin(
+                BinOp::Add,
+                v(ss),
+                bin(BinOp::Mul, tg_load(tg_y, uv(i)), tg_load(tg_y, uv(i))),
+            ),
+        }],
+    });
+    stmts.push(KirStmt::ThreadgroupReduce { acc_id: ss, tg: TG });
+    stmts.push(KirStmt::Let {
+        id: inv,
+        expr: un(
+            UnaryOp::Rsqrt,
+            bin(BinOp::Add, bin(BinOp::Div, v(ss), c(rows as f32)), c(eps)),
+        ),
+    });
+    stmts.push(KirStmt::LetU32 {
+        id: j,
+        expr: lid(),
+    });
+    let mut val = bin(
+        BinOp::Mul,
+        bin(BinOp::Mul, tg_load(tg_y, uv(j)), v(inv)),
+        ld(2, uv(j), DType::F16),
+    );
+    val = bin(BinOp::Add, val, ld(3, uv(j), DType::F16));
+    if let Some(sc) = scale {
+        val = bin(BinOp::Mul, c(sc), val);
+    }
+    stmts.push(KirStmt::ForRange {
+        id: j,
+        limit_off: cu(0),
+        bound: cu(rows as u32),
+        step: cu(TG as u32),
+        body: vec![st(4, uv(j), val)],
+    });
+
+    Ok((
+        KirLaunch::RowsParallel {
+            rows: 1,
+            tg: TG,
+        },
+        stmts,
+    ))
+}
+
+/// Full PLE one TG: gate gelu*ctx → proj → rmsnorm_add_scale.
+/// Buffers: `0=Wg`, `1=x`, `2=ctx`, `3=Wp`, `4=w_norm`, `5=residual`, `6=out`.
+/// LOCAL: x[cols] + u[gate_rows] + y[proj_rows].
+fn lower_ple_gelu_proj_rms_fused(
+    gate_rows: usize,
+    cols: usize,
+    proj_rows: usize,
+    ctx_off: usize,
+    eps: f32,
+    scale: f32,
+    weight_dtype: DType,
+    next: &mut u32,
+) -> Result<(KirLaunch, Vec<KirStmt>), CodegenError> {
+    const TG: u64 = 256;
+    if weight_dtype != DType::Q4K || cols % 256 != 0 || gate_rows % 256 != 0 {
+        return Err(CodegenError::Msg(format!(
+            "PLE full fuse: need Q4K, cols%256==0, gate_rows%256==0 (wd={weight_dtype:?} cols={cols} gate={gate_rows})"
+        )));
+    }
+    let local_elems = cols.saturating_add(gate_rows).saturating_add(proj_rows);
+    if local_elems.saturating_mul(4) > TG_X_BYTES_MAX {
+        return Err(CodegenError::Msg(format!(
+            "PLE full fuse: LOCAL too large ({local_elems} floats)"
+        )));
+    }
+
+    let (mut stmts, tg_x) = stage_local_x(cols, 1, TG, DType::F16, None, next)?;
+    let tg_x = tg_x.ok_or_else(|| CodegenError::Msg("PLE fuse needs LOCAL x".into()))?;
+    let tg_u = 1u32;
+    let tg_y = 2u32;
+    stmts.push(KirStmt::TgDeclF32 {
+        id: tg_u,
+        n: gate_rows,
+    });
+    stmts.push(KirStmt::TgDeclF32 {
+        id: tg_y,
+        n: proj_rows,
+    });
+
+    // Phase 1: u[r] = gelu(Wg[r]·x) * ctx[ctx_off+r]
+    let row = fresh(next);
+    stmts.push(KirStmt::LetU32 {
+        id: row,
+        expr: lid(),
+    });
+    let acc = fresh(next);
+    let base = fresh(next);
+    let k = fresh(next);
+    let (gelu_stmts, gelu_id) = emit_gelu_of(v(acc), next);
+    let out_u = fresh(next);
+    let mut gate_body = vec![
+        KirStmt::Let {
+            id: acc,
+            expr: c(0.0),
+        },
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, uv(row), cu(cols as u32)),
+        },
+        KirStmt::LetU32 {
+            id: k,
+            expr: cu(0),
+        },
+        KirStmt::ForRange {
+            id: k,
+            limit_off: cu(0),
+            bound: cu(cols as u32),
+            step: cu(256),
+            body: vec![KirStmt::Assign {
+                id: acc,
+                expr: bin(
+                    BinOp::Add,
+                    v(acc),
+                    vec_dot(
+                        0,
+                        bin(BinOp::Add, uv(base), uv(k)),
+                        1,
+                        uv(k),
+                        256,
+                        DType::Q4K,
+                        Some(tg_x),
+                    ),
+                ),
+            }],
+        },
+    ];
+    gate_body.extend(gelu_stmts);
+    gate_body.push(KirStmt::Let {
+        id: out_u,
+        expr: bin(
+            BinOp::Mul,
+            v(gelu_id),
+            ld(
+                2,
+                bin(BinOp::Add, cu(ctx_off as u32), uv(row)),
+                DType::F16,
+            ),
+        ),
+    });
+    gate_body.push(KirStmt::TgStore {
+        id: tg_u,
+        idx: uv(row),
+        val: v(out_u),
+    });
+    stmts.push(KirStmt::ForRange {
+        id: row,
+        limit_off: cu(0),
+        bound: cu(gate_rows as u32),
+        step: cu(TG as u32),
+        body: gate_body,
+    });
+    stmts.push(KirStmt::Barrier);
+
+    // Phase 2: y[r] = Wp[r]·u  (proj cols = gate_rows)
+    let row2 = fresh(next);
+    stmts.push(KirStmt::LetU32 {
+        id: row2,
+        expr: lid(),
+    });
+    let acc2 = fresh(next);
+    let base2 = fresh(next);
+    let k2 = fresh(next);
+    let proj_body = vec![
+        KirStmt::Let {
+            id: acc2,
+            expr: c(0.0),
+        },
+        KirStmt::LetU32 {
+            id: base2,
+            expr: bin(BinOp::Mul, uv(row2), cu(gate_rows as u32)),
+        },
+        KirStmt::LetU32 {
+            id: k2,
+            expr: cu(0),
+        },
+        KirStmt::ForRange {
+            id: k2,
+            limit_off: cu(0),
+            bound: cu(gate_rows as u32),
+            step: cu(256),
+            body: vec![KirStmt::Assign {
+                id: acc2,
+                expr: bin(
+                    BinOp::Add,
+                    v(acc2),
+                    vec_dot(
+                        3,
+                        bin(BinOp::Add, uv(base2), uv(k2)),
+                        1, // unused when b_from_tg set
+                        uv(k2),
+                        256,
+                        DType::Q4K,
+                        Some(tg_u),
+                    ),
+                ),
+            }],
+        },
+        KirStmt::TgStore {
+            id: tg_y,
+            idx: uv(row2),
+            val: v(acc2),
+        },
+    ];
+    stmts.push(KirStmt::ForRange {
+        id: row2,
+        limit_off: cu(0),
+        bound: cu(proj_rows as u32),
+        step: cu(TG as u32),
+        body: proj_body,
+    });
+    stmts.push(KirStmt::Barrier);
+
+    // Phase 3: rmsnorm_add_scale on LOCAL y
+    let ss = fresh(next);
+    let i = fresh(next);
+    let inv = fresh(next);
+    let j = fresh(next);
+    stmts.push(KirStmt::Let {
+        id: ss,
+        expr: c(0.0),
+    });
+    stmts.push(KirStmt::LetU32 {
+        id: i,
+        expr: lid(),
+    });
+    stmts.push(KirStmt::ForRange {
+        id: i,
+        limit_off: cu(0),
+        bound: cu(proj_rows as u32),
+        step: cu(TG as u32),
+        body: vec![KirStmt::Assign {
+            id: ss,
+            expr: bin(
+                BinOp::Add,
+                v(ss),
+                bin(BinOp::Mul, tg_load(tg_y, uv(i)), tg_load(tg_y, uv(i))),
+            ),
+        }],
+    });
+    stmts.push(KirStmt::ThreadgroupReduce { acc_id: ss, tg: TG });
+    stmts.push(KirStmt::Let {
+        id: inv,
+        expr: un(
+            UnaryOp::Rsqrt,
+            bin(
+                BinOp::Add,
+                bin(BinOp::Div, v(ss), c(proj_rows as f32)),
+                c(eps),
+            ),
+        ),
+    });
+    stmts.push(KirStmt::LetU32 {
+        id: j,
+        expr: lid(),
+    });
+    let val = bin(
+        BinOp::Mul,
+        c(scale),
+        bin(
+            BinOp::Add,
+            ld(5, uv(j), DType::F16),
+            bin(
+                BinOp::Mul,
+                bin(BinOp::Mul, tg_load(tg_y, uv(j)), v(inv)),
+                ld(4, uv(j), DType::F16),
+            ),
+        ),
+    );
+    stmts.push(KirStmt::ForRange {
+        id: j,
+        limit_off: cu(0),
+        bound: cu(proj_rows as u32),
+        step: cu(TG as u32),
+        body: vec![st(6, uv(j), val)],
+    });
+
+    Ok((
+        KirLaunch::RowsParallel {
+            rows: 1,
+            tg: TG,
+        },
+        stmts,
+    ))
+}
+
 /// Tinygrad-style LOCAL/UPCAST/UNROLL as AST: lid-strided K, vec loads, tg reduce.
 /// `nr = max(1, sched.nr0)` output rows per TG share one LOCAL `x` (or `x_hat`) stage.
 /// K is outer so all NR rows reuse each weight/x chunk (oracle-style x amortization).
@@ -623,15 +1227,45 @@ fn lower_matvec(
     rms: Option<(u32, f32)>,
     next: &mut u32,
 ) -> Result<Vec<KirStmt>, CodegenError> {
+    lower_matvec_epi(
+        rows,
+        cols,
+        weight_dtype,
+        sched,
+        x_buf,
+        out_buf,
+        rms,
+        MatvecEpi::None,
+        next,
+    )
+}
+
+fn lower_matvec_epi(
+    rows: usize,
+    cols: usize,
+    weight_dtype: DType,
+    sched: OptSchedule,
+    x_buf: u32,
+    out_buf: u32,
+    rms: Option<(u32, f32)>,
+    epi: MatvecEpi,
+    next: &mut u32,
+) -> Result<Vec<KirStmt>, CodegenError> {
     if weight_dtype == DType::Q4K && cols % 256 == 0 {
-        match lower_matvec_q4k_coop(rows, cols, sched, x_buf, out_buf, rms, next) {
+        match lower_matvec_q4k_coop(rows, cols, sched, x_buf, out_buf, rms, epi, next) {
             Ok(s) => return Ok(s),
             Err(_) => {
                 // Fall back if LOCAL x cannot be staged (cols too large for TG mem).
             }
         }
     }
-    lower_matvec_generic(rows, cols, weight_dtype, sched, x_buf, out_buf, rms, next)
+    if weight_dtype == DType::Q6K && cols % 256 == 0 {
+        match lower_matvec_q6k_coop(rows, cols, sched, x_buf, out_buf, rms, epi, next) {
+            Ok(s) => return Ok(s),
+            Err(_) => {}
+        }
+    }
+    lower_matvec_generic(rows, cols, weight_dtype, sched, x_buf, out_buf, rms, epi, next)
 }
 
 /// ggml `mul_vec_q4_K`-shaped tiling: 2 simdgroups/TG, each owns `nr` rows;
@@ -643,19 +1277,31 @@ fn lower_matvec_q4k_coop(
     x_buf: u32,
     out_buf: u32,
     rms: Option<(u32, f32)>,
+    epi: MatvecEpi,
     next: &mut u32,
 ) -> Result<Vec<KirStmt>, CodegenError> {
-    let nsg = 2u32;
-    let tg = 64u64;
+    let nsg = sched.nsg.max(1);
+    let tg = (nsg as u64) * 32;
     // Force 4 rows/SG (ggml KQ_NR0) so nr4 y-amortized expand applies.
     let nr = 4u32;
-    let _ = sched;
     let nb = (cols / 256) as u32;
+    let exact_rows = rows % ((nsg * nr) as usize) == 0;
 
-    let (mut stmts, tg_x) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
-    let tg_x = tg_x.ok_or_else(|| {
-        CodegenError::Msg("q4k coop matvec requires LOCAL x staging".into())
-    })?;
+    // Device-x (oracle-style): stream device half x unless fused rms needs LOCAL x_hat.
+    let prefer_local = false;
+    let (mut stmts, tg_x) = if rms.is_some() || prefer_local {
+        let (s, tg) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
+        if rms.is_some() {
+            let tg = tg.ok_or_else(|| {
+                CodegenError::Msg("q4k coop+rmsnorm requires LOCAL staging of x_hat".into())
+            })?;
+            (s, Some(tg))
+        } else {
+            (s, tg)
+        }
+    } else {
+        (vec![], None)
+    };
 
     let lane = fresh(next);
     let sg = fresh(next);
@@ -711,52 +1357,59 @@ fn lower_matvec_q4k_coop(
     });
     let mut body = Vec::new();
     if nr == 4 {
-        let last = bin(BinOp::Add, uv(first), cu(3));
-        body.push(KirStmt::If {
-            cond: gt(cu(rows as u32), last.clone()),
-            body: vec![KirStmt::Q4kCoopNr4 {
-                w_buf: 0,
-                row0_base: uv(bases[0]),
-                cols: cols as u32,
-                ib: uv(ib),
-                b_from_tg: tg_x,
-                lane: uv(lane),
-                acc_ids: [accs[0], accs[1], accs[2], accs[3]],
-            }],
-        });
-        let mut partial = Vec::new();
-        for r in 0..nr {
-            let row = if r == 0 {
-                uv(first)
-            } else {
-                bin(BinOp::Add, uv(first), cu(r))
-            };
-            let acc = accs[r as usize];
-            let base = bases[r as usize];
-            partial.push(KirStmt::If {
-                cond: gt(cu(rows as u32), row),
-                body: vec![KirStmt::Assign {
-                    id: acc,
-                    expr: bin(
-                        BinOp::Add,
-                        v(acc),
-                        KirExpr::Q4kCoopFrag {
-                            w_buf: 0,
-                            row_base: Box::new(uv(base)),
-                            cols: cols as u32,
-                            ib: Box::new(uv(ib)),
-                            b_from_tg: tg_x,
-                            lane: Box::new(uv(lane)),
-                        },
-                    ),
-                }],
+        let nr4 = KirStmt::Q4kCoopNr4 {
+            w_buf: 0,
+            row0_base: uv(bases[0]),
+            cols: cols as u32,
+            ib: uv(ib),
+            b_from_tg: tg_x,
+            x_buf,
+            lane: uv(lane),
+            acc_ids: [accs[0], accs[1], accs[2], accs[3]],
+        };
+        if exact_rows {
+            body.push(nr4);
+        } else {
+            let last = bin(BinOp::Add, uv(first), cu(3));
+            body.push(KirStmt::If {
+                cond: gt(cu(rows as u32), last.clone()),
+                body: vec![nr4],
+            });
+            let mut partial = Vec::new();
+            for r in 0..nr {
+                let row = if r == 0 {
+                    uv(first)
+                } else {
+                    bin(BinOp::Add, uv(first), cu(r))
+                };
+                let acc = accs[r as usize];
+                let base = bases[r as usize];
+                partial.push(KirStmt::If {
+                    cond: gt(cu(rows as u32), row),
+                    body: vec![KirStmt::Assign {
+                        id: acc,
+                        expr: bin(
+                            BinOp::Add,
+                            v(acc),
+                            KirExpr::Q4kCoopFrag {
+                                w_buf: 0,
+                                row_base: Box::new(uv(base)),
+                                cols: cols as u32,
+                                ib: Box::new(uv(ib)),
+                                b_from_tg: tg_x,
+                                x_buf,
+                                lane: Box::new(uv(lane)),
+                            },
+                        ),
+                    }],
+                });
+            }
+            let rows_m1 = (rows as u32).saturating_sub(1);
+            body.push(KirStmt::If {
+                cond: gt(last, cu(rows_m1)),
+                body: partial,
             });
         }
-        let rows_m1 = (rows as u32).saturating_sub(1);
-        body.push(KirStmt::If {
-            cond: gt(last, cu(rows_m1)),
-            body: partial,
-        });
     } else {
         for r in 0..nr {
             let row = if r == 0 {
@@ -779,6 +1432,7 @@ fn lower_matvec_q4k_coop(
                             cols: cols as u32,
                             ib: Box::new(uv(ib)),
                             b_from_tg: tg_x,
+                            x_buf,
                             lane: Box::new(uv(lane)),
                         },
                     ),
@@ -801,19 +1455,299 @@ fn lower_matvec_q4k_coop(
             bin(BinOp::Add, uv(first), cu(r))
         };
         let acc = accs[r as usize];
-        stmts.push(KirStmt::If {
-            cond: gt(cu(rows as u32), row.clone()),
-            body: vec![
-                KirStmt::Assign {
-                    id: acc,
-                    expr: KirExpr::SimdSum(Box::new(v(acc))),
-                },
-                KirStmt::If {
-                    cond: eq(uv(lane), cu(0)),
-                    body: vec![st(out_buf, row, v(acc))],
-                },
-            ],
+        let mut reduce_store = vec![KirStmt::Assign {
+            id: acc,
+            expr: KirExpr::SimdSum(Box::new(v(acc))),
+        }];
+        let store_body = store_row_with_epi(out_buf, row.clone(), acc, epi, next);
+        reduce_store.push(KirStmt::If {
+            cond: eq(uv(lane), cu(0)),
+            body: store_body,
         });
+        if exact_rows {
+            stmts.extend(reduce_store);
+        } else {
+            stmts.push(KirStmt::If {
+                cond: gt(cu(rows as u32), row),
+                body: reduce_store,
+            });
+        }
+    }
+    Ok(stmts)
+}
+
+
+/// ggml `mul_vec_q6_K`-shaped tiling: 2 simdgroups/TG, lanes stripe by 2.
+fn lower_matvec_q6k_coop(
+    rows: usize,
+    cols: usize,
+    sched: OptSchedule,
+    x_buf: u32,
+    out_buf: u32,
+    rms: Option<(u32, f32)>,
+    epi: MatvecEpi,
+    next: &mut u32,
+) -> Result<Vec<KirStmt>, CodegenError> {
+    let nsg = 2u32;
+    let tg = 64u64;
+    let nr = 4u32;
+    let _ = sched;
+    let nb = (cols / 256) as u32;
+    let exact_rows = rows % ((nsg * nr) as usize) == 0;
+    let tile = (TG_X_BYTES_MAX / 4) & !255;
+    // Device-x streams any K from device half*; only tile when LOCAL staging is required
+    // and x does not fit in TG memory.
+    let prefer_local = false;
+    let need_tile =
+        prefer_local && cols.saturating_mul(4) > TG_X_BYTES_MAX;
+    let (mut stmts, tg_x, tiled) = if need_tile {
+        if rms.is_some() {
+            return Err(CodegenError::Msg(
+                "q6k coop+rmsnorm requires LOCAL staging of x_hat".into(),
+            ));
+        }
+        let tg_id = 0u32;
+        (
+            vec![KirStmt::TgDeclF32 { id: tg_id, n: tile }],
+            Some(tg_id),
+            true,
+        )
+    } else if rms.is_some() || prefer_local {
+        let (s, tg_opt) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
+        if rms.is_some() {
+            let tg = tg_opt.ok_or_else(|| {
+                CodegenError::Msg("q6k coop+rmsnorm requires LOCAL staging of x_hat".into())
+            })?;
+            (s, Some(tg), false)
+        } else {
+            (s, tg_opt, false)
+        }
+    } else {
+        (vec![], None, false)
+    };
+
+    let lane = fresh(next);
+    let sg = fresh(next);
+    let first = fresh(next);
+    stmts.push(KirStmt::LetU32 {
+        id: sg,
+        expr: bin(BinOp::Div, lid(), cu(32)),
+    });
+    stmts.push(KirStmt::LetU32 {
+        id: lane,
+        expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(sg), cu(32))),
+    });
+    stmts.push(KirStmt::LetU32 {
+        id: first,
+        expr: bin(
+            BinOp::Mul,
+            bin(BinOp::Add, bin(BinOp::Mul, gid(), cu(nsg)), uv(sg)),
+            cu(nr),
+        ),
+    });
+    // ggml q6: ix = lane % 2; stripe superblocks by 2.
+    let ix = fresh(next);
+    stmts.push(KirStmt::LetU32 {
+        id: ix,
+        expr: bin(
+            BinOp::Sub,
+            uv(lane),
+            bin(BinOp::Mul, bin(BinOp::Div, uv(lane), cu(2)), cu(2)),
+        ),
+    });
+
+    let mut accs = Vec::with_capacity(nr as usize);
+    let mut bases = Vec::with_capacity(nr as usize);
+    for r in 0..nr {
+        let row = if r == 0 {
+            uv(first)
+        } else {
+            bin(BinOp::Add, uv(first), cu(r))
+        };
+        let acc = fresh(next);
+        let base = fresh(next);
+        stmts.push(KirStmt::Let {
+            id: acc,
+            expr: c(0.0),
+        });
+        stmts.push(KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, row, cu(cols as u32)),
+        });
+        accs.push(acc);
+        bases.push(base);
+    }
+
+    let make_ib_body = |ib_expr: KirExpr, x_off: KirExpr| -> Vec<KirStmt> {
+        let nr4 = KirStmt::Q6kCoopNr4 {
+            w_buf: 0,
+            row0_base: uv(bases[0]),
+            cols: cols as u32,
+            ib: ib_expr.clone(),
+            b_from_tg: tg_x,
+            x_buf,
+            x_off: x_off.clone(),
+            lane: uv(lane),
+            acc_ids: [accs[0], accs[1], accs[2], accs[3]],
+        };
+        if exact_rows {
+            return vec![nr4];
+        }
+        let last = bin(BinOp::Add, uv(first), cu(3));
+        let mut body = vec![KirStmt::If {
+            cond: gt(cu(rows as u32), last.clone()),
+            body: vec![nr4],
+        }];
+        let mut partial = Vec::new();
+        for r in 0..nr {
+            let row = if r == 0 {
+                uv(first)
+            } else {
+                bin(BinOp::Add, uv(first), cu(r))
+            };
+            let acc = accs[r as usize];
+            let base = bases[r as usize];
+            partial.push(KirStmt::If {
+                cond: gt(cu(rows as u32), row),
+                body: vec![KirStmt::Assign {
+                    id: acc,
+                    expr: bin(
+                        BinOp::Add,
+                        v(acc),
+                        KirExpr::Q6kCoopFrag {
+                            w_buf: 0,
+                            row_base: Box::new(uv(base)),
+                            cols: cols as u32,
+                            ib: Box::new(ib_expr.clone()),
+                            b_from_tg: tg_x,
+                            x_buf,
+                            x_off: Box::new(x_off.clone()),
+                            lane: Box::new(uv(lane)),
+                        },
+                    ),
+                }],
+            });
+        }
+        let rows_m1 = (rows as u32).saturating_sub(1);
+        body.push(KirStmt::If {
+            cond: gt(last, cu(rows_m1)),
+            body: partial,
+        });
+        body
+    };
+
+    if tiled {
+        let tg_id = tg_x.expect("tiled q6 requires TG");
+        let tile_u = tile as u32;
+        let n_tiles = ((cols + tile - 1) / tile) as u32;
+        let tile_i = fresh(next);
+        stmts.push(KirStmt::LetU32 {
+            id: tile_i,
+            expr: cu(0),
+        });
+        let mut tile_body = Vec::new();
+        let tile_off = fresh(next);
+        tile_body.push(KirStmt::LetU32 {
+            id: tile_off,
+            expr: bin(BinOp::Mul, uv(tile_i), cu(tile_u)),
+        });
+        let tile_end = fresh(next);
+        tile_body.push(KirStmt::LetU32 {
+            id: tile_end,
+            expr: bin(
+                BinOp::Min,
+                bin(BinOp::Add, uv(tile_off), cu(tile_u)),
+                cu(cols as u32),
+            ),
+        });
+        let tile_len = fresh(next);
+        tile_body.push(KirStmt::LetU32 {
+            id: tile_len,
+            expr: bin(BinOp::Sub, uv(tile_end), uv(tile_off)),
+        });
+        let j = fresh(next);
+        tile_body.push(KirStmt::LetU32 {
+            id: j,
+            expr: lid(),
+        });
+        tile_body.push(KirStmt::ForRange {
+            id: j,
+            limit_off: cu(0),
+            bound: uv(tile_len),
+            step: cu(tg as u32),
+            body: vec![KirStmt::TgStore {
+                id: tg_id,
+                idx: uv(j),
+                val: ld(
+                    x_buf,
+                    bin(BinOp::Add, uv(tile_off), uv(j)),
+                    DType::F16,
+                ),
+            }],
+        });
+        tile_body.push(KirStmt::Barrier);
+        let ib = fresh(next);
+        tile_body.push(KirStmt::LetU32 {
+            id: ib,
+            expr: bin(
+                BinOp::Add,
+                bin(BinOp::Div, uv(tile_off), cu(256)),
+                uv(ix),
+            ),
+        });
+        tile_body.push(KirStmt::ForRange {
+            id: ib,
+            limit_off: cu(0),
+            bound: bin(BinOp::Div, uv(tile_end), cu(256)),
+            step: cu(2),
+            body: make_ib_body(uv(ib), uv(tile_off)),
+        });
+        stmts.push(KirStmt::ForRange {
+            id: tile_i,
+            limit_off: cu(0),
+            bound: cu(n_tiles),
+            step: cu(1),
+            body: tile_body,
+        });
+    } else {
+        let ib = fresh(next);
+        stmts.push(KirStmt::LetU32 {
+            id: ib,
+            expr: uv(ix),
+        });
+        stmts.push(KirStmt::ForRange {
+            id: ib,
+            limit_off: cu(0),
+            bound: cu(nb),
+            step: cu(2),
+            body: make_ib_body(uv(ib), cu(0)),
+        });
+    }
+
+    for r in 0..nr {
+        let row = if r == 0 {
+            uv(first)
+        } else {
+            bin(BinOp::Add, uv(first), cu(r))
+        };
+        let acc = accs[r as usize];
+        let mut reduce_store = vec![KirStmt::Assign {
+            id: acc,
+            expr: KirExpr::SimdSum(Box::new(v(acc))),
+        }];
+        let store_body = store_row_with_epi(out_buf, row.clone(), acc, epi, next);
+        reduce_store.push(KirStmt::If {
+            cond: eq(uv(lane), cu(0)),
+            body: store_body,
+        });
+        if exact_rows {
+            stmts.extend(reduce_store);
+        } else {
+            stmts.push(KirStmt::If {
+                cond: gt(cu(rows as u32), row),
+                body: reduce_store,
+            });
+        }
     }
     Ok(stmts)
 }
@@ -826,6 +1760,7 @@ fn lower_matvec_generic(
     x_buf: u32,
     out_buf: u32,
     rms: Option<(u32, f32)>,
+    epi: MatvecEpi,
     next: &mut u32,
 ) -> Result<Vec<KirStmt>, CodegenError> {
     let tg = effective_tg(weight_dtype, cols, sched.tg);
@@ -980,13 +1915,14 @@ fn lower_matvec_generic(
             bin(BinOp::Add, uv(first), cu(r))
         };
         let acc = accs[r as usize];
+        let store_body = store_row_with_epi(out_buf, row.clone(), acc, epi, next);
         stmts.push(KirStmt::If {
-            cond: gt(cu(rows as u32), row.clone()),
+            cond: gt(cu(rows as u32), row),
             body: vec![
                 KirStmt::ThreadgroupReduce { acc_id: acc, tg },
                 KirStmt::If {
                     cond: eq(lid(), cu(0)),
-                    body: vec![st(out_buf, row, v(acc))],
+                    body: store_body,
                 },
             ],
         });
@@ -1024,16 +1960,28 @@ fn lower_matvec_gate_up_q4k_coop(
     rms: Option<(u32, f32)>,
     next: &mut u32,
 ) -> Result<Vec<KirStmt>, CodegenError> {
-    let nsg = 2u32;
-    let tg = 64u64;
+    let nsg = sched.nsg.max(1);
+    let tg = (nsg as u64) * 32;
     let nr = 4u32;
-    let _ = sched;
     let nb = (cols / 256) as u32;
+    let exact_rows = rows % ((nsg * nr) as usize) == 0;
 
-    let (mut stmts, tg_x) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
-    let tg_x = tg_x.ok_or_else(|| {
-        CodegenError::Msg("q4k coop gate_up requires LOCAL x staging".into())
-    })?;
+    let prefer_local = false;
+    let (mut stmts, tg_x) = if rms.is_some() || prefer_local {
+        let (s, tg) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
+        if rms.is_some() {
+            let tg = tg.ok_or_else(|| {
+                CodegenError::Msg(
+                    "q4k coop gate_up+rmsnorm requires LOCAL staging of x_hat".into(),
+                )
+            })?;
+            (s, Some(tg))
+        } else {
+            (s, tg)
+        }
+    } else {
+        (vec![], None)
+    };
 
     let lane = fresh(next);
     let sg = fresh(next);
@@ -1098,70 +2046,78 @@ fn lower_matvec_gate_up_q4k_coop(
     // Prefer nr=4 path: amortize y across rows (two nr4 calls: gate then up).
     let nr_gate = nr;
     if nr_gate == 4 {
-        let last = bin(BinOp::Add, uv(first), cu(3));
-        body.push(KirStmt::If {
-            cond: gt(cu(rows as u32), last.clone()),
-            body: vec![KirStmt::Q4kCoopNr4Dual {
-                row0_base: uv(bases[0]),
-                cols: cols as u32,
-                ib: uv(ib),
-                b_from_tg: tg_x,
-                lane: uv(lane),
-                acc_g: [acc_gs[0], acc_gs[1], acc_gs[2], acc_gs[3]],
-                acc_u: [acc_us[0], acc_us[1], acc_us[2], acc_us[3]],
-            }],
-        });
-        let mut partial = Vec::new();
-        for r in 0..nr {
-            let row = if r == 0 {
-                uv(first)
-            } else {
-                bin(BinOp::Add, uv(first), cu(r))
-            };
-            let acc_g = acc_gs[r as usize];
-            let acc_u = acc_us[r as usize];
-            let base = bases[r as usize];
-            partial.push(KirStmt::If {
-                cond: gt(cu(rows as u32), row),
-                body: vec![
-                    KirStmt::Assign {
-                        id: acc_g,
-                        expr: bin(
-                            BinOp::Add,
-                            v(acc_g),
-                            KirExpr::Q4kCoopFrag {
-                                w_buf: 0,
-                                row_base: Box::new(uv(base)),
-                                cols: cols as u32,
-                                ib: Box::new(uv(ib)),
-                                b_from_tg: tg_x,
-                                lane: Box::new(uv(lane)),
-                            },
-                        ),
-                    },
-                    KirStmt::Assign {
-                        id: acc_u,
-                        expr: bin(
-                            BinOp::Add,
-                            v(acc_u),
-                            KirExpr::Q4kCoopFrag {
-                                w_buf: 1,
-                                row_base: Box::new(uv(base)),
-                                cols: cols as u32,
-                                ib: Box::new(uv(ib)),
-                                b_from_tg: tg_x,
-                                lane: Box::new(uv(lane)),
-                            },
-                        ),
-                    },
-                ],
+        let nr4 = KirStmt::Q4kCoopNr4Dual {
+            row0_base: uv(bases[0]),
+            cols: cols as u32,
+            ib: uv(ib),
+            b_from_tg: tg_x,
+            x_buf,
+            lane: uv(lane),
+            acc_g: [acc_gs[0], acc_gs[1], acc_gs[2], acc_gs[3]],
+            acc_u: [acc_us[0], acc_us[1], acc_us[2], acc_us[3]],
+        };
+        if exact_rows {
+            body.push(nr4);
+        } else {
+            let last = bin(BinOp::Add, uv(first), cu(3));
+            body.push(KirStmt::If {
+                cond: gt(cu(rows as u32), last.clone()),
+                body: vec![nr4],
+            });
+            let mut partial = Vec::new();
+            for r in 0..nr {
+                let row = if r == 0 {
+                    uv(first)
+                } else {
+                    bin(BinOp::Add, uv(first), cu(r))
+                };
+                let acc_g = acc_gs[r as usize];
+                let acc_u = acc_us[r as usize];
+                let base = bases[r as usize];
+                partial.push(KirStmt::If {
+                    cond: gt(cu(rows as u32), row),
+                    body: vec![
+                        KirStmt::Assign {
+                            id: acc_g,
+                            expr: bin(
+                                BinOp::Add,
+                                v(acc_g),
+                                KirExpr::Q4kCoopFrag {
+                                    w_buf: 0,
+                                    row_base: Box::new(uv(base)),
+                                    cols: cols as u32,
+                                    ib: Box::new(uv(ib)),
+                                    b_from_tg: tg_x,
+                                    x_buf,
+                                    lane: Box::new(uv(lane)),
+                                },
+                            ),
+                        },
+                        KirStmt::Assign {
+                            id: acc_u,
+                            expr: bin(
+                                BinOp::Add,
+                                v(acc_u),
+                                KirExpr::Q4kCoopFrag {
+                                    w_buf: 1,
+                                    row_base: Box::new(uv(base)),
+                                    cols: cols as u32,
+                                    ib: Box::new(uv(ib)),
+                                    b_from_tg: tg_x,
+                                    x_buf,
+                                    lane: Box::new(uv(lane)),
+                                },
+                            ),
+                        },
+                    ],
+                });
+            }
+            let rows_m1 = (rows as u32).saturating_sub(1);
+            body.push(KirStmt::If {
+                cond: gt(last, cu(rows_m1)),
+                body: partial,
             });
         }
-        let rows_m1 = (rows as u32).saturating_sub(1);
-        body.push(KirStmt::If {
-            cond: gt(last, cu(rows_m1)),
-            body: partial,
-        });
     } else {
         for r in 0..nr {
             let row = if r == 0 {
@@ -1186,6 +2142,7 @@ fn lower_matvec_gate_up_q4k_coop(
                                 cols: cols as u32,
                                 ib: Box::new(uv(ib)),
                                 b_from_tg: tg_x,
+                                x_buf,
                                 lane: Box::new(uv(lane)),
                             },
                         ),
@@ -1201,6 +2158,7 @@ fn lower_matvec_gate_up_q4k_coop(
                                 cols: cols as u32,
                                 ib: Box::new(uv(ib)),
                                 b_from_tg: tg_x,
+                                x_buf,
                                 lane: Box::new(uv(lane)),
                             },
                         ),
@@ -1228,53 +2186,58 @@ fn lower_matvec_gate_up_q4k_coop(
         let ax = fresh(next);
         let u = fresh(next);
         let gelu = fresh(next);
-        stmts.push(KirStmt::If {
-            cond: gt(cu(rows as u32), row.clone()),
-            body: vec![
-                KirStmt::Assign {
-                    id: acc_g,
-                    expr: KirExpr::SimdSum(Box::new(v(acc_g))),
-                },
-                KirStmt::Assign {
-                    id: acc_u,
-                    expr: KirExpr::SimdSum(Box::new(v(acc_u))),
-                },
-                KirStmt::If {
-                    cond: eq(uv(lane), cu(0)),
-                    body: vec![
-                        KirStmt::Let {
-                            id: ax,
-                            expr: bin(BinOp::Min, c(20.0), bin(BinOp::Max, c(-20.0), v(acc_g))),
-                        },
-                        KirStmt::Let {
-                            id: u,
-                            expr: bin(
-                                BinOp::Mul,
-                                c(0.79788456),
+        let reduce_store = vec![
+            KirStmt::Assign {
+                id: acc_g,
+                expr: KirExpr::SimdSum(Box::new(v(acc_g))),
+            },
+            KirStmt::Assign {
+                id: acc_u,
+                expr: KirExpr::SimdSum(Box::new(v(acc_u))),
+            },
+            KirStmt::If {
+                cond: eq(uv(lane), cu(0)),
+                body: vec![
+                    KirStmt::Let {
+                        id: ax,
+                        expr: bin(BinOp::Min, c(20.0), bin(BinOp::Max, c(-20.0), v(acc_g))),
+                    },
+                    KirStmt::Let {
+                        id: u,
+                        expr: bin(
+                            BinOp::Mul,
+                            c(0.79788456),
+                            bin(
+                                BinOp::Add,
+                                v(ax),
                                 bin(
-                                    BinOp::Add,
-                                    v(ax),
-                                    bin(
-                                        BinOp::Mul,
-                                        c(0.044715),
-                                        bin(BinOp::Mul, bin(BinOp::Mul, v(ax), v(ax)), v(ax)),
-                                    ),
+                                    BinOp::Mul,
+                                    c(0.044715),
+                                    bin(BinOp::Mul, bin(BinOp::Mul, v(ax), v(ax)), v(ax)),
                                 ),
                             ),
-                        },
-                        KirStmt::Let {
-                            id: gelu,
-                            expr: bin(
-                                BinOp::Mul,
-                                bin(BinOp::Mul, c(0.5), v(ax)),
-                                bin(BinOp::Add, c(1.0), un(UnaryOp::Tanh, v(u))),
-                            ),
-                        },
-                        st(out_buf, row, bin(BinOp::Mul, v(gelu), v(acc_u))),
-                    ],
-                },
-            ],
-        });
+                        ),
+                    },
+                    KirStmt::Let {
+                        id: gelu,
+                        expr: bin(
+                            BinOp::Mul,
+                            bin(BinOp::Mul, c(0.5), v(ax)),
+                            bin(BinOp::Add, c(1.0), un(UnaryOp::Tanh, v(u))),
+                        ),
+                    },
+                    st(out_buf, row.clone(), bin(BinOp::Mul, v(gelu), v(acc_u))),
+                ],
+            },
+        ];
+        if exact_rows {
+            stmts.extend(reduce_store);
+        } else {
+            stmts.push(KirStmt::If {
+                cond: gt(cu(rows as u32), row),
+                body: reduce_store,
+            });
+        }
     }
     Ok(stmts)
 }
@@ -1520,7 +2483,9 @@ fn lower_matvec_qkv(
     q_rows: usize,
     kv_rows: usize,
     cols: usize,
-    weight_dtype: DType,
+    wq_dtype: DType,
+    wk_dtype: DType,
+    wv_dtype: DType,
     sched: OptSchedule,
     x_buf: u32,
     out_q: u32,
@@ -1529,8 +2494,17 @@ fn lower_matvec_qkv(
     rms: Option<(u32, f32)>,
     next: &mut u32,
 ) -> Result<Vec<KirStmt>, CodegenError> {
+    let weight_dtype = wq_dtype;
     let tg = effective_tg(weight_dtype, cols, sched.tg);
-    let vec = effective_vec(weight_dtype, cols, sched.vec);
+    let vec = if packed_k_quant(wq_dtype) || packed_k_quant(wk_dtype) || packed_k_quant(wv_dtype) {
+        if matches!(wq_dtype, DType::Q6K) || matches!(wk_dtype, DType::Q6K) || matches!(wv_dtype, DType::Q6K) {
+            1
+        } else {
+            effective_vec(weight_dtype, cols, sched.vec)
+        }
+    } else {
+        effective_vec(weight_dtype, cols, sched.vec)
+    };
     let unroll = sched.unroll;
     let nr = sched.nr0.max(1);
     let stride = tg * u64::from(vec);
@@ -1629,7 +2603,7 @@ fn lower_matvec_qkv(
                     ),
                 }],
             });
-            if weight_dtype != DType::Q4K {
+            if !packed_k_quant(weight_dtype) {
                 let b_scalar = if let Some(tg_id) = tg_x {
                     tg_load(tg_id, uv(k))
                 } else {
@@ -1647,7 +2621,7 @@ fn lower_matvec_qkv(
                             v(acc),
                             bin(
                                 BinOp::Mul,
-                                ld(0, bin(BinOp::Add, uv(base), uv(k)), weight_dtype),
+                                ld(0, bin(BinOp::Add, uv(base), uv(k)), wq_dtype),
                                 b_scalar,
                             ),
                         ),
@@ -1702,7 +2676,7 @@ fn lower_matvec_qkv(
                     expr: bin(
                         BinOp::Add,
                         v(acc_k),
-                        vec_dot(1, a_idx.clone(), x_buf, off.clone(), vec, weight_dtype, tg_x),
+                        vec_dot(1, a_idx.clone(), x_buf, off.clone(), vec, wq_dtype, tg_x),
                     ),
                 });
                 main_body.push(KirStmt::Assign {
@@ -1710,7 +2684,7 @@ fn lower_matvec_qkv(
                     expr: bin(
                         BinOp::Add,
                         v(acc_v),
-                        vec_dot(2, a_idx, x_buf, off, vec, weight_dtype, tg_x),
+                        vec_dot(2, a_idx, x_buf, off, vec, wk_dtype, tg_x),
                     ),
                 });
             }
@@ -1734,7 +2708,7 @@ fn lower_matvec_qkv(
                             expr: bin(
                                 BinOp::Add,
                                 v(acc_k),
-                                vec_dot(1, a_idx.clone(), x_buf, uv(k), vec, weight_dtype, tg_x),
+                                vec_dot(1, a_idx.clone(), x_buf, uv(k), vec, wk_dtype, tg_x),
                             ),
                         },
                         KirStmt::Assign {
@@ -1742,13 +2716,13 @@ fn lower_matvec_qkv(
                             expr: bin(
                                 BinOp::Add,
                                 v(acc_v),
-                                vec_dot(2, a_idx, x_buf, uv(k), vec, weight_dtype, tg_x),
+                                vec_dot(2, a_idx, x_buf, uv(k), vec, wv_dtype, tg_x),
                             ),
                         },
                     ]
                 },
             });
-            if weight_dtype != DType::Q4K {
+            if !packed_k_quant(weight_dtype) {
                 let b_scalar = if let Some(tg_id) = tg_x {
                     tg_load(tg_id, uv(k))
                 } else {
@@ -1767,7 +2741,7 @@ fn lower_matvec_qkv(
                                 expr: bin(
                                     BinOp::Add,
                                     v(acc_k),
-                                    bin(BinOp::Mul, ld(1, a_idx.clone(), weight_dtype), b_scalar.clone()),
+                                    bin(BinOp::Mul, ld(1, a_idx.clone(), wk_dtype), b_scalar.clone()),
                                 ),
                             },
                             KirStmt::Assign {
@@ -1775,7 +2749,7 @@ fn lower_matvec_qkv(
                                 expr: bin(
                                     BinOp::Add,
                                     v(acc_v),
-                                    bin(BinOp::Mul, ld(2, a_idx, weight_dtype), b_scalar),
+                                    bin(BinOp::Mul, ld(2, a_idx, wv_dtype), b_scalar),
                                 ),
                             },
                         ]
@@ -1884,6 +2858,148 @@ fn lower_copy_scale(
             ld(0, bin(BinOp::Add, cu(src_off as u32), g), dt),
         ),
     )]
+}
+
+/// `out0 = residual + rms(y)*w_post`, `out1 = rms(out0)*w_ffn`.
+/// Stages residual stream in LOCAL between the two ThreadgroupReduce phases.
+/// Inputs: 0=y, 1=w_post, 2=residual, 3=w_ffn; outs: n_in+0, n_in+1.
+fn lower_rmsnorm_add_then_rmsnorm(
+    n: usize,
+    eps: f32,
+    dt: DType,
+    tg: u64,
+    next: &mut u32,
+) -> Result<Vec<KirStmt>, CodegenError> {
+    if n.saturating_mul(4) > TG_X_BYTES_MAX {
+        return Err(CodegenError::Msg(
+            "rmsnorm_add_then_rmsnorm requires LOCAL staging of residual stream".into(),
+        ));
+    }
+    let n_in = 4u32;
+    let out_x = n_in;
+    let out_x2 = n_in + 1;
+    let tg_id = 0u32;
+    let ss = fresh(next);
+    let i = fresh(next);
+    let inv = fresh(next);
+    let j = fresh(next);
+    let ss2 = fresh(next);
+    let i2 = fresh(next);
+    let inv2 = fresh(next);
+    let j2 = fresh(next);
+    let body = vec![
+        KirStmt::TgDeclF32 { id: tg_id, n },
+        KirStmt::Let {
+            id: ss,
+            expr: c(0.0),
+        },
+        KirStmt::LetU32 {
+            id: i,
+            expr: lid(),
+        },
+        KirStmt::ForRange {
+            id: i,
+            limit_off: cu(0),
+            bound: cu(n as u32),
+            step: cu(tg as u32),
+            body: vec![KirStmt::Assign {
+                id: ss,
+                expr: bin(
+                    BinOp::Add,
+                    v(ss),
+                    bin(BinOp::Mul, ld(0, uv(i), dt), ld(0, uv(i), dt)),
+                ),
+            }],
+        },
+        KirStmt::ThreadgroupReduce { acc_id: ss, tg },
+        KirStmt::Let {
+            id: inv,
+            expr: un(
+                UnaryOp::Rsqrt,
+                bin(BinOp::Add, bin(BinOp::Div, v(ss), c(n as f32)), c(eps)),
+            ),
+        },
+        KirStmt::LetU32 {
+            id: j,
+            expr: lid(),
+        },
+        KirStmt::ForRange {
+            id: j,
+            limit_off: cu(0),
+            bound: cu(n as u32),
+            step: cu(tg as u32),
+            body: {
+                let val = bin(
+                    BinOp::Add,
+                    ld(2, uv(j), dt),
+                    bin(
+                        BinOp::Mul,
+                        bin(BinOp::Mul, ld(0, uv(j), dt), v(inv)),
+                        ld(1, uv(j), dt),
+                    ),
+                );
+                vec![
+                    KirStmt::TgStore {
+                        id: tg_id,
+                        idx: uv(j),
+                        val: val.clone(),
+                    },
+                    st(out_x, uv(j), val),
+                ]
+            },
+        },
+        KirStmt::Barrier,
+        KirStmt::Let {
+            id: ss2,
+            expr: c(0.0),
+        },
+        KirStmt::LetU32 {
+            id: i2,
+            expr: lid(),
+        },
+        KirStmt::ForRange {
+            id: i2,
+            limit_off: cu(0),
+            bound: cu(n as u32),
+            step: cu(tg as u32),
+            body: vec![KirStmt::Assign {
+                id: ss2,
+                expr: bin(
+                    BinOp::Add,
+                    v(ss2),
+                    bin(BinOp::Mul, tg_load(tg_id, uv(i2)), tg_load(tg_id, uv(i2))),
+                ),
+            }],
+        },
+        KirStmt::ThreadgroupReduce { acc_id: ss2, tg },
+        KirStmt::Let {
+            id: inv2,
+            expr: un(
+                UnaryOp::Rsqrt,
+                bin(BinOp::Add, bin(BinOp::Div, v(ss2), c(n as f32)), c(eps)),
+            ),
+        },
+        KirStmt::LetU32 {
+            id: j2,
+            expr: lid(),
+        },
+        KirStmt::ForRange {
+            id: j2,
+            limit_off: cu(0),
+            bound: cu(n as u32),
+            step: cu(tg as u32),
+            body: vec![st(
+                out_x2,
+                uv(j2),
+                bin(
+                    BinOp::Mul,
+                    bin(BinOp::Mul, tg_load(tg_id, uv(j2)), v(inv2)),
+                    ld(3, uv(j2), dt),
+                ),
+            )],
+        },
+    ];
+    Ok(body)
 }
 
 fn lower_rmsnorm(
@@ -2201,6 +3317,15 @@ fn dot_qkv(
 
 fn lower_sdpa_online(hd: usize, max_t: usize, dt: DType, tg: u64, next: &mut u32) -> Vec<KirStmt> {
     let _ = max_t;
+    // float4 along hd when one simdgroup owns contiguous chunks (tg==32, hd%128==0).
+    let vec = if tg == 32 && hd % (32 * 4) == 0 {
+        4u32
+    } else {
+        1u32
+    };
+    let step = (tg as u32) * vec;
+    let one_sg = tg <= 32;
+
     let head = gid();
     let tlen_f = fresh(next);
     let start_f = fresh(next);
@@ -2250,28 +3375,37 @@ fn lower_sdpa_online(hd: usize, max_t: usize, dt: DType, tg: u64, next: &mut u32
             id: lsum,
             expr: c(0.0),
         },
-        // zero LOCAL output
+        // zero LOCAL output (each lane owns lid*vec + k, stride tg*vec)
         KirStmt::LetU32 {
             id: d0,
-            expr: lid(),
+            expr: bin(BinOp::Mul, lid(), cu(vec)),
         },
         KirStmt::ForRange {
             id: d0,
             limit_off: cu(0),
             bound: cu(hd as u32),
-            step: cu(tg as u32),
-            body: vec![KirStmt::TgStore {
-                id: o_tg,
-                idx: uv(d0),
-                val: c(0.0),
-            }],
-        },
-        KirStmt::Barrier,
-        KirStmt::LetU32 {
-            id: t,
-            expr: cu(0),
+            step: cu(step),
+            body: (0..vec)
+                .map(|i| KirStmt::TgStore {
+                    id: o_tg,
+                    idx: if i == 0 {
+                        uv(d0)
+                    } else {
+                        bin(BinOp::Add, uv(d0), cu(i))
+                    },
+                    val: c(0.0),
+                })
+                .collect(),
         },
     ];
+    // Cross-lane TG publish only needed when >1 simdgroup shares o[].
+    if !one_sg {
+        stmts.push(KirStmt::Barrier);
+    }
+    stmts.push(KirStmt::LetU32 {
+        id: t,
+        expr: cu(0),
+    });
 
     // Online softmax over t ∈ [0, tlen)
     let mut pass = Vec::new();
@@ -2281,7 +3415,7 @@ fn lower_sdpa_online(hd: usize, max_t: usize, dt: DType, tg: u64, next: &mut u32
     });
     pass.push(KirStmt::LetU32 {
         id: d1,
-        expr: lid(),
+        expr: bin(BinOp::Mul, lid(), cu(vec)),
     });
     let kv_base = fresh(next);
     pass.push(KirStmt::LetU32 {
@@ -2296,21 +3430,40 @@ fn lower_sdpa_online(hd: usize, max_t: usize, dt: DType, tg: u64, next: &mut u32
         id: d1,
         limit_off: cu(0),
         bound: cu(hd as u32),
-        step: cu(tg as u32),
+        step: cu(step),
         body: vec![KirStmt::Assign {
             id: s,
             expr: bin(
                 BinOp::Add,
                 v(s),
-                bin(
-                    BinOp::Mul,
-                    ld(0, bin(BinOp::Add, uv(q_base), uv(d1)), dt),
-                    ld(1, bin(BinOp::Add, uv(kv_base), uv(d1)), dt),
-                ),
+                if vec > 1 {
+                    vec_dot(
+                        0,
+                        bin(BinOp::Add, uv(q_base), uv(d1)),
+                        1,
+                        bin(BinOp::Add, uv(kv_base), uv(d1)),
+                        vec,
+                        dt,
+                        None,
+                    )
+                } else {
+                    bin(
+                        BinOp::Mul,
+                        ld(0, bin(BinOp::Add, uv(q_base), uv(d1)), dt),
+                        ld(1, bin(BinOp::Add, uv(kv_base), uv(d1)), dt),
+                    )
+                },
             ),
         }],
     });
-    pass.push(KirStmt::ThreadgroupReduce { acc_id: s, tg });
+    if one_sg {
+        pass.push(KirStmt::Assign {
+            id: s,
+            expr: KirExpr::SimdSum(Box::new(v(s))),
+        });
+    } else {
+        pass.push(KirStmt::ThreadgroupReduce { acc_id: s, tg });
+    }
     pass.push(KirStmt::Let {
         id: m2,
         expr: bin(BinOp::Max, v(m), v(s)),
@@ -2333,28 +3486,39 @@ fn lower_sdpa_online(hd: usize, max_t: usize, dt: DType, tg: u64, next: &mut u32
     });
     pass.push(KirStmt::LetU32 {
         id: d2,
-        expr: lid(),
+        expr: bin(BinOp::Mul, lid(), cu(vec)),
     });
     pass.push(KirStmt::ForRange {
         id: d2,
         limit_off: cu(0),
         bound: cu(hd as u32),
-        step: cu(tg as u32),
-        body: vec![KirStmt::TgStore {
-            id: o_tg,
-            idx: uv(d2),
-            val: bin(
-                BinOp::Add,
-                bin(BinOp::Mul, tg_load(o_tg, uv(d2)), v(alpha)),
-                bin(
-                    BinOp::Mul,
-                    v(e),
-                    ld(2, bin(BinOp::Add, uv(kv_base), uv(d2)), dt),
-                ),
-            ),
-        }],
+        step: cu(step),
+        body: (0..vec)
+            .map(|i| {
+                let di = if i == 0 {
+                    uv(d2)
+                } else {
+                    bin(BinOp::Add, uv(d2), cu(i))
+                };
+                KirStmt::TgStore {
+                    id: o_tg,
+                    idx: di.clone(),
+                    val: bin(
+                        BinOp::Add,
+                        bin(BinOp::Mul, tg_load(o_tg, di.clone()), v(alpha)),
+                        bin(
+                            BinOp::Mul,
+                            v(e),
+                            ld(2, bin(BinOp::Add, uv(kv_base), di), dt),
+                        ),
+                    ),
+                }
+            })
+            .collect(),
     });
-    pass.push(KirStmt::Barrier);
+    if !one_sg {
+        pass.push(KirStmt::Barrier);
+    }
     stmts.push(KirStmt::ForRange {
         id: t,
         limit_off: cu(0),
@@ -2370,18 +3534,27 @@ fn lower_sdpa_online(hd: usize, max_t: usize, dt: DType, tg: u64, next: &mut u32
     });
     stmts.push(KirStmt::LetU32 {
         id: d3,
-        expr: lid(),
+        expr: bin(BinOp::Mul, lid(), cu(vec)),
     });
     stmts.push(KirStmt::ForRange {
         id: d3,
         limit_off: cu(0),
         bound: cu(hd as u32),
-        step: cu(tg as u32),
-        body: vec![st(
-            4,
-            bin(BinOp::Add, uv(q_base), uv(d3)),
-            bin(BinOp::Mul, tg_load(o_tg, uv(d3)), v(inv_l)),
-        )],
+        step: cu(step),
+        body: (0..vec)
+            .map(|i| {
+                let di = if i == 0 {
+                    uv(d3)
+                } else {
+                    bin(BinOp::Add, uv(d3), cu(i))
+                };
+                st(
+                    4,
+                    bin(BinOp::Add, uv(q_base), di.clone()),
+                    bin(BinOp::Mul, tg_load(o_tg, di), v(inv_l)),
+                )
+            })
+            .collect(),
     });
     stmts
 }
@@ -2402,20 +3575,7 @@ fn lower_softcap_argmax(
     let best_v = fresh(next);
     let i = fresh(next);
     let val = fresh(next);
-    let j = fresh(next);
-    let acc_v = fresh(next);
-    let acc_i = fresh(next);
-    let tg_v = 0u32;
-    let tg_i = 1u32;
     vec![
-        KirStmt::TgDeclF32 {
-            id: tg_v,
-            n: tg as usize,
-        },
-        KirStmt::TgDeclF32 {
-            id: tg_i,
-            n: tg as usize,
-        },
         KirStmt::Let {
             id: best_v,
             expr: c(-1.0e30),
@@ -2460,59 +3620,14 @@ fn lower_softcap_argmax(
                 },
             ],
         },
-        KirStmt::TgStore {
-            id: tg_v,
-            idx: lid(),
-            val: v(best_v),
+        KirStmt::ThreadgroupArgmax {
+            val_id: best_v,
+            idx_id: best_i,
+            tg,
         },
-        KirStmt::TgStore {
-            id: tg_i,
-            idx: lid(),
-            val: v(best_i),
-        },
-        KirStmt::Barrier,
         KirStmt::If {
             cond: eq(lid(), cu(0)),
-            body: vec![
-                KirStmt::Let {
-                    id: acc_v,
-                    expr: tg_load(tg_v, cu(0)),
-                },
-                KirStmt::Let {
-                    id: acc_i,
-                    expr: tg_load(tg_i, cu(0)),
-                },
-                KirStmt::LetU32 {
-                    id: j,
-                    expr: cu(1),
-                },
-                KirStmt::ForRange {
-                    id: j,
-                    limit_off: cu(0),
-                    bound: cu(tg as u32),
-                    step: cu(1),
-                    body: vec![
-                        KirStmt::Let {
-                            id: val,
-                            expr: tg_load(tg_v, uv(j)),
-                        },
-                        KirStmt::If {
-                            cond: gt(v(val), v(acc_v)),
-                            body: vec![
-                                KirStmt::Assign {
-                                    id: acc_v,
-                                    expr: v(val),
-                                },
-                                KirStmt::Assign {
-                                    id: acc_i,
-                                    expr: tg_load(tg_i, uv(j)),
-                                },
-                            ],
-                        },
-                    ],
-                },
-                st(1, cu(0), v(acc_i)),
-            ],
+            body: vec![st(1, cu(0), v(best_i))],
         },
     ]
 }

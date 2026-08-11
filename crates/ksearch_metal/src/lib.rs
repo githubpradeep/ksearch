@@ -46,6 +46,7 @@ impl MetalContext {
 
     pub fn compile(&self, kernel: &MetalKernelSource) -> Result<ComputePipelineState> {
         let options = CompileOptions::new();
+        options.set_fast_math_enabled(true);
         let library = self
             .device
             .new_library_with_source(&kernel.source, &options)

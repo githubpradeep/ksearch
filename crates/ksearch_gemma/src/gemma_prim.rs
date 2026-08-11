@@ -3,7 +3,7 @@
 
 use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
 use anyhow::{anyhow, bail, Result};
-use ksearch_gguf::{f32_to_f16, ggml_type, Gguf};
+use ksearch_gguf::{f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
 use ksearch_ir::DType;
 use ksearch_kernels::Eng;
 use ksearch_metal::MetalContext;
@@ -17,19 +17,52 @@ const PREFILL_CHUNK: usize = 32;
 enum WeightBuf {
     F16(Buffer),
     Q4K(Buffer),
+    Q6K(Buffer),
 }
+
+fn is_packed(d: DType) -> bool {
+    matches!(d, DType::Q4K | DType::Q6K)
+}
+
+/// Host-side RoPE table: for each pos, `hd` F16s = cos[0..half) || sin[0..half).
+fn precompute_rope_table(max_seq: usize, hd: usize, theta: f32, rope_angles: usize) -> Vec<u8> {
+    let half = hd / 2;
+    let rope_angles = rope_angles.min(half);
+    let mut out = vec![0u16; max_seq * hd];
+    for pos in 0..max_seq {
+        let base = pos * hd;
+        for i in 0..half {
+            if i < rope_angles {
+                let freq = 1.0 / theta.powf((2 * i) as f32 / hd as f32);
+                let ang = pos as f32 * freq;
+                out[base + i] = f32_to_f16(ang.cos());
+                out[base + half + i] = f32_to_f16(ang.sin());
+            } else {
+                out[base + i] = f32_to_f16(1.0);
+                out[base + half + i] = f32_to_f16(0.0);
+            }
+        }
+    }
+    let mut bytes = Vec::with_capacity(out.len() * 2);
+    for v in out {
+        bytes.extend_from_slice(&v.to_ne_bytes());
+    }
+    bytes
+}
+
 
 impl WeightBuf {
     fn dtype(&self) -> DType {
         match self {
             WeightBuf::F16(_) => DType::F16,
             WeightBuf::Q4K(_) => DType::Q4K,
+            WeightBuf::Q6K(_) => DType::Q6K,
         }
     }
 
     fn buf(&self) -> &Buffer {
         match self {
-            WeightBuf::F16(b) | WeightBuf::Q4K(b) => b,
+            WeightBuf::F16(b) | WeightBuf::Q4K(b) | WeightBuf::Q6K(b) => b,
         }
     }
 }
@@ -58,13 +91,18 @@ pub struct GemmaPrimModel {
     logits: Buffer,
     argmax_out: Buffer,
     ple_tok: Buffer,
+    /// Double-buffer host→GPU PLE token rows.
+    ple_stage: [Buffer; 2],
     ple_ctx: Buffer,
     ple_tmp: Buffer,
     ple_gate: Buffer,
     ple_u: Buffer,
     ple_proj: Buffer,
     meta: Vec<Buffer>,
-    cos_sin: Vec<Buffer>,
+    rope_swa: Buffer,
+    rope_full: Buffer,
+    hd_swa: usize,
+    hd_full: usize,
     /// F16 KV caches [max_seq × hd] per owning layer.
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
@@ -149,14 +187,23 @@ impl GemmaPrimModel {
         }
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
-        let mut cos_sin = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
             meta.push(
                 ctx.device
                     .new_buffer(32, metal::MTLResourceOptions::StorageModeShared),
             );
-            cos_sin.push(ctx.buffer_empty_f16(max_hd));
         }
+        let rope_swa = {
+            let hd = cfg.head_dim_swa;
+            let bytes = precompute_rope_table(max_seq, hd, cfg.rope_theta_swa, hd / 2);
+            ctx.buffer_bytes(&bytes)
+        };
+        let rope_full = {
+            let hd = cfg.head_dim_full;
+            let angles = ((hd as f32) * cfg.partial_rotary) as usize / 2;
+            let bytes = precompute_rope_table(max_seq, hd, cfg.rope_theta_full, angles);
+            ctx.buffer_bytes(&bytes)
+        };
 
         let x = ctx.buffer_empty_f16(cfg.hidden);
         let x2 = ctx.buffer_empty_f16(cfg.hidden);
@@ -170,6 +217,10 @@ impl GemmaPrimModel {
         let logits = ctx.buffer_empty_f16(cfg.vocab);
         let argmax_out = ctx.buffer_empty_f32(1);
         let ple_tok = ctx.buffer_empty_f16(ple_total);
+        let ple_stage = [
+            ctx.buffer_empty_f16(ple_total),
+            ctx.buffer_empty_f16(ple_total),
+        ];
         let ple_ctx = ctx.buffer_empty_f16(ple_total);
         let ple_tmp = ctx.buffer_empty_f16(ple_total);
         let ple_gate = ctx.buffer_empty_f16(cfg.ple_dim);
@@ -215,7 +266,7 @@ impl GemmaPrimModel {
         }
 
         eprintln!("[prim] load complete");
-        Ok(Self {
+        let mut model = Self {
             cfg: cfg.clone(),
             vocab,
             gguf: g,
@@ -237,31 +288,85 @@ impl GemmaPrimModel {
             logits,
             argmax_out,
             ple_tok,
+            ple_stage,
             ple_ctx,
             ple_tmp,
             ple_gate,
             ple_u,
             ple_proj,
             meta,
-            cos_sin,
+            rope_swa,
+            rope_full,
+            hd_swa: cfg.head_dim_swa,
+            hd_full: cfg.head_dim_full,
             kv_k,
             kv_v,
             eng,
             weight_bufs: HashMap::new(),
             max_seq,
             pos: 0,
-        })
+        };
+        if model.gguf.has_tensor("per_layer_model_proj.weight") {
+            let scale = 1.0 / (model.cfg.hidden as f32).sqrt();
+            let mut f = model.gguf.dequant_to_f32("per_layer_model_proj.weight");
+            assert!(f.len() % 256 == 0);
+            for v in &mut f { *v *= scale; }
+            let q4 = quantize_f32_to_q4k(&f);
+            eprintln!("[prim] per_layer_model_proj → Q4_K ({:.1} MB)", q4.len() as f64 / 1e6);
+            model.weight_bufs.insert(
+                "per_layer_model_proj.weight".into(),
+                WeightBuf::Q4K(model.ctx.buffer_bytes(&q4)),
+            );
+        }
+        for layer in 0..model.cfg.n_layers {
+            let pref = format!("blk.{layer}.");
+            for name in [
+                "attn_q.weight","attn_k.weight","attn_v.weight","attn_output.weight",
+                "ffn_gate.weight","ffn_up.weight","ffn_down.weight",
+                "inp_gate.weight","proj.weight",
+            ] {
+                let full = format!("{pref}{name}");
+                if model.gguf.has_tensor(&full) {
+                    model.ensure_weight(&full)?;
+                }
+            }
+        }
+        Ok(model)
     }
 
     fn ensure_weight(&mut self, name: &str) -> Result<()> {
         if self.weight_bufs.contains_key(name) {
             return Ok(());
         }
-        let buf = if self.gguf.tensor_type(name) == ggml_type::Q4_K {
+        let ty = self.gguf.tensor_type(name);
+        let buf = if ty == ggml_type::Q4_K {
             WeightBuf::Q4K(self.ctx.buffer_bytes(self.gguf.tensor_raw(name)))
+        } else if ty == ggml_type::Q6_K
+            && (name.ends_with("ffn_down.weight") || name.ends_with("attn_v.weight"))
+        {
+            // Host-requant Q6→Q4 for faster coop matvec (ffn_down + attn_v).
+            let f = self.gguf.dequant_to_f32(name);
+            assert!(f.len() % 256 == 0, "{name}: elems {} not multiple of 256", f.len());
+            let q4 = quantize_f32_to_q4k(&f);
+            eprintln!(
+                "[prim] {name} Q6_K → Q4_K host-requant ({:.1} MB)",
+                q4.len() as f64 / 1e6
+            );
+            WeightBuf::Q4K(self.ctx.buffer_bytes(&q4))
+        } else if ty == ggml_type::Q6_K {
+            eprintln!("[prim] {name} Q6_K native");
+            WeightBuf::Q6K(self.ctx.buffer_bytes(self.gguf.tensor_raw(name)))
         } else {
-            // Non-Q4: dequant → F16 (tinygrad ggml_data_to_tensor → .half()).
-            WeightBuf::F16(self.ctx.buffer_bytes(&self.gguf.dequant_to_f16_bytes(name)))
+            // PLE F32/BF16 etc.: host-quantize to Q4_K for coop path.
+            let f = self.gguf.dequant_to_f32(name);
+            assert!(f.len() % 256 == 0, "{name}: elems {} not multiple of 256", f.len());
+            let q4 = quantize_f32_to_q4k(&f);
+            eprintln!(
+                "[prim] {name} {} → Q4_K ({:.1} MB)",
+                ksearch_gguf::ggml_type_name(ty),
+                q4.len() as f64 / 1e6
+            );
+            WeightBuf::Q4K(self.ctx.buffer_bytes(&q4))
         };
         self.weight_bufs.insert(name.to_string(), buf);
         Ok(())
@@ -297,6 +402,10 @@ impl GemmaPrimModel {
         let w = self.weight_bufs.get(w_name).unwrap();
         let wd = w.dtype();
         let w = w.buf().clone();
+        if is_packed(wd) {
+            self.eng.rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+            return self.eng.matvec_wd(&self.ctx, rows, cols, wd, &w, &self.x2, &y);
+        }
         self.eng
             .rmsnorm_matvec_wd(&self.ctx, rows, cols, eps, wd, &x, w_norm, &w, &y)
     }
@@ -325,7 +434,7 @@ impl GemmaPrimModel {
         let wq = self.weight_bufs.get(q_name).unwrap().buf().clone();
         let wk = self.weight_bufs.get(k_name).unwrap().buf().clone();
         let wv = self.weight_bufs.get(v_name).unwrap().buf().clone();
-        if dq == dk && dk == dv {
+        if dq == dk && dk == dv && !is_packed(dq) {
             return self.eng.rmsnorm_matvec_qkv_wd(
                 &self.ctx,
                 q_rows,
@@ -372,6 +481,13 @@ impl GemmaPrimModel {
         let du = self.weight_bufs.get(up_name).unwrap().dtype();
         let wg = self.weight_bufs.get(gate_name).unwrap().buf().clone();
         let wu = self.weight_bufs.get(up_name).unwrap().buf().clone();
+        if dg == du && is_packed(dg) {
+            self.eng
+                .rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+            return self.eng.matvec_gate_up_gelu_wd(
+                &self.ctx, rows, cols, dg, &wg, &wu, &self.x2, &y,
+            );
+        }
         if dg == du {
             return self.eng.rmsnorm_matvec_gate_up_gelu_wd(
                 &self.ctx,
@@ -406,24 +522,6 @@ impl GemmaPrimModel {
         }
     }
 
-    fn fill_cos_sin(&self, layer: usize, pos: usize, hd: usize, theta: f32, rope_angles: usize) {
-        let ptr = self.cos_sin[layer].contents() as *mut u16;
-        let half = hd / 2;
-        let rope_angles = rope_angles.min(half);
-        unsafe {
-            for i in 0..half {
-                if i < rope_angles {
-                    let freq = 1.0 / theta.powf((2 * i) as f32 / hd as f32);
-                    let ang = pos as f32 * freq;
-                    *ptr.add(i) = f32_to_f16(ang.cos());
-                    *ptr.add(half + i) = f32_to_f16(ang.sin());
-                } else {
-                    *ptr.add(i) = f32_to_f16(1.0);
-                    *ptr.add(half + i) = f32_to_f16(0.0);
-                }
-            }
-        }
-    }
 
     fn embed_token(&mut self, token: u32) -> Result<()> {
         let h = self.cfg.hidden;
@@ -440,20 +538,20 @@ impl GemmaPrimModel {
                     0,
                 )?;
             }
-            WeightBuf::Q4K(_) => {
-                // Row lookup: host-dequant one Q4_K row → F16 activation (acts stay F16).
-                let mut row = self
-                    .gguf
-                    .dequant_row("token_embd.weight", token as usize);
-                for v in &mut row {
-                    *v *= scale;
-                }
-                let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
-                if self.ctx.has_gpu_work() {
-                    self.ctx.synchronize()?;
-                }
-                self.ctx.write_u16s_nosync(&self.x, &row_h);
+            WeightBuf::Q4K(embd) => {
+                let row_bytes = (h / 256) * 144;
+                self.eng.copy_scale_wd(
+                    &self.ctx,
+                    h,
+                    scale,
+                    DType::Q4K,
+                    embd,
+                    token as usize * row_bytes,
+                    &self.x,
+                    0,
+                )?;
             }
+            WeightBuf::Q6K(_) => bail!("token_embd Q6_K embed not wired"),
         }
         Ok(())
     }
@@ -467,12 +565,22 @@ impl GemmaPrimModel {
             *v *= scale;
         }
         let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
-        // Avoid a full GPU sync on every token: decode already synced on prior argmax read;
-        // during prefill, flush+wait only if work is in flight.
         if self.ctx.has_gpu_work() {
-            self.ctx.synchronize()?;
+            self.ctx.wait_inflight_at_most(1);
+            let stage = &self.ple_stage[self.pos & 1];
+            self.ctx.write_u16s_nosync(stage, &row_h);
+            self.eng.copy_scale(
+                &self.ctx,
+                self.cfg.ple_total(),
+                1.0,
+                stage,
+                0,
+                &self.ple_tok,
+                0,
+            )?;
+        } else {
+            self.ctx.write_u16s_nosync(&self.ple_tok, &row_h);
         }
-        self.ctx.write_u16s_nosync(&self.ple_tok, &row_h);
         Ok(())
     }
 
@@ -482,7 +590,6 @@ impl GemmaPrimModel {
         let n_layers = self.cfg.n_layers;
         let ple_dim = self.cfg.ple_dim;
         let eps = self.cfg.rms_eps;
-        let inv_sqrt_h = 1.0 / (h as f32).sqrt();
         let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
 
         self.matvec_w(
@@ -492,54 +599,26 @@ impl GemmaPrimModel {
             self.x.clone(),
             self.ple_tmp.clone(),
         )?;
-        self.eng.scale_const(
-            &self.ctx,
-            ple_total,
-            inv_sqrt_h,
-            &self.ple_tmp,
-            &self.ple_ctx,
-        )?;
         self.eng.rmsnorm_per_head(
             &self.ctx,
             n_layers,
             ple_dim,
             eps,
-            &self.ple_ctx,
-            &self.ple_proj_norm,
             &self.ple_tmp,
+            &self.ple_proj_norm,
+            &self.ple_ctx,
         )?;
-        self.eng
-            .add(&self.ctx, ple_total, &self.ple_tmp, &self.ple_tok, &self.ple_ctx)?;
-        self.eng.scale_const(
+        self.eng.add_scale(
             &self.ctx,
             ple_total,
             inv_sqrt2,
             &self.ple_ctx,
+            &self.ple_tok,
             &self.ple_ctx,
         )?;
         Ok(())
     }
 
-    fn kv_append_f16(&mut self, kv_src: usize, hd: usize) -> Result<()> {
-        let pos = self.pos;
-        self.eng.copy_slice(
-            &self.ctx,
-            hd,
-            &self.tmp_k,
-            0,
-            &self.kv_k[kv_src],
-            pos * hd,
-        )?;
-        self.eng.copy_slice(
-            &self.ctx,
-            hd,
-            &self.tmp_v,
-            0,
-            &self.kv_v[kv_src],
-            pos * hd,
-        )?;
-        Ok(())
-    }
 
     fn forward_token(&mut self, token: u32, want_logits: bool) -> Result<Option<u32>> {
         if self.pos >= self.max_seq {
@@ -577,17 +656,13 @@ impl GemmaPrimModel {
                 (lw.q_rows, lw.kv_rows, lw.o_in, lw.ffn_inter, lw.hd)
             };
             let is_swa = self.cfg.is_swa(layer);
-            let theta = if is_swa {
-                self.cfg.rope_theta_swa
+            let rope_hd = if is_swa { self.hd_swa } else { self.hd_full };
+            let rope_buf = if is_swa {
+                self.rope_swa.clone()
             } else {
-                self.cfg.rope_theta_full
+                self.rope_full.clone()
             };
-            let rotary_dim = if is_swa {
-                hd
-            } else {
-                ((hd as f32) * self.cfg.partial_rotary) as usize
-            };
-            let rope_angles = rotary_dim / 2;
+            let rope_off = self.pos * rope_hd;
             let pref = format!("blk.{layer}.");
             let owns_kv = self.cfg.owns_kv(layer);
             let kv_src = self.cfg.kv_source(layer);
@@ -621,37 +696,40 @@ impl GemmaPrimModel {
                 )?;
             }
 
-            self.fill_cos_sin(layer, self.pos, hd, theta, rope_angles);
-            self.eng.rmsnorm_per_head_rope(
+            self.eng.rmsnorm_per_head_rope_off(
                 &self.ctx,
                 n_heads,
                 hd,
                 eps,
                 &self.tmp_q,
                 &self.layer_norms[layer].q_norm,
-                &self.cos_sin[layer],
+                &rope_buf,
+                rope_off,
                 &self.tmp_q,
+                0,
             )?;
             if owns_kv {
-                self.eng.rmsnorm_per_head_rope(
+                self.eng.rmsnorm_per_head_rope_off(
                     &self.ctx,
                     self.cfg.n_kv,
                     hd,
                     eps,
                     &self.tmp_k,
                     &self.layer_norms[layer].k_norm,
-                    &self.cos_sin[layer],
-                    &self.tmp_k,
+                    &rope_buf,
+                    rope_off,
+                    &self.kv_k[kv_src],
+                    self.pos * hd,
                 )?;
-                self.eng.rmsnorm_noweight(
+                self.eng.rmsnorm_noweight_off(
                     &self.ctx,
                     self.cfg.n_kv,
                     hd,
                     eps,
                     &self.tmp_v,
-                    &self.tmp_v,
+                    &self.kv_v[kv_src],
+                    self.pos * hd,
                 )?;
-                self.kv_append_f16(kv_src, hd)?;
             }
 
             let kv_len = self.pos + 1;
@@ -675,56 +753,121 @@ impl GemmaPrimModel {
             )?;
 
             self.matvec_w(h, o_in, &format!("{pref}attn_output.weight"), self.tmp_o.clone(), self.x2.clone())?;
-            self.eng.rmsnorm_add(
-                &self.ctx,
-                h,
-                eps,
-                &self.x2,
-                &self.layer_norms[layer].post_attn_norm,
-                &self.x,
-                &self.x,
-            )?;
-            if let Some(ts) = t_section {
-                self.ctx.synchronize()?;
-                ms_attn += ts.elapsed().as_secs_f64() * 1e3;
-            }
-            let t_mlp = if profile {
-                Some(Instant::now())
-            } else {
-                None
-            };
 
-            // MLP: fused rms → gate/up matvec+gelu → down
+            let gate_name = format!("{pref}ffn_gate.weight");
+            let up_name = format!("{pref}ffn_up.weight");
+            self.ensure_weight(&gate_name)?;
+            self.ensure_weight(&up_name)?;
+            let dg = self.weight_bufs.get(&gate_name).unwrap().dtype();
+            let du = self.weight_bufs.get(&up_name).unwrap().dtype();
+            let packed_gate = dg == du && is_packed(dg);
             let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
-            self.rmsnorm_matvec_gate_up_gelu_w(
-                ffn_inter,
-                h,
-                eps,
-                &format!("{pref}ffn_gate.weight"),
-                &format!("{pref}ffn_up.weight"),
-                self.x.clone(),
-                &ffn_norm,
-                self.tmp_ff3.clone(),
-            )?;
-            self.matvec_w(
-                h,
-                ffn_inter,
-                &format!("{pref}ffn_down.weight"),
-                self.tmp_ff3.clone(),
-                self.x2.clone(),
-            )?;
-            self.eng.rmsnorm_add(
-                &self.ctx,
-                h,
-                eps,
-                &self.x2,
-                &self.layer_norms[layer].post_ffw_norm,
-                &self.x,
-                &self.x,
-            )?;
-            if let Some(ts) = t_mlp {
-                self.ctx.synchronize()?;
-                ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+
+            if packed_gate {
+                // Cut one launch: residual+post-attn rms and ffn rms in one TG.
+                if let Some(ts) = t_section {
+                    self.ctx.synchronize()?;
+                    ms_attn += ts.elapsed().as_secs_f64() * 1e3;
+                }
+                let t_mlp = if profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.eng.rmsnorm_add_then_rmsnorm(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_attn_norm,
+                    &self.x,
+                    &ffn_norm,
+                    &self.x,
+                    &self.x2,
+                )?;
+                let wg = self.weight_bufs.get(&gate_name).unwrap().buf().clone();
+                let wu = self.weight_bufs.get(&up_name).unwrap().buf().clone();
+                self.eng.matvec_gate_up_gelu_wd(
+                    &self.ctx,
+                    ffn_inter,
+                    h,
+                    dg,
+                    &wg,
+                    &wu,
+                    &self.x2,
+                    &self.tmp_ff3,
+                )?;
+                self.matvec_w(
+                    h,
+                    ffn_inter,
+                    &format!("{pref}ffn_down.weight"),
+                    self.tmp_ff3.clone(),
+                    self.x2.clone(),
+                )?;
+                self.eng.rmsnorm_add(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_ffw_norm,
+                    &self.x,
+                    &self.x,
+                )?;
+                if let Some(ts) = t_mlp {
+                    self.ctx.synchronize()?;
+                    ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+                }
+            } else {
+                self.eng.rmsnorm_add(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_attn_norm,
+                    &self.x,
+                    &self.x,
+                )?;
+                if let Some(ts) = t_section {
+                    self.ctx.synchronize()?;
+                    ms_attn += ts.elapsed().as_secs_f64() * 1e3;
+                }
+                let t_mlp = if profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+
+                // MLP: fused rms → gate/up matvec+gelu → down
+                self.rmsnorm_matvec_gate_up_gelu_w(
+                    ffn_inter,
+                    h,
+                    eps,
+                    &gate_name,
+                    &up_name,
+                    self.x.clone(),
+                    &ffn_norm,
+                    self.tmp_ff3.clone(),
+                )?;
+                self.matvec_w(
+                    h,
+                    ffn_inter,
+                    &format!("{pref}ffn_down.weight"),
+                    self.tmp_ff3.clone(),
+                    self.x2.clone(),
+                )?;
+                self.eng.rmsnorm_add(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_ffw_norm,
+                    &self.x,
+                    &self.x,
+                )?;
+                if let Some(ts) = t_mlp {
+                    self.ctx.synchronize()?;
+                    ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+                }
             }
             let t_ple_l = if profile {
                 Some(Instant::now())
@@ -732,35 +875,35 @@ impl GemmaPrimModel {
                 None
             };
 
-            // PLE
-            self.matvec_w(
-                ple_dim,
-                h,
-                &format!("{pref}inp_gate.weight"),
-                self.x.clone(),
-                self.ple_gate.clone(),
-            )?;
-            self.eng.gelu_mul_at(
+            // PLE: fuse gate matvec + gelu*ctx, then proj matvec + rmsnorm_add_scale (sequenced).
+            let gate_name = format!("{pref}inp_gate.weight");
+            self.ensure_weight(&gate_name)?;
+            let dg = self.weight_bufs.get(&gate_name).unwrap().dtype();
+            let wg = self.weight_bufs.get(&gate_name).unwrap().buf().clone();
+            self.eng.matvec_gelu_mul_at(
                 &self.ctx,
                 ple_dim,
-                &self.ple_gate,
+                h,
+                dg,
+                &wg,
+                &self.x,
                 &self.ple_ctx,
                 layer * ple_dim,
                 &self.ple_u,
             )?;
-            self.matvec_w(
-                h,
-                ple_dim,
-                &format!("{pref}proj.weight"),
-                self.ple_u.clone(),
-                self.ple_proj.clone(),
-            )?;
-            self.eng.rmsnorm_add_scale(
+            let proj_name = format!("{pref}proj.weight");
+            self.ensure_weight(&proj_name)?;
+            let dp = self.weight_bufs.get(&proj_name).unwrap().dtype();
+            let wp = self.weight_bufs.get(&proj_name).unwrap().buf().clone();
+            self.eng.matvec_rmsnorm_add_scale(
                 &self.ctx,
                 h,
+                ple_dim,
                 eps,
                 self.layer_norms[layer].layer_scale,
-                &self.ple_proj,
+                dp,
+                &wp,
+                &self.ple_u,
                 &self.layer_norms[layer].post_norm,
                 &self.x,
                 &self.x,
@@ -768,6 +911,9 @@ impl GemmaPrimModel {
             if let Some(ts) = t_ple_l {
                 self.ctx.synchronize()?;
                 ms_ple_l += ts.elapsed().as_secs_f64() * 1e3;
+            }
+            if !want_logits && !profile && (layer + 1) % 4 == 0 {
+                self.ctx.flush_async();
             }
         }
 
@@ -786,6 +932,8 @@ impl GemmaPrimModel {
                     (t_layers - t_pre).as_secs_f64() * 1e3,
                     t0.elapsed().as_secs_f64() * 1e3
                 );
+            } else {
+                self.ctx.flush_async();
             }
             return Ok(None);
         }
@@ -796,17 +944,17 @@ impl GemmaPrimModel {
         let cap = self.cfg.softcap;
         let embd_dt = self.token_embd.dtype();
         let embd = self.token_embd.buf().clone();
-        self.eng.rmsnorm_matvec_wd(
-            &self.ctx,
-            vocab,
-            h,
-            eps,
-            embd_dt,
-            &self.x,
-            &self.output_norm,
-            &embd,
-            &self.logits,
-        )?;
+        if is_packed(embd_dt) {
+            self.eng
+                .rmsnorm(&self.ctx, h, eps, &self.x, &self.output_norm, &self.x2)?;
+            self.eng.matvec_wd(
+                &self.ctx, vocab, h, embd_dt, &embd, &self.x2, &self.logits,
+            )?;
+        } else {
+            self.eng.rmsnorm_matvec_wd(
+                &self.ctx, vocab, h, eps, embd_dt, &self.x, &self.output_norm, &embd, &self.logits,
+            )?;
+        }
         self.eng
             .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &self.argmax_out)?;
         let t_logits = t0.elapsed();

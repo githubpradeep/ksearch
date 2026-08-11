@@ -76,6 +76,15 @@ pub enum FuseHint {
         w: TensorId,
         residual: TensorId,
     },
+    /// Attn→MLP boundary: `out_x = residual + rms(y)*w_post`, `out_x2 = rms(out_x)*w_ffn` (2 outs).
+    RmsNormAddThenRmsNorm {
+        n: usize,
+        eps: f32,
+        y: TensorId,
+        w_post: TensorId,
+        residual: TensorId,
+        w_ffn: TensorId,
+    },
     RmsNormPerHead {
         n_heads: usize,
         hd: usize,
@@ -105,6 +114,8 @@ pub enum FuseHint {
         n: usize,
         scale: f32,
         src: TensorId,
+        /// Logical load dtype (F16 or Q4K/Q6K); store uses Call out dtype (F16 for quant).
+        src_dtype: DType,
     },
     GeluMul {
         n: usize,
@@ -119,6 +130,52 @@ pub enum FuseHint {
         gate: TensorId,
         up: TensorId,
         x: TensorId,
+    },
+    /// PLE-style: `out[i] = gelu(W[i]·x) * ctx[ctx_off + i]` (one launch; structure of FUSED_MLP_PLE).
+    MatvecGeluMul {
+        rows: usize,
+        cols: usize,
+        ctx_off: usize,
+        w: TensorId,
+        x: TensorId,
+        ctx: TensorId,
+    },
+    /// Extend MatvecGeluMul with proj + residual rms: `u=gelu(Wg@x)*ctx`; `y=Wp@u`;
+    /// `out = scale * (residual + rmsnorm(y)*w_norm)`. One CALL when `u` fits LOCAL.
+    MatvecGeluMulProjRmsAddScale {
+        gate_rows: usize,
+        cols: usize,
+        proj_rows: usize,
+        ctx_off: usize,
+        eps: f32,
+        scale: f32,
+        w_gate: TensorId,
+        x: TensorId,
+        ctx: TensorId,
+        w_proj: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+    },
+    /// `y = W@x` then `out = residual + rmsnorm(y)*w` (safe when single-TG / short-K).
+    MatvecRmsNormAdd {
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+    },
+    /// Like MatvecRmsNormAdd with `out = scale * (residual + rmsnorm(y)*w)`.
+    MatvecRmsNormAddScale {
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        scale: f32,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
     },
     /// Fused Q/K/V matvecs sharing one LOCAL `x`: `Q=Wq@x`, `K=Wk@x`, `V=Wv@x` (3 outputs).
     MatvecQkv {
@@ -233,6 +290,15 @@ pub enum KernelKind {
         w: TensorId,
         residual: TensorId,
     },
+    /// Two outputs: residual stream + ffn-normalized activations.
+    RmsNormAddThenRmsNorm {
+        n: usize,
+        eps: f32,
+        y: TensorId,
+        w_post: TensorId,
+        residual: TensorId,
+        w_ffn: TensorId,
+    },
     RmsNormPerHead {
         n_heads: usize,
         hd: usize,
@@ -262,6 +328,8 @@ pub enum KernelKind {
         n: usize,
         scale: f32,
         src: TensorId,
+        /// Logical load dtype (F16 or Q4K/Q6K); store uses Call out dtype (F16 for quant).
+        src_dtype: DType,
     },
     GeluMul {
         n: usize,
@@ -277,6 +345,53 @@ pub enum KernelKind {
         x: TensorId,
         weight_dtype: DType,
     },
+    /// `out[i] = gelu(W[i]·x) * ctx[ctx_off + i]`.
+    MatvecGeluMul {
+        rows: usize,
+        cols: usize,
+        ctx_off: usize,
+        w: TensorId,
+        x: TensorId,
+        ctx: TensorId,
+        weight_dtype: DType,
+    },
+    /// PLE: gate gelu*ctx → proj → rmsnorm_add_scale (one launch).
+    MatvecGeluMulProjRmsAddScale {
+        gate_rows: usize,
+        cols: usize,
+        proj_rows: usize,
+        ctx_off: usize,
+        eps: f32,
+        scale: f32,
+        w_gate: TensorId,
+        x: TensorId,
+        ctx: TensorId,
+        w_proj: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+        weight_dtype: DType,
+    },
+    MatvecRmsNormAdd {
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+        weight_dtype: DType,
+    },
+    MatvecRmsNormAddScale {
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        scale: f32,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+        weight_dtype: DType,
+    },
     MatvecQkv {
         q_rows: usize,
         kv_rows: usize,
@@ -285,7 +400,9 @@ pub enum KernelKind {
         wk: TensorId,
         wv: TensorId,
         x: TensorId,
-        weight_dtype: DType,
+        wq_dtype: DType,
+        wk_dtype: DType,
+        wv_dtype: DType,
     },
     RmsNormMatvec {
         n: usize,
@@ -319,7 +436,9 @@ pub enum KernelKind {
         wq: TensorId,
         wk: TensorId,
         wv: TensorId,
-        weight_dtype: DType,
+        wq_dtype: DType,
+        wk_dtype: DType,
+        wv_dtype: DType,
     },
     CopySlice {
         src_off: usize,
@@ -408,12 +527,27 @@ pub enum KirExpr {
     SimdSum(Box<KirExpr>),
     /// One simdgroup-lane partial for a Q4_K superblock (ggml `mul_vec_q4_K` layout).
     /// `row_base` = row * cols (element index); `ib` = superblock index; `lane` = lid%32.
+    /// `b_from_tg=None` → device `x_buf` half activations (oracle-style, no TG staging).
     Q4kCoopFrag {
         w_buf: u32,
         row_base: Box<KirExpr>,
         cols: u32,
         ib: Box<KirExpr>,
-        b_from_tg: u32,
+        b_from_tg: Option<u32>,
+        x_buf: u32,
+        lane: Box<KirExpr>,
+    },
+    /// One simdgroup-lane partial for a Q6_K superblock (ggml `mul_vec_q6_K` layout).
+    /// When `b_from_tg` is `None`, activations are read from device `x_buf` (half).
+    /// `x_off` is subtracted from `ib*256` when indexing TG `x` (tiled LOCAL staging).
+    Q6kCoopFrag {
+        w_buf: u32,
+        row_base: Box<KirExpr>,
+        cols: u32,
+        ib: Box<KirExpr>,
+        b_from_tg: Option<u32>,
+        x_buf: u32,
+        x_off: Box<KirExpr>,
         lane: Box<KirExpr>,
     },
     Bin {
@@ -487,13 +621,17 @@ pub enum KirStmt {
     },
     /// Tree reduce `acc` across threadgroup (`tg` lanes). Uses simd_sum when tg≤32.
     ThreadgroupReduce { acc_id: u32, tg: u64 },
+    /// Parallel argmax: `val_id`/`idx_id` become the TG-wide max and its index (as f32).
+    ThreadgroupArgmax { val_id: u32, idx_id: u32, tg: u64 },
     /// ggml-style Q4_K: one y-load, accumulate 4 consecutive rows into `acc_ids`.
+    /// `b_from_tg=None` → device `x_buf` half activations.
     Q4kCoopNr4 {
         w_buf: u32,
         row0_base: KirExpr,
         cols: u32,
         ib: KirExpr,
-        b_from_tg: u32,
+        b_from_tg: Option<u32>,
+        x_buf: u32,
         lane: KirExpr,
         acc_ids: [u32; 4],
     },
@@ -502,10 +640,25 @@ pub enum KirStmt {
         row0_base: KirExpr,
         cols: u32,
         ib: KirExpr,
-        b_from_tg: u32,
+        b_from_tg: Option<u32>,
+        x_buf: u32,
         lane: KirExpr,
         acc_g: [u32; 4],
         acc_u: [u32; 4],
+    },
+    /// ggml-style Q6_K: one y-load, accumulate 4 consecutive rows into `acc_ids`.
+    /// `b_from_tg=None` → device `x_buf` activations (large-K path).
+    /// `x_off` subtracts from `ib*256` for tiled TG staging.
+    Q6kCoopNr4 {
+        w_buf: u32,
+        row0_base: KirExpr,
+        cols: u32,
+        ib: KirExpr,
+        b_from_tg: Option<u32>,
+        x_buf: u32,
+        x_off: KirExpr,
+        lane: KirExpr,
+        acc_ids: [u32; 4],
     },
 }
 
