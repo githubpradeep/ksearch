@@ -1169,10 +1169,7 @@ impl GemmaPrimModel {
 
     /// F32 KV pool for multi-stream decode (P5 serving contract).
     pub fn make_kv_pool(&self, max_batch: usize) -> Result<KvPool> {
-        let n_kv_layers = (0..self.cfg.n_layers)
-            .filter(|&i| self.cfg.owns_kv(i))
-            .count()
-            .max(1);
+        let n_kv_layers = self.cfg.n_kv_owners();
         let hd = self.cfg.head_dim_full.max(self.cfg.head_dim_swa);
         KvPool::new(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
     }

@@ -69,7 +69,8 @@ enum Cmd {
         gguf: String,
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(long, default_value_t = 1024)]
+        /// KV slot capacity (tokens). Default 16k like metal-llm-server; model ctx is ~128k.
+        #[arg(long, default_value_t = 16384)]
         max_seq: usize,
         /// Concurrent KV slots (llama.cpp `--parallel`).
         #[arg(long, default_value_t = 4)]

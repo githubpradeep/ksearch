@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, StreamExt};
-use ksearch_gemma::GemmaPrimModel;
+use ksearch_gemma::{GemmaConfig, GemmaPrimModel};
 use ksearch_gguf::{build_tokenizer_from_gguf, encode_prompt, gemma4_chat_from_messages, Gguf};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -37,6 +37,7 @@ struct AppState {
     tokenizer: Arc<Tokenizer>,
     model_id: String,
     max_seq: usize,
+    model_ctx: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,11 +213,20 @@ pub async fn run_server(args: ServeArgs) -> Result<()> {
     let g = Gguf::open(&args.gguf);
     let tokenizer = build_tokenizer_from_gguf(&g).map_err(|e| anyhow::anyhow!(e))?;
     let tokenizer = Arc::new(tokenizer);
+    let cfg = GemmaConfig::from_gguf(&g)?;
+    let model_ctx = cfg.context_length.max(256);
+    let max_seq = args.max_seq.max(256);
+    if max_seq > model_ctx {
+        eprintln!(
+            "[serve] warning: --max-seq {max_seq} > model context_length {model_ctx} (RoPE past training length)"
+        );
+    }
+    let slots = args.slots.max(1);
+    let kv_mb = cfg.kv_q40_bytes(max_seq, slots) as f64 / 1e6;
+    eprintln!("[serve] ctx={max_seq} model_ctx={model_ctx} slots={slots} kv_q40≈{kv_mb:.0} MB");
 
     let (job_tx, job_rx) = mpsc::sync_channel::<InferenceRequest>(32);
     let gguf = args.gguf.clone();
-    let max_seq = args.max_seq;
-    let slots = args.slots.max(1);
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
     thread::Builder::new()
         .name("ksearch-sched".into())
@@ -251,6 +261,7 @@ pub async fn run_server(args: ServeArgs) -> Result<()> {
         tokenizer,
         model_id: model_id.clone(),
         max_seq,
+        model_ctx,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -359,9 +370,10 @@ async fn handle_chat(st: AppState, req: ChatCompletionRequest) -> Result<Respons
             StatusCode::BAD_REQUEST,
             "context_length_exceeded",
             format!(
-                "prompt is {} tokens; max_seq is {} (need room for at least one decode step)",
+                "prompt is {} tokens; max_seq is {} (need room for at least one decode step). Restart with --max-seq N (model context_length is {}).",
                 ids.len(),
-                st.max_seq
+                st.max_seq,
+                st.model_ctx
             ),
         ));
     }

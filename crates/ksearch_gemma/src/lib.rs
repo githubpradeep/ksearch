@@ -8,6 +8,7 @@ pub use kv_pool::{KvPool, KvSlot, SlotId};
 
 use anyhow::{anyhow, Result};
 use ksearch_gguf::Gguf;
+use ksearch_ir::q40_nbytes;
 use metal::Buffer;
 
 #[derive(Clone)]
@@ -29,11 +30,14 @@ pub struct GemmaConfig {
     pub rope_theta_full: f32,
     pub rope_theta_swa: f32,
     pub partial_rotary: f32,
+    pub context_length: usize,
 }
 
 impl GemmaConfig {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
-        let n_layers = g.get_u32("gemma4.block_count").ok_or_else(|| anyhow!("block_count"))? as usize;
+        let n_layers = g
+            .get_u32("gemma4.block_count")
+            .ok_or_else(|| anyhow!("block_count"))? as usize;
         let hidden = g.get_u32("gemma4.embedding_length").unwrap() as usize;
         let n_heads = g.get_u32("gemma4.attention.head_count").unwrap() as usize;
         let n_kv = g.get_u32("gemma4.attention.head_count_kv").unwrap_or(1) as usize;
@@ -41,7 +45,9 @@ impl GemmaConfig {
         let head_dim_swa = g.get_u32("gemma4.attention.key_length_swa").unwrap_or(256) as usize;
         let sliding_window = g.get_u32("gemma4.attention.sliding_window").unwrap_or(512) as usize;
         let shared_kv_layers = g.get_u32("gemma4.attention.shared_kv_layers").unwrap_or(0) as usize;
-        let rms_eps = g.get_f32("gemma4.attention.layer_norm_rms_epsilon").unwrap_or(1e-6);
+        let rms_eps = g
+            .get_f32("gemma4.attention.layer_norm_rms_epsilon")
+            .unwrap_or(1e-6);
         let softcap = g.get_f32("gemma4.final_logit_softcapping").unwrap_or(30.0);
         let ple_dim = g
             .get_u32("gemma4.embedding_length_per_layer_input")
@@ -70,6 +76,7 @@ impl GemmaConfig {
             .tensor("token_embd.weight")
             .map(|t| t.n_rows())
             .unwrap_or(262144);
+        let context_length = g.get_u32("gemma4.context_length").unwrap_or(131072) as usize;
 
         Ok(Self {
             n_layers,
@@ -89,7 +96,21 @@ impl GemmaConfig {
             rope_theta_full,
             rope_theta_swa,
             partial_rotary: 0.25,
+            context_length,
         })
+    }
+
+    pub fn n_kv_owners(&self) -> usize {
+        (0..self.n_layers)
+            .filter(|&i| self.owns_kv(i))
+            .count()
+            .max(1)
+    }
+
+    /// Q4_0 K+V bytes for `slots` sequences of `max_seq` (pool uses max head dim).
+    pub fn kv_q40_bytes(&self, max_seq: usize, slots: usize) -> usize {
+        let hd = self.head_dim_full.max(self.head_dim_swa);
+        slots * self.n_kv_owners() * 2 * q40_nbytes(max_seq, hd)
     }
 
     pub fn is_swa(&self, layer: usize) -> bool {
