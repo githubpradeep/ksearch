@@ -98,6 +98,29 @@ impl Eng {
         Ok(())
     }
 
+    fn run_offsets_multi(
+        &self,
+        ctx: &MetalContext,
+        key: &str,
+        inputs: &[&Buffer],
+        input_byte_offsets: &[u64],
+        outputs: &[&Buffer],
+        output_byte_offsets: &[u64],
+    ) -> Result<()> {
+        let (src, pipe) = self.cache.get(key).expect("ensure first");
+        let tg = Self::tg_for(src);
+        ctx.encode_offsets_multi(
+            pipe,
+            src,
+            inputs,
+            input_byte_offsets,
+            outputs,
+            output_byte_offsets,
+            tg,
+        )?;
+        Ok(())
+    }
+
     pub fn matvec(
         &mut self,
         ctx: &MetalContext,
@@ -799,7 +822,7 @@ impl Eng {
     ) -> Result<()> {
         let scratch = self.scratch_f16(ctx, rows);
         self.matvec_wd(ctx, rows, cols, weight_dtype, w, x, &scratch)?;
-        ctx.encoder_barrier();
+        // Same compute encoder: Metal tracks buffer hazards across dispatches.
         self.rmsnorm_add(ctx, rows, eps, &scratch, w_norm, residual, y)
     }
 
@@ -822,7 +845,7 @@ impl Eng {
     ) -> Result<()> {
         let scratch = self.scratch_f16(ctx, rows);
         self.matvec_wd(ctx, rows, cols, weight_dtype, w, x, &scratch)?;
-        ctx.encoder_barrier();
+        // Same compute encoder: Metal tracks buffer hazards across dispatches.
         self.rmsnorm_add_scale(ctx, rows, eps, scale, &scratch, w_norm, residual, y)
     }
 
@@ -1158,6 +1181,49 @@ impl Eng {
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
         self.run_offsets(ctx, &key, &[x, x], &[0, 0], dst, dst_byte_off as u64)
+    }
+
+    /// Q rms+RoPE (F16) + K rms+RoPE+Q40 + V rms+Q40 in one launch (KV-owning layers).
+    pub fn rmsnorm_per_head_qkv_q40_off(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+        q: &Buffer,
+        qw: &Buffer,
+        cos_sin: &Buffer,
+        cos_sin_off_elems: usize,
+        k: &Buffer,
+        kw: &Buffer,
+        v: &Buffer,
+        q_out: &Buffer,
+        kv_k: &Buffer,
+        kv_v: &Buffer,
+        kv_byte_off: usize,
+    ) -> Result<()> {
+        let key = format!("rms_ph_qkv_q40_{n_q}_{n_kv}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
+            let qwi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F16);
+            let ki = g.input(Shape(vec![n_kv * hd]), DType::F16);
+            let kwi = g.input(Shape(vec![hd]), DType::F16);
+            let vi = g.input(Shape(vec![n_kv * hd]), DType::F16);
+            let out = g.rmsnorm_per_head_qkv_q40(qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b = DType::F16.size_bytes() as u64;
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[q, qw, cos_sin, k, kw, v],
+            &[0, 0, cos_sin_off_elems as u64 * b, 0, 0, 0],
+            &[q_out, kv_k, kv_v],
+            &[0, kv_byte_off as u64, kv_byte_off as u64],
+        )
     }
 
     pub fn copy_slice(

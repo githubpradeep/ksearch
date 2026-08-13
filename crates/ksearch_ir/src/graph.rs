@@ -540,6 +540,54 @@ impl Graph {
         ))
     }
 
+    /// Q rms+RoPE (F16) + K rms+RoPE+Q40 + V rms+Q40 as one CALL (decode KV owners).
+    pub fn rmsnorm_per_head_qkv_q40(
+        &mut self,
+        q: TensorId,
+        qw: TensorId,
+        cos_sin: TensorId,
+        k: TensorId,
+        kw: TensorId,
+        v: TensorId,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        if !dq.is_float()
+            || dq != dk
+            || dq != dv
+            || sq.numel() != n_q * hd
+            || sk.numel() != n_kv * hd
+            || sv.numel() != n_kv * hd
+            || hd % 32 != 0
+            || n_kv == 0
+            || n_q < n_kv
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, qw, cos_sin, k, kw, v],
+            Shape(vec![n_q * hd]),
+            dq,
+            FuseHint::RmsNormPerHeadQkvQ40 {
+                n_q,
+                n_kv,
+                hd,
+                eps,
+                q,
+                qw,
+                cos_sin,
+                k,
+                kw,
+                v,
+            },
+        ))
+    }
+
     pub fn copy_scale(
         &mut self,
         src: TensorId,

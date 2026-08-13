@@ -121,6 +121,19 @@ pub enum FuseHint {
         x: TensorId,
         w: TensorId,
     },
+    /// Q rms+RoPE (F16) + K rms+RoPE+Q40 + V rms+Q40 in one 32-wide launch.
+    RmsNormPerHeadQkvQ40 {
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+        q: TensorId,
+        qw: TensorId,
+        cos_sin: TensorId,
+        k: TensorId,
+        kw: TensorId,
+        v: TensorId,
+    },
     Rope {
         n_heads: usize,
         hd: usize,
@@ -399,6 +412,19 @@ pub enum KernelKind {
         with_weight: bool,
         x: TensorId,
         w: TensorId,
+    },
+    /// Three outputs: Q F16, K Q40, V Q40.
+    RmsNormPerHeadQkvQ40 {
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+        q: TensorId,
+        qw: TensorId,
+        cos_sin: TensorId,
+        k: TensorId,
+        kw: TensorId,
+        v: TensorId,
     },
     Rope {
         n_heads: usize,

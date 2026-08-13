@@ -38,7 +38,7 @@ pub fn lower_to_kir(
                 ));
             }
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
             (
                 matvec_launch(*weight_dtype, *rows, sched),
                 lower_matvec(*rows, *cols, *weight_dtype, sched, 1, 2, None, &mut next)?,
@@ -57,13 +57,7 @@ pub fn lower_to_kir(
                 ));
             }
             validate_sched(sched)?;
-            let mut sched = apply_matvec_sched(*weight_dtype, *cols, sched);
-            // Dual gate∥up: nsg=4 was faster than ggml's nsg=2 on M1 Pro (measured).
-            if *weight_dtype == DType::Q4K && *cols % 256 == 0 {
-                sched.nsg = 4;
-                sched.tg = 128;
-                sched.nr0 = 16;
-            }
+            let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
             (
                 matvec_launch(*weight_dtype, *rows, sched),
                 lower_matvec_gate_up_gelu(
@@ -98,8 +92,8 @@ pub fn lower_to_kir(
             }
             let wd = *wq_dtype;
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(wd, *cols, sched);
             let max_rows = (*q_rows).max(*kv_rows);
+            let sched = apply_matvec_sched(wd, *cols, max_rows, sched);
             (
                 matvec_launch(wd, max_rows, sched),
                 lower_matvec_qkv(
@@ -133,7 +127,7 @@ pub fn lower_to_kir(
                 ));
             }
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
             (
                 matvec_launch(*weight_dtype, *rows, sched),
                 lower_matvec(
@@ -162,12 +156,7 @@ pub fn lower_to_kir(
                 ));
             }
             validate_sched(sched)?;
-            let mut sched = apply_matvec_sched(*weight_dtype, *cols, sched);
-            if *weight_dtype == DType::Q4K && *cols % 256 == 0 {
-                sched.nsg = 4;
-                sched.tg = 128;
-                sched.nr0 = 16;
-            }
+            let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
             (
                 matvec_launch(*weight_dtype, *rows, sched),
                 lower_matvec_gate_up_gelu(
@@ -203,8 +192,8 @@ pub fn lower_to_kir(
             }
             let wd = *wq_dtype;
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(wd, *cols, sched);
             let max_rows = (*q_rows).max(*kv_rows);
+            let sched = apply_matvec_sched(wd, *cols, max_rows, sched);
             (
                 matvec_launch(wd, max_rows, sched),
                 lower_matvec_qkv(
@@ -301,8 +290,12 @@ pub fn lower_to_kir(
             with_weight,
             ..
         } => (
-            KirLaunch::Elementwise { n: *n_heads },
-            lower_rmsnorm_per_head_rope(*hd, *eps, *with_weight, out_dtype, &mut next),
+            // One TG/head, 32 lanes: simd RMS + in-place RoPE (no hd-sized thread array).
+            KirLaunch::RowsParallel {
+                rows: *n_heads,
+                tg: 32,
+            },
+            lower_rmsnorm_per_head_rope(*hd, *eps, *with_weight, out_dtype, 0, 1, 2, 3, &mut next),
             1,
         ),
         KernelKind::RmsNormPerHeadRopeQ40 {
@@ -312,8 +305,13 @@ pub fn lower_to_kir(
             with_weight,
             ..
         } => (
-            KirLaunch::Elementwise { n: *n_heads },
-            lower_rmsnorm_per_head_rope_q40(*hd, *eps, *with_weight, DType::F16, &mut next),
+            KirLaunch::RowsParallel {
+                rows: *n_heads,
+                tg: 32,
+            },
+            lower_rmsnorm_per_head_rope_q40(
+                *hd, *eps, *with_weight, DType::F16, 0, 1, 2, 3, 0, 1, &mut next,
+            ),
             1,
         ),
         KernelKind::RmsNormPerHeadQ40 {
@@ -323,9 +321,26 @@ pub fn lower_to_kir(
             with_weight,
             ..
         } => (
-            KirLaunch::Elementwise { n: *n_heads },
-            lower_rmsnorm_per_head_q40(*hd, *eps, *with_weight, DType::F16, &mut next),
+            KirLaunch::RowsParallel {
+                rows: *n_heads,
+                tg: 32,
+            },
+            lower_rmsnorm_per_head_q40(*hd, *eps, *with_weight, DType::F16, 0, 1, 2, 0, &mut next),
             1,
+        ),
+        KernelKind::RmsNormPerHeadQkvQ40 {
+            n_q,
+            n_kv,
+            hd,
+            eps,
+            ..
+        } => (
+            KirLaunch::RowsParallel {
+                rows: *n_q,
+                tg: 32,
+            },
+            lower_rmsnorm_per_head_qkv_q40(*n_kv, *hd, *eps, out_dtype, &mut next),
+            3,
         ),
         KernelKind::Rope { n_heads, hd, .. } => (
             KirLaunch::Elementwise { n: *n_heads },
@@ -407,7 +422,7 @@ pub fn lower_to_kir(
             ..
         } => {
             validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, sched);
+            let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
             let epi = MatvecEpi::GeluMulCtx {
                 ctx_buf: 2,
                 ctx_off: *ctx_off as u32,
@@ -742,12 +757,25 @@ fn x_dtype(weight_dtype: DType) -> DType {
     }
 }
 
-fn apply_matvec_sched(weight_dtype: DType, cols: usize, mut sched: OptSchedule) -> OptSchedule {
+fn apply_matvec_sched(
+    weight_dtype: DType,
+    cols: usize,
+    rows: usize,
+    mut sched: OptSchedule,
+) -> OptSchedule {
     if matches!(weight_dtype, DType::Q4K | DType::Q6K) && cols % 256 == 0 {
         // ggml mul_vec_q{4,6}_K: TG=64 (2 SG), 8 rows/TG (4 per SG).
         sched.tg = 64;
         sched.nr0 = 8;
         sched.nsg = 2;
+        // Wide TG is faster on modest row counts (QKV, gate/up, o-proj, down).
+        // lm_head (vocab) regresses at nsg=4. Tiny PLE gate (256 rows) is only
+        // 16 TGs at nsg=4 — occupancy loss; keep ggml nsg=2 below 512 rows.
+        if weight_dtype == DType::Q4K && rows >= 512 && rows <= 32768 {
+            sched.nsg = 4;
+            sched.tg = 128;
+            sched.nr0 = 16;
+        }
     }
     sched
 }
@@ -2037,6 +2065,7 @@ fn lower_matvec_gate_up_q4k_coop(
     let nb = (cols / 256) as u32;
     let exact_rows = rows % ((nsg * nr) as usize) == 0;
 
+    // Device-x: LOCAL staging of raw x on dual gate∥up was slower (measured).
     let prefer_local = false;
     let (mut stmts, tg_x) = if rms.is_some() || prefer_local {
         let (s, tg) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
@@ -3476,34 +3505,36 @@ fn lower_rmsnorm_per_head(
 }
 
 
-fn lower_rmsnorm_per_head_to_thread(
+/// Per-head RMS scale with 32 lanes (one simdgroup). Returns `(stmts, base_u32, inv_f32)`.
+fn lower_per_head_rms_inv(
     hd: usize,
     eps: f32,
-    with_weight: bool,
     x_buf: u32,
-    w_buf: u32,
-    th_id: u32,
     dt: DType,
     next: &mut u32,
-) -> Vec<KirStmt> {
-    let head = gid();
+) -> (Vec<KirStmt>, u32, u32) {
     let base = fresh(next);
     let ss = fresh(next);
     let i = fresh(next);
     let inv = fresh(next);
-    let j = fresh(next);
-    let mut stmts = vec![
-        KirStmt::Let {
+    let stmts = vec![
+        KirStmt::LetU32 {
             id: base,
-            expr: bin(BinOp::Mul, head, cu(hd as u32)),
+            expr: bin(BinOp::Mul, gid(), cu(hd as u32)),
         },
         KirStmt::Let {
             id: ss,
             expr: c(0.0),
         },
-        KirStmt::For {
+        KirStmt::LetU32 {
             id: i,
-            n: hd,
+            expr: lid(),
+        },
+        KirStmt::ForRange {
+            id: i,
+            limit_off: cu(0),
+            bound: cu(hd as u32),
+            step: cu(32),
             body: vec![KirStmt::Assign {
                 id: ss,
                 expr: bin(
@@ -3511,11 +3542,15 @@ fn lower_rmsnorm_per_head_to_thread(
                     v(ss),
                     bin(
                         BinOp::Mul,
-                        ld(x_buf, bin(BinOp::Add, v(base), fv(i)), dt),
-                        ld(x_buf, bin(BinOp::Add, v(base), fv(i)), dt),
+                        ld(x_buf, bin(BinOp::Add, uv(base), uv(i)), dt),
+                        ld(x_buf, bin(BinOp::Add, uv(base), uv(i)), dt),
                     ),
                 ),
             }],
+        },
+        KirStmt::ThreadgroupReduce {
+            acc_id: ss,
+            tg: 32,
         },
         KirStmt::Let {
             id: inv,
@@ -3525,67 +3560,94 @@ fn lower_rmsnorm_per_head_to_thread(
             ),
         },
     ];
+    (stmts, base, inv)
+}
+
+fn rms_at(
+    x_buf: u32,
+    w_buf: u32,
+    base: u32,
+    idx: KirExpr,
+    inv: u32,
+    with_weight: bool,
+    dt: DType,
+) -> KirExpr {
     let mut val = bin(
         BinOp::Mul,
-        ld(x_buf, bin(BinOp::Add, v(base), fv(j)), dt),
+        ld(x_buf, bin(BinOp::Add, uv(base), idx.clone()), dt),
         v(inv),
     );
     if with_weight {
-        val = bin(BinOp::Mul, val, ld(w_buf, fv(j), dt));
+        val = bin(BinOp::Mul, val, ld(w_buf, idx, dt));
     }
-    stmts.push(KirStmt::For {
-        id: j,
-        n: hd,
-        body: vec![th_store(th_id, fv(j), val)],
-    });
-    stmts
+    val
 }
 
-fn lower_rope_on_thread(
+fn lower_rmsnorm_per_head_rope(
     hd: usize,
-    th_id: u32,
-    cos_buf: u32,
+    eps: f32,
+    with_weight: bool,
     dt: DType,
+    x_buf: u32,
+    w_buf: u32,
+    rope_buf: u32,
+    out_buf: u32,
     next: &mut u32,
 ) -> Vec<KirStmt> {
+    // 32 lanes; each owns unique (i, i+half) pairs.
     let half = hd / 2;
-    let i = fresh(next);
+    let (mut body, base, inv) = lower_per_head_rms_inv(hd, eps, x_buf, dt, next);
+    let k = fresh(next);
     let u = fresh(next);
     let vv = fresh(next);
     let cos = fresh(next);
     let sin = fresh(next);
-    vec![KirStmt::For {
-        id: i,
-        n: half,
+    body.push(KirStmt::LetU32 {
+        id: k,
+        expr: lid(),
+    });
+    body.push(KirStmt::ForRange {
+        id: k,
+        limit_off: cu(0),
+        bound: cu(half as u32),
+        step: cu(32),
         body: vec![
             KirStmt::Let {
-                id: cos,
-                expr: ld(cos_buf, fv(i), dt),
-            },
-            KirStmt::Let {
-                id: sin,
-                expr: ld(cos_buf, bin(BinOp::Add, cu(half as u32), fv(i)), dt),
-            },
-            KirStmt::Let {
                 id: u,
-                expr: th_load(th_id, fv(i)),
+                expr: rms_at(x_buf, w_buf, base, uv(k), inv, with_weight, dt),
             },
             KirStmt::Let {
                 id: vv,
-                expr: th_load(th_id, bin(BinOp::Add, cu(half as u32), fv(i))),
+                expr: rms_at(
+                    x_buf,
+                    w_buf,
+                    base,
+                    bin(BinOp::Add, cu(half as u32), uv(k)),
+                    inv,
+                    with_weight,
+                    dt,
+                ),
             },
-            th_store(
-                th_id,
-                fv(i),
+            KirStmt::Let {
+                id: cos,
+                expr: ld(rope_buf, uv(k), dt),
+            },
+            KirStmt::Let {
+                id: sin,
+                expr: ld(rope_buf, bin(BinOp::Add, cu(half as u32), uv(k)), dt),
+            },
+            st(
+                out_buf,
+                bin(BinOp::Add, uv(base), uv(k)),
                 bin(
                     BinOp::Sub,
                     bin(BinOp::Mul, v(u), v(cos)),
                     bin(BinOp::Mul, v(vv), v(sin)),
                 ),
             ),
-            th_store(
-                th_id,
-                bin(BinOp::Add, cu(half as u32), fv(i)),
+            st(
+                out_buf,
+                bin(BinOp::Add, uv(base), bin(BinOp::Add, cu(half as u32), uv(k))),
                 bin(
                     BinOp::Add,
                     bin(BinOp::Mul, v(u), v(sin)),
@@ -3593,23 +3655,8 @@ fn lower_rope_on_thread(
                 ),
             ),
         ],
-    }]
-}
-
-fn lower_pack_thread_q40(hd: usize, th_id: u32, dst_buf: u32, next: &mut u32) -> Vec<KirStmt> {
-    assert!(hd % 32 == 0);
-    let n_blk = hd / 32;
-    let b = fresh(next);
-    vec![KirStmt::For {
-        id: b,
-        n: n_blk,
-        body: vec![KirStmt::Q40PackFromThread {
-            dst_buf,
-            block: bin(BinOp::Add, bin(BinOp::Mul, gid(), cu(n_blk as u32)), fv(b)),
-            th_id,
-            th_off: bin(BinOp::Mul, fv(b), cu(32)),
-        }],
-    }]
+    });
+    body
 }
 
 fn lower_rmsnorm_per_head_rope_q40(
@@ -3617,16 +3664,113 @@ fn lower_rmsnorm_per_head_rope_q40(
     eps: f32,
     with_weight: bool,
     dt: DType,
+    x_buf: u32,
+    w_buf: u32,
+    rope_buf: u32,
+    out_buf: u32,
+    th_lo: u32,
+    th_hi: u32,
     next: &mut u32,
 ) -> Vec<KirStmt> {
-    // inputs: x=0, w=1, cos_sin=2; out Q40 = 3
-    let th = 0u32;
-    let mut body = vec![KirStmt::ThreadDeclF32 { id: th, n: hd }];
-    body.extend(lower_rmsnorm_per_head_to_thread(
-        hd, eps, with_weight, 0, 1, th, dt, next,
-    ));
-    body.extend(lower_rope_on_thread(hd, th, 2, dt, next));
-    body.extend(lower_pack_thread_q40(hd, th, 3, next));
+    // Pair 32-elem Q40 blocks across RoPE halves so thread mem is 64 floats, not hd.
+    assert!(hd % 64 == 0);
+    let half = hd / 2;
+    let n_blk = hd / 32;
+    let n_pair = half / 32;
+    let (mut body, base, inv) = lower_per_head_rms_inv(hd, eps, x_buf, dt, next);
+    body.push(KirStmt::ThreadDeclF32 { id: th_lo, n: 32 });
+    body.push(KirStmt::ThreadDeclF32 { id: th_hi, n: 32 });
+    let pb = fresh(next);
+    let d = fresh(next);
+    let u = fresh(next);
+    let vv = fresh(next);
+    let cos = fresh(next);
+    let sin = fresh(next);
+    let lo_i = fresh(next);
+    body.push(KirStmt::LetU32 {
+        id: pb,
+        expr: lid(),
+    });
+    body.push(KirStmt::ForRange {
+        id: pb,
+        limit_off: cu(0),
+        bound: cu(n_pair as u32),
+        step: cu(32),
+        body: vec![
+            KirStmt::For {
+                id: d,
+                n: 32,
+                body: vec![
+                    KirStmt::LetU32 {
+                        id: lo_i,
+                        expr: bin(BinOp::Add, bin(BinOp::Mul, uv(pb), cu(32)), fv(d)),
+                    },
+                    KirStmt::Let {
+                        id: u,
+                        expr: rms_at(x_buf, w_buf, base, uv(lo_i), inv, with_weight, dt),
+                    },
+                    KirStmt::Let {
+                        id: vv,
+                        expr: rms_at(
+                            x_buf,
+                            w_buf,
+                            base,
+                            bin(BinOp::Add, cu(half as u32), uv(lo_i)),
+                            inv,
+                            with_weight,
+                            dt,
+                        ),
+                    },
+                    KirStmt::Let {
+                        id: cos,
+                        expr: ld(rope_buf, uv(lo_i), dt),
+                    },
+                    KirStmt::Let {
+                        id: sin,
+                        expr: ld(rope_buf, bin(BinOp::Add, cu(half as u32), uv(lo_i)), dt),
+                    },
+                    th_store(
+                        th_lo,
+                        fv(d),
+                        bin(
+                            BinOp::Sub,
+                            bin(BinOp::Mul, v(u), v(cos)),
+                            bin(BinOp::Mul, v(vv), v(sin)),
+                        ),
+                    ),
+                    th_store(
+                        th_hi,
+                        fv(d),
+                        bin(
+                            BinOp::Add,
+                            bin(BinOp::Mul, v(u), v(sin)),
+                            bin(BinOp::Mul, v(vv), v(cos)),
+                        ),
+                    ),
+                ],
+            },
+            KirStmt::Q40PackFromThread {
+                dst_buf: out_buf,
+                block: bin(
+                    BinOp::Add,
+                    bin(BinOp::Mul, gid(), cu(n_blk as u32)),
+                    uv(pb),
+                ),
+                th_id: th_lo,
+                th_off: cu(0),
+            },
+            KirStmt::Q40PackFromThread {
+                dst_buf: out_buf,
+                block: bin(
+                    BinOp::Add,
+                    bin(BinOp::Mul, gid(), cu(n_blk as u32)),
+                    bin(BinOp::Add, uv(pb), cu(n_pair as u32)),
+                ),
+                th_id: th_hi,
+                th_off: cu(0),
+            },
+        ],
+    });
     body
 }
 
@@ -3635,28 +3779,79 @@ fn lower_rmsnorm_per_head_q40(
     eps: f32,
     with_weight: bool,
     dt: DType,
+    x_buf: u32,
+    w_buf: u32,
+    out_buf: u32,
+    th: u32,
     next: &mut u32,
 ) -> Vec<KirStmt> {
-    // inputs: x=0, w=1; out Q40 = 2
-    let th = 0u32;
-    let mut body = vec![KirStmt::ThreadDeclF32 { id: th, n: hd }];
-    body.extend(lower_rmsnorm_per_head_to_thread(
-        hd, eps, with_weight, 0, 1, th, dt, next,
-    ));
-    body.extend(lower_pack_thread_q40(hd, th, 2, next));
+    assert!(hd % 32 == 0);
+    let n_blk = hd / 32;
+    let (mut body, base, inv) = lower_per_head_rms_inv(hd, eps, x_buf, dt, next);
+    body.push(KirStmt::ThreadDeclF32 { id: th, n: 32 });
+    let b = fresh(next);
+    let d = fresh(next);
+    let idx = fresh(next);
+    body.push(KirStmt::LetU32 {
+        id: b,
+        expr: lid(),
+    });
+    body.push(KirStmt::ForRange {
+        id: b,
+        limit_off: cu(0),
+        bound: cu(n_blk as u32),
+        step: cu(32),
+        body: vec![
+            KirStmt::For {
+                id: d,
+                n: 32,
+                body: vec![
+                    KirStmt::LetU32 {
+                        id: idx,
+                        expr: bin(BinOp::Add, bin(BinOp::Mul, uv(b), cu(32)), fv(d)),
+                    },
+                    th_store(
+                        th,
+                        fv(d),
+                        rms_at(x_buf, w_buf, base, uv(idx), inv, with_weight, dt),
+                    ),
+                ],
+            },
+            KirStmt::Q40PackFromThread {
+                dst_buf: out_buf,
+                block: bin(
+                    BinOp::Add,
+                    bin(BinOp::Mul, gid(), cu(n_blk as u32)),
+                    uv(b),
+                ),
+                th_id: th,
+                th_off: cu(0),
+            },
+        ],
+    });
     body
 }
 
-fn lower_rmsnorm_per_head_rope(
+/// Q F16 rms+RoPE, then (gid < n_kv) K Q40 rms+RoPE and V Q40 rms.
+/// Buffers: q=0, qw=1, rope=2, k=3, kw=4, v=5; outs q=6, k=7, v=8.
+fn lower_rmsnorm_per_head_qkv_q40(
+    n_kv: usize,
     hd: usize,
     eps: f32,
-    with_weight: bool,
     dt: DType,
     next: &mut u32,
 ) -> Vec<KirStmt> {
-    // inputs: x=0, w=1, cos_sin=2; out=3
-    let mut body = lower_rmsnorm_per_head(hd, eps, with_weight, 0, 1, 3, dt, next);
-    body.extend(lower_rope(hd, 3, 2, 3, dt, next));
+    let mut body = lower_rmsnorm_per_head_rope(hd, eps, true, dt, 0, 1, 2, 6, next);
+    let mut kv = lower_rmsnorm_per_head_rope_q40(
+        hd, eps, true, dt, 3, 4, 2, 7, 0, 1, next,
+    );
+    kv.extend(lower_rmsnorm_per_head_q40(
+        hd, eps, false, dt, 5, 5, 8, 2, next,
+    ));
+    body.push(KirStmt::If {
+        cond: gt(cu(n_kv as u32), gid()),
+        body: kv,
+    });
     body
 }
 

@@ -988,15 +988,17 @@ fn buffer_params(kir: &KernelIr) -> String {
             "  device const {ty}* in{i} [[buffer({i})]],\n"
         ));
     }
-    let out_ty = kir.out_dtype.msl();
     let n_out = kir.n_outputs.max(1);
+    let out_dt = infer_out_dtypes(kir);
     if n_out == 1 {
+        let out_ty = out_dt[0].msl();
         p.push_str(&format!(
             "  device {out_ty}* out [[buffer({})]],\n",
             kir.n_inputs
         ));
     } else {
         for o in 0..n_out {
+            let out_ty = out_dt[o].msl();
             p.push_str(&format!(
                 "  device {out_ty}* out{o} [[buffer({})]],\n",
                 kir.n_inputs + o
@@ -1004,6 +1006,33 @@ fn buffer_params(kir: &KernelIr) -> String {
         }
     }
     p
+}
+
+fn infer_out_dtypes(kir: &KernelIr) -> Vec<DType> {
+    let n_out = kir.n_outputs.max(1);
+    let mut out_dt = vec![kir.out_dtype; n_out];
+    let n_in = kir.n_inputs as u32;
+    fn walk(stmts: &[KirStmt], n_in: u32, out_dt: &mut [DType]) {
+        for s in stmts {
+            match s {
+                KirStmt::Q40PackFromThread { dst_buf, .. }
+                | KirStmt::Q40PackBlock { dst_buf, .. } => {
+                    if *dst_buf >= n_in {
+                        let o = (*dst_buf - n_in) as usize;
+                        if o < out_dt.len() {
+                            out_dt[o] = DType::Q40;
+                        }
+                    }
+                }
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => walk(body, n_in, out_dt),
+                _ => {}
+            }
+        }
+    }
+    walk(&kir.body, n_in, &mut out_dt);
+    out_dt
 }
 
 fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {

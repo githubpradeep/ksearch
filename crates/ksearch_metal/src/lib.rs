@@ -155,10 +155,12 @@ impl MetalContext {
 
     /// Commit pending work without waiting (overlap CPU encode with GPU).
     pub fn flush_async(&self) {
-        if let Some(p) = self.pending.borrow_mut().take() {
-            let cmd = Self::end_pending(p, false);
-            self.inflight.borrow_mut().push(cmd);
-        }
+        autoreleasepool(|| {
+            if let Some(p) = self.pending.borrow_mut().take() {
+                let cmd = Self::end_pending(p, false);
+                self.inflight.borrow_mut().push(cmd);
+            }
+        });
     }
 
     /// Block until at most `max_inflight` command buffers remain (drop completed from the front).
@@ -196,16 +198,18 @@ impl MetalContext {
 
     /// Commit pending work and wait for all in-flight CBs (call before host reads).
     pub fn synchronize(&self) -> Result<()> {
-        if let Some(p) = self.pending.borrow_mut().take() {
-            let cmd = Self::end_pending(p, false);
-            self.inflight.borrow_mut().push(cmd);
-        }
-        let mut inflight = self.inflight.borrow_mut();
-        if let Some(last) = inflight.last() {
-            last.wait_until_completed();
-        }
-        inflight.clear();
-        Ok(())
+        autoreleasepool(|| {
+            if let Some(p) = self.pending.borrow_mut().take() {
+                let cmd = Self::end_pending(p, false);
+                self.inflight.borrow_mut().push(cmd);
+            }
+            let mut inflight = self.inflight.borrow_mut();
+            if let Some(last) = inflight.last() {
+                last.wait_until_completed();
+            }
+            inflight.clear();
+            Ok(())
+        })
     }
 
     /// Encode into the open compute encoder (no wait). Many dispatches share one encoder.
@@ -296,74 +300,72 @@ impl MetalContext {
                 output_byte_offsets.len()
             ));
         }
-        autoreleasepool(|| {
-            let mut slot = self.ensure_pending();
-            let pending = slot.as_mut().unwrap();
-            let enc = &pending.enc;
-            enc.set_compute_pipeline_state(pipeline);
-            for (i, b) in inputs.iter().enumerate() {
-                enc.set_buffer(i as u64, Some(b), input_byte_offsets[i]);
+        // One encoder/CB per token: do not open an autorelease pool per dispatch.
+        let mut slot = self.ensure_pending();
+        let pending = slot.as_mut().unwrap();
+        let enc = &pending.enc;
+        enc.set_compute_pipeline_state(pipeline);
+        for (i, b) in inputs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), input_byte_offsets[i]);
+        }
+        for (o, b) in outputs.iter().enumerate() {
+            enc.set_buffer(
+                (kernel.n_inputs + o) as u64,
+                Some(b),
+                output_byte_offsets[o],
+            );
+        }
+
+        let (n_tg, tg) = match &kernel.launch {
+            LaunchHint::Elementwise { n } => {
+                let tg = tg_size.min(*n as u64).max(1);
+                let n_tg = (*n as u64 + tg - 1) / tg;
+                (n_tg, tg)
             }
-            for (o, b) in outputs.iter().enumerate() {
-                enc.set_buffer(
-                    (kernel.n_inputs + o) as u64,
-                    Some(b),
-                    output_byte_offsets[o],
+            LaunchHint::Rows { rows, .. } => {
+                let tg = tg_size.min(*rows as u64).max(1);
+                let n_tg = (*rows as u64 + tg - 1) / tg;
+                (n_tg, tg)
+            }
+            LaunchHint::RowsParallel { rows, tg } => (*rows as u64, *tg),
+            LaunchHint::RowsParallelSg { rows, nsg } => (*rows as u64, nsg * 32),
+            LaunchHint::RowsParallel2D { rows, batch, tg } => {
+                let _ = (rows, batch, tg);
+                (*rows as u64 * *batch as u64, *tg)
+            }
+            LaunchHint::MulMm { .. } => (1, 1),
+        };
+        match &kernel.launch {
+            LaunchHint::RowsParallel2D { rows, batch, tg } => {
+                enc.dispatch_thread_groups(
+                    MTLSize::new(*rows as u64, *batch as u64, 1),
+                    MTLSize::new(*tg, 1, 1),
                 );
             }
-
-            let (n_tg, tg) = match &kernel.launch {
-                LaunchHint::Elementwise { n } => {
-                    let tg = tg_size.min(*n as u64).max(1);
-                    let n_tg = (*n as u64 + tg - 1) / tg;
-                    (n_tg, tg)
-                }
-                LaunchHint::Rows { rows, .. } => {
-                    let tg = tg_size.min(*rows as u64).max(1);
-                    let n_tg = (*rows as u64 + tg - 1) / tg;
-                    (n_tg, tg)
-                }
-                LaunchHint::RowsParallel { rows, tg } => (*rows as u64, *tg),
-                LaunchHint::RowsParallelSg { rows, nsg } => (*rows as u64, nsg * 32),
-                LaunchHint::RowsParallel2D { rows, batch, tg } => {
-                    // Encode as flattened 1D for the common path; 2D set below.
-                    let _ = (rows, batch, tg);
-                    (*rows as u64 * *batch as u64, *tg)
-                }
-                LaunchHint::MulMm { .. } => (1, 1), // unused; MulMm branch below
-            };
-            match &kernel.launch {
-                LaunchHint::RowsParallel2D { rows, batch, tg } => {
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(*rows as u64, *batch as u64, 1),
-                        MTLSize::new(*tg, 1, 1),
-                    );
-                }
-                LaunchHint::RowsParallelSg { rows, nsg } => {
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(*rows as u64, 1, 1),
-                        MTLSize::new(32, *nsg, 1),
-                    );
-                }
-                LaunchHint::MulMm {
-                    tg_x,
-                    tg_y,
-                    tw,
-                    nsg,
-                    smem,
-                } => {
-                    enc.set_threadgroup_memory_length(0, *smem);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(*tg_x, *tg_y, 1),
-                        MTLSize::new(*tw, *nsg, 1),
-                    );
-                }
-                _ => {
-                    enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
-                }
+            LaunchHint::RowsParallelSg { rows, nsg } => {
+                enc.dispatch_thread_groups(
+                    MTLSize::new(*rows as u64, 1, 1),
+                    MTLSize::new(32, *nsg, 1),
+                );
             }
-            Ok(())
-        })
+            LaunchHint::MulMm {
+                tg_x,
+                tg_y,
+                tw,
+                nsg,
+                smem,
+            } => {
+                enc.set_threadgroup_memory_length(0, *smem);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(*tg_x, *tg_y, 1),
+                    MTLSize::new(*tw, *nsg, 1),
+                );
+            }
+            _ => {
+                enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(tg, 1, 1));
+            }
+        }
+        Ok(())
     }
 
     /// Run once with immediate wait; returns wall ms (BEAM timing).

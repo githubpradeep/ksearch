@@ -721,53 +721,38 @@ impl GemmaPrimModel {
                 )?;
             }
 
-            self.eng.rmsnorm_per_head_rope_off(
-                &self.ctx,
-                n_heads,
-                hd,
-                eps,
-                &self.tmp_q,
-                &self.layer_norms[layer].q_norm,
-                &rope_buf,
-                rope_off,
-                &self.tmp_q,
-                0,
-            )?;
             if owns_kv {
-                self.eng.rmsnorm_per_head_rope_off(
+                let kv_off = self.pos * q40_row_bytes(hd);
+                self.eng.rmsnorm_per_head_qkv_q40_off(
                     &self.ctx,
+                    n_heads,
                     self.cfg.n_kv,
                     hd,
                     eps,
-                    &self.tmp_k,
-                    &self.layer_norms[layer].k_norm,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
                     &rope_buf,
                     rope_off,
                     &self.tmp_k,
-                    0,
-                )?;
-                self.eng.quantize_q40(
-                    &self.ctx,
-                    self.cfg.n_kv * hd,
-                    &self.tmp_k,
+                    &self.layer_norms[layer].k_norm,
+                    &self.tmp_v,
+                    &self.tmp_q,
                     &self.kv_k[kv_src],
-                    self.pos * q40_row_bytes(hd),
+                    &self.kv_v[kv_src],
+                    kv_off,
                 )?;
-                self.eng.rmsnorm_noweight_off(
+            } else {
+                self.eng.rmsnorm_per_head_rope_off(
                     &self.ctx,
-                    self.cfg.n_kv,
+                    n_heads,
                     hd,
                     eps,
-                    &self.tmp_v,
-                    &self.tmp_v,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
+                    &self.tmp_q,
                     0,
-                )?;
-                self.eng.quantize_q40(
-                    &self.ctx,
-                    self.cfg.n_kv * hd,
-                    &self.tmp_v,
-                    &self.kv_v[kv_src],
-                    self.pos * q40_row_bytes(hd),
                 )?;
             }
 
