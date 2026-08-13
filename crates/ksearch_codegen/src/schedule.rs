@@ -248,6 +248,24 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 src_dtype: *src_dtype,
             },
         },
+        FuseHint::CopyScaleIndexed {
+            n,
+            scale,
+            src,
+            idx,
+            src_dtype,
+        } => ScheduledKernel {
+            name: format!("k_csl_sc_idx_{}", out.0),
+            inputs: vec![*src, *idx],
+            output: out,
+            kind: KernelKind::CopyScaleIndexed {
+                n: *n,
+                scale: *scale,
+                src: *src,
+                idx: *idx,
+                src_dtype: *src_dtype,
+            },
+        },
         FuseHint::GeluMul {
             n,
             up_off,

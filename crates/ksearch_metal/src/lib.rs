@@ -92,6 +92,11 @@ impl MetalContext {
 
     pub fn read_f32(&self, buf: &Buffer, n: usize) -> Vec<f32> {
         self.synchronize().ok();
+        self.read_f32_nosync(buf, n)
+    }
+
+    /// Host read without flushing GPU. Caller must ensure `buf` is not a pending GPU write.
+    pub fn read_f32_nosync(&self, buf: &Buffer, n: usize) -> Vec<f32> {
         let ptr = buf.contents() as *const f32;
         unsafe { std::slice::from_raw_parts(ptr, n).to_vec() }
     }

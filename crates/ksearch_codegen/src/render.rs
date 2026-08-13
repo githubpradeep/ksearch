@@ -610,6 +610,45 @@ inline void ksearch_q4k_coop_frag_nr4_dual_dev(
 
 "#;
 
+const K4_SCALE_MIN_HELPER: &str = r#"
+inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
+  if (j < 4u) { d = q[j] & 63u; m = q[j + 4u] & 63u; }
+  else { d = (q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u); m = (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u); }
+}
+"#;
+
+/// Generic Q5_K Load expand (same pattern as Q4_K; dequant-at-load to float).
+const Q5K_LOAD_HELPER: &str = r#"
+inline float ksearch_load_q5k(device const uchar* A, uint idx) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 176u;
+  device const uchar* blk = A + (idx / QK) * BPB;
+  float d = float(*(device const half*)(blk + 0));
+  float dmin = float(*(device const half*)(blk + 2));
+  uint j = idx % QK;
+  uint g = j / 64u;
+  uint jl = j % 64u;
+  device const uchar* scales = blk + 4;
+  device const uchar* qh = blk + 16;
+  device const uchar* qs = blk + 48;
+  uint qoff = g * 32u;
+  uint is = g * 2u;
+  uint u1 = 1u << (2u * g);
+  uint u2 = 2u << (2u * g);
+  uchar sc, mn;
+  if (jl < 32u) {
+    ksearch_get_scale_min_k4(is, scales, sc, mn);
+    float hi = ((uint(qh[jl]) & u1) != 0u) ? 16.0f : 0.0f;
+    return d * float(sc) * (float(qs[qoff + jl] & 0x0Fu) + hi) - dmin * float(mn);
+  } else {
+    ksearch_get_scale_min_k4(is + 1u, scales, sc, mn);
+    uint l = jl - 32u;
+    float hi = ((uint(qh[l]) & u2) != 0u) ? 16.0f : 0.0f;
+    return d * float(sc) * (float(qs[qoff + l] >> 4u) + hi) - dmin * float(mn);
+  }
+}
+"#;
+
 /// Generic Q6_K Load / coop expand (not a named matvec kernel).
 const Q6K_LOAD_HELPER: &str = r#"
 // --- Q6_K Load expand + ggml mul_vec_q6_K-shaped coop ---
@@ -902,6 +941,12 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
     if body_needs_q4(&kir.body) {
         src.push_str(Q4K_LOAD_HELPER);
+    }
+    if body_needs_q5(&kir.body) {
+        if !body_needs_q4(&kir.body) {
+            src.push_str(K4_SCALE_MIN_HELPER);
+        }
+        src.push_str(Q5K_LOAD_HELPER);
     }
     if body_needs_q6(&kir.body) {
         src.push_str(Q6K_LOAD_HELPER);
@@ -1570,6 +1615,51 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
     false
 }
 
+fn body_needs_q5(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                KirStmt::Let { expr, .. }
+                | KirStmt::LetU32 { expr, .. }
+                | KirStmt::Assign { expr, .. } => {
+                    if expr_needs_q5(expr) {
+                        return true;
+                    }
+                }
+                KirStmt::Store { idx, val, .. }
+                | KirStmt::TgStore { idx, val, .. }
+                | KirStmt::ThreadStore { idx, val, .. } => {
+                    if expr_needs_q5(idx) || expr_needs_q5(val) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    fn expr_needs_q5(e: &KirExpr) -> bool {
+        match e {
+            KirExpr::Load {
+                dtype: DType::Q5K, ..
+            } => true,
+            KirExpr::Load { idx, .. } => expr_needs_q5(idx),
+            KirExpr::Bin { a, b, .. } => expr_needs_q5(a) || expr_needs_q5(b),
+            KirExpr::Unary { a, .. } => expr_needs_q5(a),
+            KirExpr::CastF32ToU32(e) | KirExpr::CastU32ToF32(e) => expr_needs_q5(e),
+            _ => false,
+        }
+    }
+    walk(stmts)
+}
+
 fn body_needs_q6(stmts: &[KirStmt]) -> bool {
     (0..8).any(|b| buf_is_q6(stmts, b))
 }
@@ -2037,6 +2127,11 @@ fn emit_expr_ty(
                 DType::F16 => format!("float({load})"),
                 DType::Q4K => format!(
                     "ksearch_load_q4k({}, {})",
+                    buf_name(*buf, n_in, n_out),
+                    idx_u
+                ),
+                DType::Q5K => format!(
+                    "ksearch_load_q5k({}, {})",
                     buf_name(*buf, n_in, n_out),
                     idx_u
                 ),

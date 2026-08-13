@@ -356,8 +356,13 @@ pub fn lower_to_kir(
             ..
         } => (
             KirLaunch::Elementwise { n: *n },
-            // Load uses src_dtype (Q4K/Q6K expand); store uses Call out dtype (F16).
+            // Load uses src_dtype (Q4K/Q5K/Q6K expand); store uses Call out dtype (F16).
             lower_copy_scale(*src_off, *dst_off, *scale, sk.inputs.len() as u32, *src_dtype),
+            1,
+        ),
+        KernelKind::CopyScaleIndexed { n, scale, src_dtype, .. } => (
+            KirLaunch::Elementwise { n: *n },
+            lower_copy_scale_indexed(*n, *scale, sk.inputs.len() as u32, *src_dtype),
             1,
         ),
         KernelKind::GeluMul { n, up_off, .. } => (
@@ -3224,6 +3229,31 @@ fn lower_copy_scale(
             ld(0, bin(BinOp::Add, cu(src_off as u32), g), dt),
         ),
     )]
+}
+
+/// `out[gid] = scale * src[uint(idx[0]) * n + gid]`. Inputs: 0=src, 1=idx (F32).
+fn lower_copy_scale_indexed(n: usize, scale: f32, n_in: u32, dt: DType) -> Vec<KirStmt> {
+    let g = gid();
+    let row = 0u32;
+    vec![
+        KirStmt::LetU32 {
+            id: row,
+            expr: KirExpr::CastF32ToU32(Box::new(ld(1, cu(0), DType::F32))),
+        },
+        st(
+            n_in,
+            g.clone(),
+            bin(
+                BinOp::Mul,
+                c(scale),
+                ld(
+                    0,
+                    bin(BinOp::Add, bin(BinOp::Mul, uv(row), cu(n as u32)), g),
+                    dt,
+                ),
+            ),
+        ),
+    ]
 }
 
 /// `out0 = residual + rms(y)*w_post`, `out1 = rms(out0)*w_ffn`.

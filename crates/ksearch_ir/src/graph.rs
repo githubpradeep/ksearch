@@ -603,7 +603,7 @@ impl Graph {
         // Float: same dtype. Packed K-quant: Load expand → F16 acts (Thesis A).
         let out_dt = if d.is_float() {
             d
-        } else if matches!(d, DType::Q4K | DType::Q6K) {
+        } else if matches!(d, DType::Q4K | DType::Q5K | DType::Q6K) {
             DType::F16
         } else {
             return Err(IrError::ShapeMismatch);
@@ -618,6 +618,40 @@ impl Graph {
                 n,
                 scale,
                 src,
+                src_dtype: d,
+            },
+        ))
+    }
+
+    /// Gather one packed/F16 row: `out[i] = scale * src[uint(idx[0]) * n + i]`.
+    pub fn copy_scale_indexed(
+        &mut self,
+        src: TensorId,
+        idx: TensorId,
+        n: usize,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (_, d) = self.shape_dtype(src)?;
+        let (is, idt) = self.shape_dtype(idx)?;
+        if is.numel() < 1 || idt != DType::F32 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let out_dt = if d.is_float() {
+            d
+        } else if matches!(d, DType::Q4K | DType::Q5K | DType::Q6K) {
+            DType::F16
+        } else {
+            return Err(IrError::ShapeMismatch);
+        };
+        Ok(self.call(
+            vec![src, idx],
+            Shape(vec![n]),
+            out_dt,
+            FuseHint::CopyScaleIndexed {
+                n,
+                scale,
+                src,
+                idx,
                 src_dtype: d,
             },
         ))

@@ -17,6 +17,7 @@ const PREFILL_CHUNK: usize = 32;
 enum WeightBuf {
     F16(Buffer),
     Q4K(Buffer),
+    Q5K(Buffer),
     Q6K(Buffer),
 }
 
@@ -56,13 +57,14 @@ impl WeightBuf {
         match self {
             WeightBuf::F16(_) => DType::F16,
             WeightBuf::Q4K(_) => DType::Q4K,
+            WeightBuf::Q5K(_) => DType::Q5K,
             WeightBuf::Q6K(_) => DType::Q6K,
         }
     }
 
     fn buf(&self) -> &Buffer {
         match self {
-            WeightBuf::F16(b) | WeightBuf::Q4K(b) | WeightBuf::Q6K(b) => b,
+            WeightBuf::F16(b) | WeightBuf::Q4K(b) | WeightBuf::Q5K(b) | WeightBuf::Q6K(b) => b,
         }
     }
 }
@@ -91,9 +93,12 @@ pub struct GemmaPrimModel {
     tmp_ff2: Buffer,
     tmp_ff3: Buffer,
     logits: Buffer,
-    argmax_out: Buffer,
+    /// Ping-pong F32 token ids: decode step i reads `[i&1]`, writes `[(i+1)&1]`.
+    tok_idx: [Buffer; 2],
     ple_tok: Buffer,
-    /// Double-buffer host→GPU PLE token rows.
+    /// Packed `per_layer_token_embd` for GPU row gather (Q5_K Load expand).
+    ple_embd: Option<WeightBuf>,
+    /// Double-buffer host→GPU PLE token rows (prefill / fallback).
     ple_stage: [Buffer; 2],
     ple_ctx: Buffer,
     ple_tmp: Buffer,
@@ -112,6 +117,8 @@ pub struct GemmaPrimModel {
     weight_bufs: HashMap<String, WeightBuf>,
     max_seq: usize,
     pub pos: usize,
+    decode_src: usize,
+    return_token_sync: bool,
 }
 
 impl GemmaPrimModel {
@@ -219,7 +226,7 @@ impl GemmaPrimModel {
         let tmp_ff2 = ctx.buffer_empty_f16(max_ff);
         let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
         let logits = ctx.buffer_empty_f16(cfg.vocab);
-        let argmax_out = ctx.buffer_empty_f32(1);
+        let tok_idx = [ctx.buffer_empty_f32(1), ctx.buffer_empty_f32(1)];
         let ple_tok = ctx.buffer_empty_f16(ple_total);
         let ple_stage = [
             ctx.buffer_empty_f16(ple_total),
@@ -291,8 +298,9 @@ impl GemmaPrimModel {
             tmp_ff2,
             tmp_ff3,
             logits,
-            argmax_out,
+            tok_idx,
             ple_tok,
+            ple_embd: None,
             ple_stage,
             ple_ctx,
             ple_tmp,
@@ -310,6 +318,8 @@ impl GemmaPrimModel {
             weight_bufs: HashMap::new(),
             max_seq,
             pos: 0,
+            decode_src: 0,
+            return_token_sync: true,
         };
         if model.gguf.has_tensor("per_layer_model_proj.weight") {
             let scale = 1.0 / (model.cfg.hidden as f32).sqrt();
@@ -335,6 +345,52 @@ impl GemmaPrimModel {
                     model.ensure_weight(&full)?;
                 }
             }
+        }
+        if model.gguf.has_tensor("per_layer_token_embd.weight") {
+            let ty = model.gguf.tensor_type("per_layer_token_embd.weight");
+            if ty == ggml_type::Q5_K {
+                let raw = model.gguf.tensor_raw("per_layer_token_embd.weight");
+                eprintln!(
+                    "[prim] per_layer_token_embd Q5_K ({:.1} MB) — Load(Q5K) row gather",
+                    raw.len() as f64 / 1e6
+                );
+                model.ple_embd = Some(WeightBuf::Q5K(model.ctx.buffer_bytes(raw)));
+            }
+        }
+        if let Some(ple) = model.ple_embd.as_ref() {
+            let h = model.cfg.hidden;
+            let idx = model.tok_idx[0].clone();
+            let x = model.x.clone();
+            let ple_tok = model.ple_tok.clone();
+            let ple_dt = ple.dtype();
+            let ple_buf = ple.buf().clone();
+            let scale_e = (h as f32).sqrt();
+            let scale_p = (model.cfg.ple_dim as f32).sqrt();
+            match &model.token_embd {
+                WeightBuf::F16(embd) => {
+                    let e = embd.clone();
+                    model.eng.copy_scale_indexed_wd(
+                        &model.ctx, h, scale_e, DType::F16, &e, &idx, &x,
+                    )?;
+                }
+                WeightBuf::Q4K(embd) => {
+                    let e = embd.clone();
+                    model.eng.copy_scale_indexed_wd(
+                        &model.ctx, h, scale_e, DType::Q4K, &e, &idx, &x,
+                    )?;
+                }
+                _ => {}
+            }
+            model.eng.copy_scale_indexed_wd(
+                &model.ctx,
+                model.cfg.ple_total(),
+                scale_p,
+                ple_dt,
+                &ple_buf,
+                &idx,
+                &ple_tok,
+            )?;
+            model.ctx.synchronize()?;
         }
         Ok(model)
     }
@@ -576,8 +632,58 @@ impl GemmaPrimModel {
                     0,
                 )?;
             }
-            WeightBuf::Q6K(_) => bail!("token_embd Q6_K embed not wired"),
+            WeightBuf::Q5K(_) | WeightBuf::Q6K(_) => bail!("token_embd Q5/Q6 embed not wired"),
         }
+        Ok(())
+    }
+
+    /// GPU-resident embed: row index from F32 token-id buffer.
+    fn embed_from_idx(&mut self, idx: &Buffer) -> Result<()> {
+        let h = self.cfg.hidden;
+        let scale = (h as f32).sqrt();
+        match &self.token_embd {
+            WeightBuf::F16(embd) => {
+                self.eng.copy_scale_indexed_wd(
+                    &self.ctx,
+                    h,
+                    scale,
+                    DType::F16,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q4K(embd) => {
+                self.eng.copy_scale_indexed_wd(
+                    &self.ctx,
+                    h,
+                    scale,
+                    DType::Q4K,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q5K(_) | WeightBuf::Q6K(_) => bail!("token_embd Q5/Q6 embed not wired"),
+        }
+        Ok(())
+    }
+
+    /// GPU-resident PLE row gather from F32 token-id buffer.
+    fn ple_from_idx(&mut self, idx: &Buffer) -> Result<()> {
+        let Some(ple) = self.ple_embd.as_ref() else {
+            bail!("ple_from_idx: packed PLE table not loaded");
+        };
+        let scale = (self.cfg.ple_dim as f32).sqrt();
+        self.eng.copy_scale_indexed_wd(
+            &self.ctx,
+            self.cfg.ple_total(),
+            scale,
+            ple.dtype(),
+            ple.buf(),
+            idx,
+            &self.ple_tok,
+        )?;
         Ok(())
     }
 
@@ -651,9 +757,20 @@ impl GemmaPrimModel {
         }
         let profile = std::env::var_os("KSEARCH_PROFILE").is_some();
         let t0 = Instant::now();
-        self.embed_token(token)?;
+        let gpu_idx = want_logits && self.ple_embd.is_some();
+        if gpu_idx {
+            let src = self.tok_idx[self.decode_src].clone();
+            self.embed_from_idx(&src)?;
+        } else {
+            self.embed_token(token)?;
+        }
         let t_embed = t0.elapsed();
-        self.load_ple_token(token)?;
+        if gpu_idx {
+            let src = self.tok_idx[self.decode_src].clone();
+            self.ple_from_idx(&src)?;
+        } else {
+            self.load_ple_token(token)?;
+        }
         let t_ple = t0.elapsed();
         self.ple_prepass()?;
         let t_pre = t0.elapsed();
@@ -982,10 +1099,14 @@ impl GemmaPrimModel {
                 &self.ctx, vocab, h, eps, embd_dt, &self.x, &self.output_norm, &embd, &self.logits,
             )?;
         }
+        let dst = self.tok_idx[self.decode_src ^ 1].clone();
         self.eng
-            .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &self.argmax_out)?;
+            .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &dst)?;
         let t_logits = t0.elapsed();
-        let best = self.ctx.read_f32(&self.argmax_out, 1)[0] as u32;
+        if !self.return_token_sync {
+            return Ok(None);
+        }
+        let best = self.ctx.read_f32(&dst, 1)[0] as u32;
         if profile {
             eprintln!(
                 "[profile] decode pos={} embed={:.1}ms ple_load={:.1}ms prepass={:.1}ms attn={:.1}ms mlp={:.1}ms ple={:.1}ms logits+sync={:.1}ms total={:.1}ms",
@@ -1015,6 +1136,8 @@ impl GemmaPrimModel {
 
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.decode_src = 0;
+        self.return_token_sync = true;
         self.ctx.synchronize().ok();
         for b in self.kv_k.iter().chain(self.kv_v.iter()) {
             let n = b.length() as usize;
@@ -1047,27 +1170,78 @@ impl GemmaPrimModel {
         let prefill_tokens = prefill_toks.len();
 
         let mut tok = *prompt_tokens.last().unwrap();
+        let gpu_pipe = self.ple_embd.is_some();
         let t_decode = Instant::now();
-        for i in 0..n_new {
-            let step_t0 = Instant::now();
-            let next = self
-                .forward_token(tok, true)?
-                .ok_or_else(|| anyhow!("decode expected logits"))?;
-            out.push(next);
-            tok = next;
-            if verbose {
-                let piece = self
-                    .vocab
-                    .as_ref()
-                    .map(|v| v.decode(&[next], false))
-                    .unwrap_or_default();
-                eprintln!(
-                    "  token[{i}] = {next} {piece:?}  ({:.0}ms)",
-                    step_t0.elapsed().as_secs_f64() * 1e3
-                );
+        if gpu_pipe {
+            self.ctx.synchronize()?;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[0], &[tok as f32]);
+            self.return_token_sync = false;
+            let mut stopped = false;
+            for i in 0..n_new {
+                let step_t0 = Instant::now();
+                self.decode_src = i & 1;
+                let _ = self.forward_token(tok, true)?;
+                self.ctx.flush_async();
+                if i > 0 {
+                    self.ctx.wait_inflight_at_most(1);
+                    let next = self.ctx.read_f32_nosync(&self.tok_idx[i & 1], 1)[0] as u32;
+                    out.push(next);
+                    tok = next;
+                    if verbose {
+                        let piece = self
+                            .vocab
+                            .as_ref()
+                            .map(|v| v.decode(&[next], false))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  token[{}] = {next} {piece:?}  ({:.0}ms)",
+                            out.len() - 1,
+                            step_t0.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    if next == 1 || next == 106 {
+                        stopped = true;
+                        break;
+                    }
+                }
             }
-            if next == 1 || next == 106 {
-                break;
+            if !stopped && n_new > 0 {
+                self.ctx.wait_inflight_at_most(0);
+                let next = self.ctx.read_f32_nosync(&self.tok_idx[n_new & 1], 1)[0] as u32;
+                out.push(next);
+                if verbose {
+                    let piece = self
+                        .vocab
+                        .as_ref()
+                        .map(|v| v.decode(&[next], false))
+                        .unwrap_or_default();
+                    eprintln!("  token[{}] = {next} {piece:?}", out.len() - 1);
+                }
+            }
+            self.return_token_sync = true;
+        } else {
+            for i in 0..n_new {
+                let step_t0 = Instant::now();
+                let next = self
+                    .forward_token(tok, true)?
+                    .ok_or_else(|| anyhow!("decode expected logits"))?;
+                out.push(next);
+                tok = next;
+                if verbose {
+                    let piece = self
+                        .vocab
+                        .as_ref()
+                        .map(|v| v.decode(&[next], false))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "  token[{i}] = {next} {piece:?}  ({:.0}ms)",
+                        step_t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                if next == 1 || next == 106 {
+                    break;
+                }
             }
         }
         let decode_s = t_decode.elapsed().as_secs_f64();

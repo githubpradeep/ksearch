@@ -146,7 +146,15 @@ pub enum FuseHint {
         n: usize,
         scale: f32,
         src: TensorId,
-        /// Logical load dtype (F16 or Q4K/Q6K); store uses Call out dtype (F16 for quant).
+        /// Logical load dtype (F16 or Q4K/Q5K/Q6K); store uses Call out dtype (F16 for quant).
+        src_dtype: DType,
+    },
+    /// `out[gid] = scale * src[uint(idx[0]) * n + gid]` (GPU-resident row gather).
+    CopyScaleIndexed {
+        n: usize,
+        scale: f32,
+        src: TensorId,
+        idx: TensorId,
         src_dtype: DType,
     },
     GeluMul {
@@ -438,7 +446,14 @@ pub enum KernelKind {
         n: usize,
         scale: f32,
         src: TensorId,
-        /// Logical load dtype (F16 or Q4K/Q6K); store uses Call out dtype (F16 for quant).
+        /// Logical load dtype (F16 or Q4K/Q5K/Q6K); store uses Call out dtype (F16 for quant).
+        src_dtype: DType,
+    },
+    CopyScaleIndexed {
+        n: usize,
+        scale: f32,
+        src: TensorId,
+        idx: TensorId,
         src_dtype: DType,
     },
     GeluMul {

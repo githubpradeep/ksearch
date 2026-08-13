@@ -1259,7 +1259,7 @@ impl Eng {
     }
 
     /// Copy `n` logical elems from `src` (+byte offset) with scale. `dtype` may be F16 or
-    /// Q4K/Q6K (Load expand → F16). Offsets are **bytes** into the buffers.
+    /// Q4K/Q5K/Q6K (Load expand → F16). Offsets are **bytes** into the buffers.
     pub fn copy_scale_wd(
         &mut self,
         ctx: &MetalContext,
@@ -1288,6 +1288,29 @@ impl Eng {
             dst,
             dst_byte_off as u64,
         )
+    }
+
+    /// GPU-resident row gather: `dst[i] = scale * src[uint(idx[0]) * n + i]`.
+    pub fn copy_scale_indexed_wd(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        scale: f32,
+        dtype: DType,
+        src: &Buffer,
+        idx: &Buffer,
+        dst: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(dtype);
+        let key = format!("csl_sc_idx_{tag}_{n}_{}", scale.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), dtype);
+            let ii = g.input(Shape(vec![1]), DType::F32);
+            let out = g.copy_scale_indexed(xi, ii, n, scale)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[src, idx], dst)
     }
 
     pub fn softcap_argmax(
@@ -1421,6 +1444,7 @@ impl Eng {
 fn weight_cache_tag(d: DType) -> &'static str {
     match d {
         DType::Q4K => "q4k",
+        DType::Q5K => "q5k",
         DType::Q6K => "q6k",
         DType::F16 => "f16",
         DType::F32 => "f32",
