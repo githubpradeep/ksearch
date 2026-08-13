@@ -3,7 +3,7 @@
 mod gemma_prim;
 mod kv_pool;
 
-pub use gemma_prim::GemmaPrimModel;
+pub use gemma_prim::{GemmaPrimModel, PREFILL_CHUNK_SIZE};
 pub use kv_pool::{KvPool, KvSlot, SlotId};
 
 use anyhow::{anyhow, Result};

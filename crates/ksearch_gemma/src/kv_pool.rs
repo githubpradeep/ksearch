@@ -137,6 +137,28 @@ impl KvPool {
         bail!("KvPool full (max_batch={})", self.max_batch)
     }
 
+    /// Zero K/V packs for a slot (call after [`alloc`] before first prefill).
+    pub fn clear_slot(&self, id: SlotId) -> Result<()> {
+        let i = id.0 as usize;
+        if i >= self.max_batch {
+            bail!("bad SlotId");
+        }
+        for b in self.k[i].iter().chain(self.v[i].iter()) {
+            let n = b.length() as usize;
+            unsafe {
+                std::ptr::write_bytes(b.contents() as *mut u8, 0, n);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn seq_len(&self, id: SlotId) -> Result<usize> {
+        self.slots
+            .get(id.0 as usize)
+            .map(|s| s.seq_len)
+            .ok_or_else(|| anyhow::anyhow!("bad SlotId"))
+    }
+
     pub fn free(&mut self, id: SlotId) -> Result<()> {
         let s = self
             .slots

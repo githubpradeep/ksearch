@@ -1,7 +1,7 @@
 //! Thesis A Gemma path: Graph→AST→MSL. Q4_K weights stay packed (`Load(Q4K)` expand);
 //! other quant types dequant → F16. Activations stay F16.
 
-use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
+use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool, SlotId};
 use anyhow::{anyhow, bail, Result};
 use ksearch_gguf::{f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
 use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
@@ -13,6 +13,9 @@ use std::path::Path;
 use std::time::Instant;
 
 const PREFILL_CHUNK: usize = 32;
+
+/// Tokens per prefill chunk (also the server scheduler's default slice).
+pub const PREFILL_CHUNK_SIZE: usize = PREFILL_CHUNK;
 
 enum WeightBuf {
     F16(Buffer),
@@ -1122,6 +1125,46 @@ impl GemmaPrimModel {
             );
         }
         Ok(Some(best))
+    }
+
+    /// Bind this sequence's K/V packs and `pos` to a pool slot (serving).
+    pub fn bind_slot(&mut self, pool: &KvPool, slot: SlotId) -> Result<()> {
+        if self.kv_k.len() != pool.n_kv_layers {
+            bail!(
+                "kv layer mismatch: model={} pool={}",
+                self.kv_k.len(),
+                pool.n_kv_layers
+            );
+        }
+        for i in 0..self.kv_k.len() {
+            self.kv_k[i] = pool.k_buf(slot, i)?.clone();
+            self.kv_v[i] = pool.v_buf(slot, i)?.clone();
+        }
+        self.pos = pool.seq_len(slot)?;
+        Ok(())
+    }
+
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
+    /// Prefill one token (KV write, no logits).
+    pub fn prefill_token(&mut self, token: u32) -> Result<()> {
+        let _ = self.forward_token(token, false)?;
+        Ok(())
+    }
+
+    /// Decode one token: embed/PLE from `token`, return next greedy id.
+    pub fn decode_token(&mut self, token: u32) -> Result<u32> {
+        self.decode_src = 0;
+        self.return_token_sync = true;
+        if self.ple_embd.is_some() {
+            self.ctx.synchronize()?;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[0], &[token as f32]);
+        }
+        self.forward_token(token, true)?
+            .ok_or_else(|| anyhow!("decode expected logits"))
     }
 
     /// F32 KV pool for multi-stream decode (P5 serving contract).
