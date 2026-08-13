@@ -616,18 +616,19 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
             let wi = g.input(Shape(vec![hd]), DType::F16);
-            let ci = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rmsnorm_per_head_rope(xi, wi, ci, n_heads, hd, eps, true)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
-        let b = DType::F16.size_bytes() as u64;
+        let b16 = DType::F16.size_bytes() as u64;
+        let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets(
             ctx,
             &key,
             &[x, w, cos_sin],
-            &[0, 0, cos_sin_off_elems as u64 * b],
+            &[0, 0, cos_sin_off_elems as u64 * b32],
             y,
-            y_off_elems as u64 * b,
+            y_off_elems as u64 * b16,
         )
     }
 
@@ -720,6 +721,70 @@ impl Eng {
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
         self.run(ctx, &key, &[gate, up], y)
+    }
+
+    /// `y[i] = gelu(gate[i]) * up[i]` with F16 element offsets.
+    pub fn gelu_mul_off(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        gate: &Buffer,
+        gate_off_elems: usize,
+        up: &Buffer,
+        up_off_elems: usize,
+        y: &Buffer,
+        y_off_elems: usize,
+    ) -> Result<()> {
+        let key = format!("gelu_f16_{n}_0");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let gate_i = g.input(Shape(vec![n]), DType::F16);
+            let up_i = g.input(Shape(vec![n]), DType::F16);
+            let out = g.gelu_mul_at(gate_i, up_i, 0)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b = DType::F16.size_bytes() as u64;
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[gate, up],
+            &[gate_off_elems as u64 * b, up_off_elems as u64 * b],
+            &[y],
+            &[y_off_elems as u64 * b],
+        )
+    }
+
+    /// `y[t*inner + i] = gelu(gate[t*inner + i]) * up[t*up_stride + i]` (up may be byte-offset).
+    pub fn gelu_mul_strided(
+        &mut self,
+        ctx: &MetalContext,
+        inner: usize,
+        n_tok: usize,
+        gate: &Buffer,
+        up: &Buffer,
+        up_off_elems: usize,
+        up_stride: usize,
+        y: &Buffer,
+    ) -> Result<()> {
+        let n = inner * n_tok;
+        let key = format!("gelu_f16_strided_{n_tok}_{inner}_{up_stride}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let gate_i = g.input(Shape(vec![n]), DType::F16);
+            let up_need = (n_tok.saturating_sub(1)) * up_stride + inner;
+            let up_i = g.input(Shape(vec![up_need.max(1)]), DType::F16);
+            let out = g.gelu_mul_strided(gate_i, up_i, inner, n_tok, 0, up_stride)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b = DType::F16.size_bytes() as u64;
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[gate, up],
+            &[0, up_off_elems as u64 * b],
+            &[y],
+            &[0],
+        )
     }
 
     /// PLE gate: fused matvec + `gelu(acc)*ctx[i]` (one launch). Use `ctx` byte offset for layer slice.
@@ -994,7 +1059,7 @@ impl Eng {
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
-            let ci = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rope(xi, ci, n_heads, hd)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
@@ -1036,7 +1101,7 @@ impl Eng {
             let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
             let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
             let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
-            let mi = g.input(Shape(vec![2]), DType::F16);
+            let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_naive(qi, ki, vi, mi, n_q, hd, max_t)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
         }
@@ -1069,7 +1134,7 @@ impl Eng {
             let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
             let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
             let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
-            let mi = g.input(Shape(vec![2]), DType::F16);
+            let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_mwg_part(qi, ki, vi, mi, n_q, hd, max_t, nwg)?;
             self.ensure(ctx, &part_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
         }
@@ -1081,6 +1146,7 @@ impl Eng {
             self.ensure(ctx, &red_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
         }
         self.run(ctx, &part_key, &[q, k, v, meta], tmp)?;
+        ctx.encoder_barrier();
         self.run(ctx, &red_key, &[tmp], out)
     }
 
@@ -1146,16 +1212,16 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
             let wi = g.input(Shape(vec![hd]), DType::F16);
-            let ci = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rmsnorm_per_head_rope_q40(xi, wi, ci, n_heads, hd, eps, true)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
-        let b = DType::F16.size_bytes() as u64;
+        let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets(
             ctx,
             &key,
             &[x, w, cos_sin],
-            &[0, 0, cos_sin_off_elems as u64 * b],
+            &[0, 0, cos_sin_off_elems as u64 * b32],
             dst,
             dst_byte_off as u64,
         )
@@ -1208,19 +1274,19 @@ impl Eng {
             let mut g = Graph::new();
             let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
             let qwi = g.input(Shape(vec![hd]), DType::F16);
-            let ci = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
             let ki = g.input(Shape(vec![n_kv * hd]), DType::F16);
             let kwi = g.input(Shape(vec![hd]), DType::F16);
             let vi = g.input(Shape(vec![n_kv * hd]), DType::F16);
             let out = g.rmsnorm_per_head_qkv_q40(qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, eps)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
-        let b = DType::F16.size_bytes() as u64;
+        let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets_multi(
             ctx,
             &key,
             &[q, qw, cos_sin, k, kw, v],
-            &[0, 0, cos_sin_off_elems as u64 * b, 0, 0, 0],
+            &[0, 0, cos_sin_off_elems as u64 * b32, 0, 0, 0],
             &[q_out, kv_k, kv_v],
             &[0, kv_byte_off as u64, kv_byte_off as u64],
         )
@@ -1311,6 +1377,581 @@ impl Eng {
             self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
         }
         self.run(ctx, &key, &[src, idx], dst)
+    }
+
+    /// Prefill: gather `batch` rows; `idx` is F32 `[batch]`.
+    pub fn copy_scale_indexed_batch_wd(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        batch: usize,
+        scale: f32,
+        dtype: DType,
+        src: &Buffer,
+        idx: &Buffer,
+        dst: &Buffer,
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.copy_scale_indexed_wd(ctx, n, scale, dtype, src, idx, dst);
+        }
+        let tag = weight_cache_tag(dtype);
+        let key = format!("csl_sc_idx_b{batch}_{tag}_{n}_{}", scale.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), dtype);
+            let ii = g.input(Shape(vec![batch]), DType::F32);
+            let out = g.copy_scale_indexed_batch(xi, ii, n, batch, scale)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[src, idx], dst)
+    }
+
+    /// Prefill: `y[t] = W @ x[t]` for `t in 0..batch`.
+    pub fn matvec_batch(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        weight_dtype: DType,
+        a: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec_wd(ctx, rows, cols, weight_dtype, a, x, y);
+        }
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("mv_b{batch}_{tag}_{rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let w = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let v = g.input(Shape(vec![batch * cols]), DType::F16);
+            let out = g.matvec_batch(w, v, batch)?;
+            self.ensure(
+                ctx,
+                &key,
+                lower_to_metal_chip(&g, out, &ctx.device_name()).map_err(|e| {
+                    anyhow::anyhow!("matvec_batch {tag} {batch}x{rows}x{cols}: {e}")
+                })?,
+            )?;
+        }
+        self.run(ctx, &key, &[a, x], y)
+    }
+
+    pub fn matvec_wd_at(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        weight_dtype: DType,
+        a: &Buffer,
+        x: &Buffer,
+        x_off_elems: usize,
+        y: &Buffer,
+        y_off_elems: usize,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("mv_{tag}_{rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let w = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let v = g.input(Shape(vec![cols]), DType::F16);
+            let out = g.matvec_prim(w, v)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b = DType::F16.size_bytes() as u64;
+        self.run_offsets(
+            ctx,
+            &key,
+            &[a, x],
+            &[0, x_off_elems as u64 * b],
+            y,
+            y_off_elems as u64 * b,
+        )
+    }
+
+    pub fn rmsnorm_rows(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        rows: usize,
+        eps: f32,
+        x: &Buffer,
+        w: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.rmsnorm(ctx, n, eps, x, w, y);
+        }
+        let key = format!("rms_f16_rows_{rows}_{n}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![rows * n]), DType::F16);
+            let wi = g.input(Shape(vec![n]), DType::F16);
+            let out = g.rmsnorm_rows(xi, wi, n, rows, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[x, w], y)
+    }
+
+    pub fn rmsnorm_add_rows(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        rows: usize,
+        eps: f32,
+        x: &Buffer,
+        w: &Buffer,
+        residual: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.rmsnorm_add(ctx, n, eps, x, w, residual, y);
+        }
+        let key = format!("rms_f16_add_rows_{rows}_{n}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![rows * n]), DType::F16);
+            let wi = g.input(Shape(vec![n]), DType::F16);
+            let ri = g.input(Shape(vec![rows * n]), DType::F16);
+            let out = g.rmsnorm_add_rows(xi, wi, ri, n, rows, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[x, w, residual], y)
+    }
+
+    pub fn rmsnorm_add_scale_rows(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        rows: usize,
+        eps: f32,
+        scale: f32,
+        x: &Buffer,
+        w: &Buffer,
+        residual: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.rmsnorm_add_scale_at(
+                ctx, n, eps, scale, x, 0, w, residual, 0, y, 0,
+            );
+        }
+        let key = format!(
+            "rms_f16_add_sc_rows_{rows}_{n}_{}_{}",
+            eps.to_bits(),
+            scale.to_bits()
+        );
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![rows * n]), DType::F16);
+            let wi = g.input(Shape(vec![n]), DType::F16);
+            let ri = g.input(Shape(vec![rows * n]), DType::F16);
+            let out = g.rmsnorm_add_scale_rows(xi, wi, ri, n, rows, eps, scale)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[x, w, residual], y)
+    }
+
+    pub fn rmsnorm_add_then_rmsnorm_rows(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        rows: usize,
+        eps: f32,
+        y: &Buffer,
+        w_post: &Buffer,
+        residual: &Buffer,
+        w_ffn: &Buffer,
+        out_x: &Buffer,
+        out_x2: &Buffer,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.rmsnorm_add_then_rmsnorm(
+                ctx, n, eps, y, w_post, residual, w_ffn, out_x, out_x2,
+            );
+        }
+        let key = format!("rms_f16_add_then_rms_rows_{rows}_{n}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let yi = g.input(Shape(vec![rows * n]), DType::F16);
+            let wp = g.input(Shape(vec![n]), DType::F16);
+            let ri = g.input(Shape(vec![rows * n]), DType::F16);
+            let wf = g.input(Shape(vec![n]), DType::F16);
+            let out = g.rmsnorm_add_then_rmsnorm_rows(yi, wp, ri, wf, n, rows, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run_multi(ctx, &key, &[y, w_post, residual, w_ffn], &[out_x, out_x2])
+    }
+
+    pub fn sdpa_hybrid_kv_batch(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        n_tok: usize,
+        hd: usize,
+        max_t: usize,
+        attn_t: u32,
+        kv_dtype: DType,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+    ) -> Result<()> {
+        if n_tok == 1 {
+            return self.sdpa_hybrid_kv(
+                ctx, n_q, hd, max_t, attn_t, kv_dtype, q, k, v, meta, tmp, out,
+            );
+        }
+        if attn_t >= Self::SDPA_MWG_THRESHOLD {
+            self.sdpa_mwg_kv_batch(
+                ctx, n_q, n_tok, hd, max_t, kv_dtype, q, k, v, meta, tmp, out,
+            )
+        } else {
+            self.sdpa_naive_kv_batch(ctx, n_q, n_tok, hd, max_t, kv_dtype, q, k, v, meta, out)
+        }
+    }
+
+    pub fn sdpa_naive_kv_batch(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        n_tok: usize,
+        hd: usize,
+        max_t: usize,
+        kv_dtype: DType,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        out: &Buffer,
+    ) -> Result<()> {
+        let key = format!("sdpa_f16_b{n_tok}_{n_q}_{hd}_{max_t}_{kv_dtype:?}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_tok * n_q * hd]), DType::F16);
+            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let mi = g.input(Shape(vec![4]), DType::F32);
+            let o = g.sdpa_naive_batch(qi, ki, vi, mi, n_q, n_tok, hd, max_t)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[q, k, v, meta], out)
+    }
+
+    pub fn sdpa_mwg_kv_batch(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        n_tok: usize,
+        hd: usize,
+        max_t: usize,
+        kv_dtype: DType,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+    ) -> Result<()> {
+        let nwg = Self::SDPA_MWG_NWG;
+        let part_key = format!("sdpa_mwg_part_b{n_tok}_{n_q}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
+        let red_key = format!("sdpa_mwg_red_b{n_tok}_{n_q}_{hd}_{nwg}");
+        if !self.cache.contains_key(&part_key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_tok * n_q * hd]), DType::F16);
+            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let mi = g.input(Shape(vec![4]), DType::F32);
+            let t = g.sdpa_mwg_part_batch(qi, ki, vi, mi, n_q, n_tok, hd, max_t, nwg)?;
+            self.ensure(ctx, &part_key, lower_to_metal_chip(&g, t, &ctx.device_name())?)?;
+        }
+        if !self.cache.contains_key(&red_key) {
+            let mut g = Graph::new();
+            let ti = g.input(Shape(vec![n_tok * n_q * nwg * (hd + 2)]), DType::F32);
+            let o = g.sdpa_mwg_reduce_batch(ti, n_q, n_tok, hd, nwg)?;
+            self.ensure(ctx, &red_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &part_key, &[q, k, v, meta], tmp)?;
+        ctx.encoder_barrier();
+        self.run(ctx, &red_key, &[tmp], out)
+    }
+
+    pub fn rmsnorm_per_head_qkv_q40_row(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+        q: &Buffer,
+        q_off_elems: usize,
+        qw: &Buffer,
+        cos_sin: &Buffer,
+        cos_sin_off_elems: usize,
+        k: &Buffer,
+        k_off_elems: usize,
+        kw: &Buffer,
+        v: &Buffer,
+        v_off_elems: usize,
+        q_out: &Buffer,
+        q_out_off_elems: usize,
+        kv_k: &Buffer,
+        kv_v: &Buffer,
+        kv_byte_off: usize,
+    ) -> Result<()> {
+        let key = format!("rms_ph_qkv_q40_{n_q}_{n_kv}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
+            let qwi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
+            let ki = g.input(Shape(vec![n_kv * hd]), DType::F16);
+            let kwi = g.input(Shape(vec![hd]), DType::F16);
+            let vi = g.input(Shape(vec![n_kv * hd]), DType::F16);
+            let out = g.rmsnorm_per_head_qkv_q40(qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, eps)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b16 = DType::F16.size_bytes() as u64;
+        let b32 = DType::F32.size_bytes() as u64;
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[q, qw, cos_sin, k, kw, v],
+            &[
+                q_off_elems as u64 * b16,
+                0,
+                cos_sin_off_elems as u64 * b32,
+                k_off_elems as u64 * b16,
+                0,
+                v_off_elems as u64 * b16,
+            ],
+            &[q_out, kv_k, kv_v],
+            &[
+                q_out_off_elems as u64 * b16,
+                kv_byte_off as u64,
+                kv_byte_off as u64,
+            ],
+        )
+    }
+
+    pub fn rmsnorm_per_head_qkv_q40_batch(
+        &mut self,
+        ctx: &MetalContext,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        n_tok: usize,
+        eps: f32,
+        q: &Buffer,
+        qw: &Buffer,
+        cos_sin: &Buffer,
+        cos_sin_off_elems: usize,
+        k: &Buffer,
+        kw: &Buffer,
+        v: &Buffer,
+        q_out: &Buffer,
+        kv_k: &Buffer,
+        kv_v: &Buffer,
+        kv_byte_off: usize,
+    ) -> Result<()> {
+        if n_tok == 1 {
+            return self.rmsnorm_per_head_qkv_q40_row(
+                ctx,
+                n_q,
+                n_kv,
+                hd,
+                eps,
+                q,
+                0,
+                qw,
+                cos_sin,
+                cos_sin_off_elems,
+                k,
+                0,
+                kw,
+                v,
+                0,
+                q_out,
+                0,
+                kv_k,
+                kv_v,
+                kv_byte_off,
+            );
+        }
+        let key = format!("rms_ph_qkv_q40_b{n_tok}_{n_q}_{n_kv}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_tok * n_q * hd]), DType::F16);
+            let qwi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![n_tok * hd]), DType::F32);
+            let ki = g.input(Shape(vec![n_tok * n_kv * hd]), DType::F16);
+            let kwi = g.input(Shape(vec![hd]), DType::F16);
+            let vi = g.input(Shape(vec![n_tok * n_kv * hd]), DType::F16);
+            let out = g.rmsnorm_per_head_qkv_q40_batch(
+                qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, n_tok, eps,
+            )?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b32 = DType::F32.size_bytes() as u64;
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[q, qw, cos_sin, k, kw, v],
+            &[0, 0, cos_sin_off_elems as u64 * b32, 0, 0, 0],
+            &[q_out, kv_k, kv_v],
+            &[0, kv_byte_off as u64, kv_byte_off as u64],
+        )
+    }
+
+    pub fn rmsnorm_per_head_rope_row(
+        &mut self,
+        ctx: &MetalContext,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        x: &Buffer,
+        x_off_elems: usize,
+        w: &Buffer,
+        cos_sin: &Buffer,
+        cos_sin_off_elems: usize,
+        y: &Buffer,
+        y_off_elems: usize,
+    ) -> Result<()> {
+        let key = format!("rms_f16_ph_rope_{n_heads}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
+            let wi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
+            let out = g.rmsnorm_per_head_rope(xi, wi, ci, n_heads, hd, eps, true)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b16 = DType::F16.size_bytes() as u64;
+        let b32 = DType::F32.size_bytes() as u64;
+        self.run_offsets(
+            ctx,
+            &key,
+            &[x, w, cos_sin],
+            &[
+                x_off_elems as u64 * b16,
+                0,
+                cos_sin_off_elems as u64 * b32,
+            ],
+            y,
+            y_off_elems as u64 * b16,
+        )
+    }
+
+    pub fn rmsnorm_per_head_rope_batch(
+        &mut self,
+        ctx: &MetalContext,
+        n_heads: usize,
+        hd: usize,
+        n_tok: usize,
+        eps: f32,
+        x: &Buffer,
+        w: &Buffer,
+        cos_sin: &Buffer,
+        cos_sin_off_elems: usize,
+        y: &Buffer,
+    ) -> Result<()> {
+        if n_tok == 1 {
+            return self.rmsnorm_per_head_rope_row(
+                ctx, n_heads, hd, eps, x, 0, w, cos_sin, cos_sin_off_elems, y, 0,
+            );
+        }
+        let key = format!("rms_f16_ph_rope_b{n_tok}_{n_heads}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n_tok * n_heads * hd]), DType::F16);
+            let wi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![n_tok * hd]), DType::F32);
+            let out = g.rmsnorm_per_head_rope_batch(
+                xi, wi, ci, n_heads, hd, n_tok, eps, true,
+            )?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b32 = DType::F32.size_bytes() as u64;
+        self.run_offsets(
+            ctx,
+            &key,
+            &[x, w, cos_sin],
+            &[0, 0, cos_sin_off_elems as u64 * b32],
+            y,
+            0,
+        )
+    }
+
+    pub fn matvec_gelu_mul_row(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        weight_dtype: DType,
+        w: &Buffer,
+        x: &Buffer,
+        x_off_elems: usize,
+        ctx_buf: &Buffer,
+        ctx_off_elems: usize,
+        y: &Buffer,
+    ) -> Result<()> {
+        let tag = weight_cache_tag(weight_dtype);
+        let key = format!("mv_gelu_mul_{tag}_{rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wi = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let xi = g.input(Shape(vec![cols]), DType::F16);
+            let ci = g.input(Shape(vec![rows]), DType::F16);
+            let out = g.matvec_gelu_mul(wi, xi, ci, 0)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b = DType::F16.size_bytes() as u64;
+        self.run_offsets(
+            ctx,
+            &key,
+            &[w, x, ctx_buf],
+            &[0, x_off_elems as u64 * b, ctx_off_elems as u64 * b],
+            y,
+            0,
+        )
+    }
+
+    pub fn rmsnorm_add_scale_at(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        eps: f32,
+        scale: f32,
+        x: &Buffer,
+        x_off_elems: usize,
+        w: &Buffer,
+        residual: &Buffer,
+        res_off_elems: usize,
+        y: &Buffer,
+        y_off_elems: usize,
+    ) -> Result<()> {
+        let key = format!("rms_f16_add_sc_{n}_{}_{}", eps.to_bits(), scale.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n]), DType::F16);
+            let wi = g.input(Shape(vec![n]), DType::F16);
+            let ri = g.input(Shape(vec![n]), DType::F16);
+            let out = g.rmsnorm_add_scale_expand(xi, wi, ri, eps, scale)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        let b = DType::F16.size_bytes() as u64;
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[x, w, residual],
+            &[x_off_elems as u64 * b, 0, res_off_elems as u64 * b],
+            &[y],
+            &[y_off_elems as u64 * b],
+        )
     }
 
     pub fn softcap_argmax(

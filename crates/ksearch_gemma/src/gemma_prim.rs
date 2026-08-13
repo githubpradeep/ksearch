@@ -1,7 +1,8 @@
 //! Thesis A Gemma path: Graph→AST→MSL. Q4_K weights stay packed (`Load(Q4K)` expand);
 //! other quant types dequant → F16. Activations stay F16.
 
-use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool, SlotId};
+use crate::sample::sample_softcap_min_p;
+use crate::{GemmaConfig, GenerateStats, KvPool, LayerMeta, LayerNorms, SlotId};
 use anyhow::{anyhow, bail, Result};
 use ksearch_gguf::{f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
 use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-const PREFILL_CHUNK: usize = 32;
+const PREFILL_CHUNK: usize = 256;
 
 /// Tokens per prefill chunk (also the server scheduler's default slice).
 pub const PREFILL_CHUNK_SIZE: usize = PREFILL_CHUNK;
@@ -32,24 +33,24 @@ fn is_packed(d: DType) -> bool {
 fn precompute_rope_table(max_seq: usize, hd: usize, theta: f32, rope_angles: usize) -> Vec<u8> {
     let half = hd / 2;
     let rope_angles = rope_angles.min(half);
-    let mut out = vec![0u16; max_seq * hd];
+    let mut out = vec![0f32; max_seq * hd];
     for pos in 0..max_seq {
         let base = pos * hd;
         for i in 0..half {
             if i < rope_angles {
-                let freq = 1.0 / theta.powf((2 * i) as f32 / hd as f32);
+                let freq = 1.0 / (theta as f64).powf((2 * i) as f64 / hd as f64) as f32;
                 let ang = pos as f32 * freq;
-                out[base + i] = f32_to_f16(ang.cos());
-                out[base + half + i] = f32_to_f16(ang.sin());
+                out[base + i] = ang.cos();
+                out[base + half + i] = ang.sin();
             } else {
-                out[base + i] = f32_to_f16(1.0);
-                out[base + half + i] = f32_to_f16(0.0);
+                out[base + i] = 1.0;
+                out[base + half + i] = 0.0;
             }
         }
     }
-    let mut bytes = Vec::with_capacity(out.len() * 2);
+    let mut bytes = Vec::with_capacity(out.len() * 4);
     for v in out {
-        bytes.extend_from_slice(&v.to_ne_bytes());
+        bytes.extend_from_slice(&v.to_le_bytes());
     }
     bytes
 }
@@ -98,6 +99,8 @@ pub struct GemmaPrimModel {
     logits: Buffer,
     /// Ping-pong F32 token ids: decode step i reads `[i&1]`, writes `[(i+1)&1]`.
     tok_idx: [Buffer; 2],
+    /// Prefill chunk token ids (F32, length `PREFILL_CHUNK`).
+    chunk_tok: Buffer,
     ple_tok: Buffer,
     /// Packed `per_layer_token_embd` for GPU row gather (Q5_K Load expand).
     ple_embd: Option<WeightBuf>,
@@ -122,6 +125,10 @@ pub struct GemmaPrimModel {
     pub pos: usize,
     decode_src: usize,
     return_token_sync: bool,
+    /// Serve-path sampling; 0 = greedy GPU argmax. Cleared after each sampled step.
+    sample_temperature: f32,
+    sample_min_p: f32,
+    sample_seed: u32,
 }
 
 impl GemmaPrimModel {
@@ -218,28 +225,31 @@ impl GemmaPrimModel {
             ctx.buffer_bytes(&bytes)
         };
 
-        let x = ctx.buffer_empty_f16(cfg.hidden);
-        let x2 = ctx.buffer_empty_f16(cfg.hidden);
-        let tmp_q = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
-        let tmp_k = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
-        let tmp_v = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
-        let tmp_o = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
-        let tmp_attn_mwg = ctx.buffer_empty_f32(cfg.n_heads * Eng::SDPA_MWG_NWG * (max_hd + 2));
-        let tmp_ff1 = ctx.buffer_empty_f16(max_ff);
-        let tmp_ff2 = ctx.buffer_empty_f16(max_ff);
-        let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
+        let t = PREFILL_CHUNK;
+        let x = ctx.buffer_empty_f16(t * cfg.hidden);
+        let x2 = ctx.buffer_empty_f16(t * cfg.hidden);
+        let tmp_q = ctx.buffer_empty_f16(t * cfg.n_heads * max_hd);
+        let tmp_k = ctx.buffer_empty_f16(t * cfg.n_kv * max_hd);
+        let tmp_v = ctx.buffer_empty_f16(t * cfg.n_kv * max_hd);
+        let tmp_o = ctx.buffer_empty_f16(t * cfg.n_heads * max_hd);
+        let tmp_attn_mwg =
+            ctx.buffer_empty_f32(t * cfg.n_heads * Eng::SDPA_MWG_NWG * (max_hd + 2));
+        let tmp_ff1 = ctx.buffer_empty_f16(t * max_ff);
+        let tmp_ff2 = ctx.buffer_empty_f16(t * max_ff);
+        let tmp_ff3 = ctx.buffer_empty_f16(t * max_ff.max(ple_total));
         let logits = ctx.buffer_empty_f16(cfg.vocab);
         let tok_idx = [ctx.buffer_empty_f32(1), ctx.buffer_empty_f32(1)];
-        let ple_tok = ctx.buffer_empty_f16(ple_total);
+        let chunk_tok = ctx.buffer_empty_f32(t);
+        let ple_tok = ctx.buffer_empty_f16(t * ple_total);
         let ple_stage = [
             ctx.buffer_empty_f16(ple_total),
             ctx.buffer_empty_f16(ple_total),
         ];
-        let ple_ctx = ctx.buffer_empty_f16(ple_total);
-        let ple_tmp = ctx.buffer_empty_f16(ple_total);
+        let ple_ctx = ctx.buffer_empty_f16(t * ple_total);
+        let ple_tmp = ctx.buffer_empty_f16(t * ple_total);
         let ple_gate = ctx.buffer_empty_f16(cfg.ple_dim);
-        let ple_u = ctx.buffer_empty_f16(cfg.ple_dim);
-        let ple_proj = ctx.buffer_empty_f16(cfg.hidden);
+        let ple_u = ctx.buffer_empty_f16(t * cfg.ple_dim);
+        let ple_proj = ctx.buffer_empty_f16(t * cfg.hidden);
 
         let mut eng = Eng::new();
         {
@@ -302,6 +312,7 @@ impl GemmaPrimModel {
             tmp_ff3,
             logits,
             tok_idx,
+            chunk_tok,
             ple_tok,
             ple_embd: None,
             ple_stage,
@@ -323,6 +334,9 @@ impl GemmaPrimModel {
             pos: 0,
             decode_src: 0,
             return_token_sync: true,
+            sample_temperature: 0.0,
+            sample_min_p: 0.05,
+            sample_seed: 1,
         };
         if model.gguf.has_tensor("per_layer_model_proj.weight") {
             let scale = 1.0 / (model.cfg.hidden as f32).sqrt();
@@ -450,6 +464,23 @@ impl GemmaPrimModel {
         let w = w.buf().clone();
         self.eng
             .matvec_wd(&self.ctx, rows, cols, wd, &w, &x, &y)
+    }
+
+    fn matvec_w_batch(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        name: &str,
+        x: Buffer,
+        y: Buffer,
+        batch: usize,
+    ) -> Result<()> {
+        self.ensure_weight(name)?;
+        let w = self.weight_bufs.get(name).unwrap();
+        let wd = w.dtype();
+        let w = w.buf().clone();
+        self.eng
+            .matvec_batch(&self.ctx, rows, cols, batch, wd, &w, &x, &y)
     }
 
     fn rmsnorm_matvec_w(
@@ -599,10 +630,16 @@ impl GemmaPrimModel {
     }
 
     fn write_meta(&self, layer: usize, tlen: u32, start: u32) {
-        let ptr = self.meta[layer].contents() as *mut u16;
+        self.write_meta_win(layer, tlen, start, 0);
+    }
+
+    fn write_meta_win(&self, layer: usize, tlen: u32, start: u32, window: u32) {
+        // f32: integers stay exact through max_seq (F16 ULP is 2+ past 2048).
+        let ptr = self.meta[layer].contents() as *mut f32;
         unsafe {
-            *ptr = f32_to_f16(tlen as f32);
-            *ptr.add(1) = f32_to_f16(start as f32);
+            *ptr = tlen as f32;
+            *ptr.add(1) = start as f32;
+            *ptr.add(2) = window as f32;
         }
     }
 
@@ -672,6 +709,39 @@ impl GemmaPrimModel {
         Ok(())
     }
 
+    fn embed_from_idx_batch(&mut self, idx: &Buffer, batch: usize) -> Result<()> {
+        let h = self.cfg.hidden;
+        let scale = (h as f32).sqrt();
+        match &self.token_embd {
+            WeightBuf::F16(embd) => {
+                self.eng.copy_scale_indexed_batch_wd(
+                    &self.ctx,
+                    h,
+                    batch,
+                    scale,
+                    DType::F16,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q4K(embd) => {
+                self.eng.copy_scale_indexed_batch_wd(
+                    &self.ctx,
+                    h,
+                    batch,
+                    scale,
+                    DType::Q4K,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q5K(_) | WeightBuf::Q6K(_) => bail!("token_embd Q5/Q6 embed not wired"),
+        }
+        Ok(())
+    }
+
     /// GPU-resident PLE row gather from F32 token-id buffer.
     fn ple_from_idx(&mut self, idx: &Buffer) -> Result<()> {
         let Some(ple) = self.ple_embd.as_ref() else {
@@ -686,6 +756,60 @@ impl GemmaPrimModel {
             ple.buf(),
             idx,
             &self.ple_tok,
+        )?;
+        Ok(())
+    }
+
+    fn ple_from_idx_batch(&mut self, idx: &Buffer, batch: usize) -> Result<()> {
+        let Some(ple) = self.ple_embd.as_ref() else {
+            bail!("ple_from_idx_batch: packed PLE table not loaded");
+        };
+        let scale = (self.cfg.ple_dim as f32).sqrt();
+        self.eng.copy_scale_indexed_batch_wd(
+            &self.ctx,
+            self.cfg.ple_total(),
+            batch,
+            scale,
+            ple.dtype(),
+            ple.buf(),
+            idx,
+            &self.ple_tok,
+        )?;
+        Ok(())
+    }
+
+    fn ple_prepass_batch(&mut self, batch: usize) -> Result<()> {
+        let h = self.cfg.hidden;
+        let ple_total = self.cfg.ple_total();
+        let n_layers = self.cfg.n_layers;
+        let ple_dim = self.cfg.ple_dim;
+        let eps = self.cfg.rms_eps;
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+
+        self.matvec_w_batch(
+            ple_total,
+            h,
+            "per_layer_model_proj.weight",
+            self.x.clone(),
+            self.ple_tmp.clone(),
+            batch,
+        )?;
+        self.eng.rmsnorm_per_head(
+            &self.ctx,
+            batch * n_layers,
+            ple_dim,
+            eps,
+            &self.ple_tmp,
+            &self.ple_proj_norm,
+            &self.ple_ctx,
+        )?;
+        self.eng.add_scale(
+            &self.ctx,
+            batch * ple_total,
+            inv_sqrt2,
+            &self.ple_ctx,
+            &self.ple_tok,
+            &self.ple_ctx,
         )?;
         Ok(())
     }
@@ -760,7 +884,14 @@ impl GemmaPrimModel {
         }
         let profile = std::env::var_os("KSEARCH_PROFILE").is_some();
         let t0 = Instant::now();
-        let gpu_idx = want_logits && self.ple_embd.is_some();
+        let gpu_idx = self.ple_embd.is_some();
+        if gpu_idx && !want_logits {
+            // Ping-pong tok_idx so the next gather can overlap the in-flight token.
+            self.ctx.wait_inflight_at_most(1);
+            self.decode_src ^= 1;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[self.decode_src], &[token as f32]);
+        }
         if gpu_idx {
             let src = self.tok_idx[self.decode_src].clone();
             self.embed_from_idx(&src)?;
@@ -1103,11 +1234,26 @@ impl GemmaPrimModel {
             )?;
         }
         let dst = self.tok_idx[self.decode_src ^ 1].clone();
-        self.eng
-            .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &dst)?;
+        let sampling = self.sample_temperature >= 1e-6;
+        if !sampling {
+            self.eng
+                .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &dst)?;
+        }
         let t_logits = t0.elapsed();
         if !self.return_token_sync {
             return Ok(None);
+        }
+        if sampling {
+            let logits = self.ctx.read_u16(&self.logits, vocab);
+            let best = sample_softcap_min_p(
+                &logits,
+                cap,
+                self.sample_temperature,
+                self.sample_min_p,
+                self.sample_seed,
+            );
+            self.sample_temperature = 0.0;
+            return Ok(Some(best));
         }
         let best = self.ctx.read_f32(&dst, 1)[0] as u32;
         if profile {
@@ -1154,10 +1300,329 @@ impl GemmaPrimModel {
         Ok(())
     }
 
+    /// Seq-parallel prefill for `tokens` (any length). Remainder of 1 uses the decode kernel.
+    pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            if chunk.len() == 1 {
+                let _ = self.forward_token(chunk[0], false)?;
+            } else {
+                self.forward_prefill_chunk(chunk)?;
+            }
+        }
+        self.ctx.synchronize()?;
+        Ok(())
+    }
+
+    fn forward_prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        let t = tokens.len();
+        if t == 0 {
+            return Ok(());
+        }
+        if self.pos + t > self.max_seq {
+            bail!("max_seq exceeded");
+        }
+        let ids: Vec<f32> = tokens.iter().map(|&tok| tok as f32).collect();
+        self.ctx.write_buffer_nosync(&self.chunk_tok, &ids);
+
+        let gpu_idx = self.ple_embd.is_some();
+        if gpu_idx {
+            let src = self.chunk_tok.clone();
+            self.embed_from_idx_batch(&src, t)?;
+            self.ple_from_idx_batch(&src, t)?;
+        } else {
+            for (i, &tok) in tokens.iter().enumerate() {
+                self.embed_token(tok)?;
+                self.eng.copy_slice(
+                    &self.ctx,
+                    self.cfg.hidden,
+                    &self.x,
+                    0,
+                    &self.x,
+                    i * self.cfg.hidden,
+                )?;
+                self.load_ple_token(tok)?;
+                self.eng.copy_slice(
+                    &self.ctx,
+                    self.cfg.ple_total(),
+                    &self.ple_tok,
+                    0,
+                    &self.ple_tok,
+                    i * self.cfg.ple_total(),
+                )?;
+            }
+        }
+        self.ple_prepass_batch(t)?;
+
+        let h = self.cfg.hidden;
+        let eps = self.cfg.rms_eps;
+        let n_layers = self.cfg.n_layers;
+        let n_heads = self.cfg.n_heads;
+        let max_seq = self.max_seq;
+        let window = self.cfg.sliding_window;
+        let ple_dim = self.cfg.ple_dim;
+        let pos0 = self.pos;
+
+        for layer in 0..n_layers {
+            let (q_rows, kv_rows, o_in, ffn_inter, hd) = {
+                let lw = &self.layers[layer];
+                (lw.q_rows, lw.kv_rows, lw.o_in, lw.ffn_inter, lw.hd)
+            };
+            let is_swa = self.cfg.is_swa(layer);
+            let rope_hd = if is_swa { self.hd_swa } else { self.hd_full };
+            let rope_buf = if is_swa {
+                self.rope_swa.clone()
+            } else {
+                self.rope_full.clone()
+            };
+            let pref = format!("blk.{layer}.");
+            let owns_kv = self.cfg.owns_kv(layer);
+            let kv_src = self.cfg.kv_source(layer);
+
+            let attn_norm = self.layer_norms[layer].attn_norm.clone();
+            self.eng
+                .rmsnorm_rows(&self.ctx, h, t, eps, &self.x, &attn_norm, &self.x2)?;
+            if owns_kv {
+                self.ensure_weight(&format!("{pref}attn_q.weight"))?;
+                self.ensure_weight(&format!("{pref}attn_k.weight"))?;
+                self.ensure_weight(&format!("{pref}attn_v.weight"))?;
+                self.matvec_w_batch(
+                    q_rows,
+                    h,
+                    &format!("{pref}attn_q.weight"),
+                    self.x2.clone(),
+                    self.tmp_q.clone(),
+                    t,
+                )?;
+                self.matvec_w_batch(
+                    kv_rows,
+                    h,
+                    &format!("{pref}attn_k.weight"),
+                    self.x2.clone(),
+                    self.tmp_k.clone(),
+                    t,
+                )?;
+                self.matvec_w_batch(
+                    kv_rows,
+                    h,
+                    &format!("{pref}attn_v.weight"),
+                    self.x2.clone(),
+                    self.tmp_v.clone(),
+                    t,
+                )?;
+            } else {
+                self.matvec_w_batch(
+                    q_rows,
+                    h,
+                    &format!("{pref}attn_q.weight"),
+                    self.x2.clone(),
+                    self.tmp_q.clone(),
+                    t,
+                )?;
+            }
+
+            if owns_kv {
+                let rope_off = pos0 * rope_hd;
+                let kv_off = pos0 * q40_row_bytes(hd);
+                self.eng.rmsnorm_per_head_qkv_q40_batch(
+                    &self.ctx,
+                    n_heads,
+                    self.cfg.n_kv,
+                    hd,
+                    t,
+                    eps,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
+                    &self.tmp_k,
+                    &self.layer_norms[layer].k_norm,
+                    &self.tmp_v,
+                    &self.tmp_q,
+                    &self.kv_k[kv_src],
+                    &self.kv_v[kv_src],
+                    kv_off,
+                )?;
+            } else {
+                let rope_off = pos0 * rope_hd;
+                self.eng.rmsnorm_per_head_rope_batch(
+                    &self.ctx,
+                    n_heads,
+                    hd,
+                    t,
+                    eps,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
+                    &self.tmp_q,
+                )?;
+            }
+
+            let last_tlen = pos0 + t;
+            let (attn_t, win) = if is_swa {
+                (
+                    last_tlen.min(window) as u32,
+                    window as u32,
+                )
+            } else {
+                (last_tlen as u32, max_seq as u32)
+            };
+            let tlen0 = (pos0 + 1) as u32;
+            self.write_meta_win(layer, tlen0, 0, win);
+            self.eng.sdpa_hybrid_kv_batch(
+                &self.ctx,
+                n_heads,
+                t,
+                hd,
+                max_seq,
+                attn_t,
+                DType::Q40,
+                &self.tmp_q,
+                &self.kv_k[kv_src],
+                &self.kv_v[kv_src],
+                &self.meta[layer],
+                &self.tmp_attn_mwg,
+                &self.tmp_o,
+            )?;
+
+            self.matvec_w_batch(
+                h,
+                o_in,
+                &format!("{pref}attn_output.weight"),
+                self.tmp_o.clone(),
+                self.x2.clone(),
+                t,
+            )?;
+
+            let gate_name = format!("{pref}ffn_gate.weight");
+            let up_name = format!("{pref}ffn_up.weight");
+            self.ensure_weight(&gate_name)?;
+            self.ensure_weight(&up_name)?;
+            let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
+            self.eng.rmsnorm_add_then_rmsnorm_rows(
+                &self.ctx,
+                h,
+                t,
+                eps,
+                &self.x2,
+                &self.layer_norms[layer].post_attn_norm,
+                &self.x,
+                &ffn_norm,
+                &self.x,
+                &self.x2,
+            )?;
+            self.matvec_w_batch(
+                ffn_inter,
+                h,
+                &gate_name,
+                self.x2.clone(),
+                self.tmp_ff1.clone(),
+                t,
+            )?;
+            self.matvec_w_batch(
+                ffn_inter,
+                h,
+                &up_name,
+                self.x2.clone(),
+                self.tmp_ff2.clone(),
+                t,
+            )?;
+            self.eng.gelu_mul(
+                &self.ctx,
+                t * ffn_inter,
+                &self.tmp_ff1,
+                &self.tmp_ff2,
+                &self.tmp_ff3,
+            )?;
+            self.matvec_w_batch(
+                h,
+                ffn_inter,
+                &format!("{pref}ffn_down.weight"),
+                self.tmp_ff3.clone(),
+                self.x2.clone(),
+                t,
+            )?;
+            self.eng.rmsnorm_add_rows(
+                &self.ctx,
+                h,
+                t,
+                eps,
+                &self.x2,
+                &self.layer_norms[layer].post_ffw_norm,
+                &self.x,
+                &self.x,
+            )?;
+
+            let gate_name = format!("{pref}inp_gate.weight");
+            self.ensure_weight(&gate_name)?;
+            let proj_name = format!("{pref}proj.weight");
+            self.ensure_weight(&proj_name)?;
+            let layer_scale = self.layer_norms[layer].layer_scale;
+            self.matvec_w_batch(
+                ple_dim,
+                h,
+                &gate_name,
+                self.x.clone(),
+                self.ple_u.clone(),
+                t,
+            )?;
+            self.eng.gelu_mul_strided(
+                &self.ctx,
+                ple_dim,
+                t,
+                &self.ple_u,
+                &self.ple_ctx,
+                layer * ple_dim,
+                self.cfg.ple_total(),
+                &self.ple_u,
+            )?;
+            self.matvec_w_batch(
+                h,
+                ple_dim,
+                &proj_name,
+                self.ple_u.clone(),
+                self.ple_proj.clone(),
+                t,
+            )?;
+            self.eng.rmsnorm_add_scale_rows(
+                &self.ctx,
+                h,
+                t,
+                eps,
+                layer_scale,
+                &self.ple_proj,
+                &self.layer_norms[layer].post_norm,
+                &self.x,
+                &self.x,
+            )?;
+        }
+
+        self.pos += t;
+        // Must wait: next chunk reuses x/meta/chunk_tok. flush_async raced the
+        // CPU overwrite with in-flight GPU and corrupted early-prompt KV.
+        self.ctx.synchronize()?;
+        Ok(())
+    }
+
     /// Decode one token: embed/PLE from `token`, return next greedy id.
     pub fn decode_token(&mut self, token: u32) -> Result<u32> {
+        self.decode_token_sampled(token, 0.0, 0.0, 1)
+    }
+
+    /// Decode one token with oracle-style temperature + min-p (CPU, after softcap).
+    /// `temperature < 1e-6` is greedy GPU argmax.
+    pub fn decode_token_sampled(
+        &mut self,
+        token: u32,
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) -> Result<u32> {
         self.decode_src = 0;
         self.return_token_sync = true;
+        self.sample_temperature = temperature;
+        self.sample_min_p = min_p;
+        self.sample_seed = seed;
         if self.ple_embd.is_some() {
             self.ctx.synchronize()?;
             self.ctx
@@ -1178,6 +1643,7 @@ impl GemmaPrimModel {
         self.pos = 0;
         self.decode_src = 0;
         self.return_token_sync = true;
+        self.sample_temperature = 0.0;
         self.ctx.synchronize().ok();
         for b in self.kv_k.iter().chain(self.kv_v.iter()) {
             let n = b.length() as usize;
@@ -1200,12 +1666,7 @@ impl GemmaPrimModel {
         let mut out = Vec::new();
         let t_prefill = Instant::now();
         let prefill_toks = &prompt_tokens[..prompt_tokens.len().saturating_sub(1)];
-        // P5: chunked prefill (oracle order later; for now chunked serial advances).
-        for chunk in prefill_toks.chunks(PREFILL_CHUNK) {
-            for &tok in chunk {
-                let _ = self.forward_token(tok, false)?;
-            }
-        }
+        self.prefill_chunk(prefill_toks)?;
         let prefill_s = t_prefill.elapsed().as_secs_f64();
         let prefill_tokens = prefill_toks.len();
 

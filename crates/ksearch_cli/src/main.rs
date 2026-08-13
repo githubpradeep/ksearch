@@ -9,6 +9,7 @@ use ksearch_ir::{DType, Graph, OptSchedule, Shape};
 use ksearch_metal::MetalContext;
 use std::path::{Path, PathBuf};
 
+mod gemma4_chat;
 mod scheduler;
 mod serve;
 

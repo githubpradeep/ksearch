@@ -205,6 +205,21 @@ impl KvPool {
         s.seq_len += 1;
         Ok(s.seq_len)
     }
+
+    pub fn bump_len_by(&mut self, slot: SlotId, n: usize) -> Result<usize> {
+        let s = self
+            .slots
+            .get_mut(slot.0 as usize)
+            .ok_or_else(|| anyhow::anyhow!("bad SlotId"))?;
+        if !s.occupied {
+            bail!("slot not occupied");
+        }
+        if s.seq_len + n > s.max_seq {
+            bail!("slot seq full");
+        }
+        s.seq_len += n;
+        Ok(s.seq_len)
+    }
 }
 
 #[cfg(test)]

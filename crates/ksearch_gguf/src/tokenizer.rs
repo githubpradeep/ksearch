@@ -122,7 +122,9 @@ pub fn gemma4_chat_from_messages<R: AsRef<str>, C: AsRef<str>>(messages: &[(R, C
     }
     let mut prompt = String::new();
     if !system.is_empty() {
-        prompt.push_str("<|turn>system\n");
+        // Match metal-llm-server / official E2B template: system turns start
+        // with `<|think|>` so the model actually uses the system content.
+        prompt.push_str("<|turn>system\n<|think|>\n");
         prompt.push_str(&system);
         prompt.push_str("<turn|>\n");
     }
@@ -152,7 +154,7 @@ mod tests {
         ]);
         assert_eq!(
             prompt,
-            "<|turn>system\nbe brief<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHi!<turn|>\n<|turn>user\nagain<turn|>\n<|turn>model\n"
+            "<|turn>system\n<|think|>\nbe brief<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHi!<turn|>\n<|turn>user\nagain<turn|>\n<|turn>model\n"
         );
         assert_eq!(
             gemma4_chat_prompt("Hi"),

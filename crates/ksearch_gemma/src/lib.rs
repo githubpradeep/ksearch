@@ -2,8 +2,10 @@
 
 mod gemma_prim;
 mod kv_pool;
+mod sample;
 
 pub use gemma_prim::{GemmaPrimModel, PREFILL_CHUNK_SIZE};
+pub use sample::sample_softcap_min_p;
 pub use kv_pool::{KvPool, KvSlot, SlotId};
 
 use anyhow::{anyhow, Result};

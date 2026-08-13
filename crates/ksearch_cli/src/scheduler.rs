@@ -8,11 +8,11 @@ use anyhow::Result;
 use ksearch_gemma::{GemmaPrimModel, KvPool, SlotId, PREFILL_CHUNK_SIZE};
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const EOS_IDS: [u32; 2] = [1, 106];
-pub const BUILTIN_STOPS: [&str; 2] = ["<turn|>", "<|turn>"];
+pub const BUILTIN_STOPS: [&str; 3] = ["<turn|>", "<|turn>", "<tool_call|>"];
 
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
@@ -29,6 +29,9 @@ pub struct InferenceRequest {
     pub prompt_ids: Vec<u32>,
     pub max_tokens: usize,
     pub stop: Vec<String>,
+    pub temperature: f32,
+    pub min_p: f32,
+    pub seed: u32,
     pub events: UnboundedSender<StreamEvent>,
 }
 
@@ -44,9 +47,15 @@ struct Active {
     text: String,
     max_tokens: usize,
     stop: Vec<String>,
+    temperature: f32,
+    min_p: f32,
+    rng: u32,
     phase: Phase,
     events: UnboundedSender<StreamEvent>,
     finished: bool,
+    admitted_at: Instant,
+    prefill_s: f64,
+    decode_s: f64,
 }
 
 pub struct SchedulerConfig {
@@ -60,7 +69,8 @@ impl Default for SchedulerConfig {
         Self {
             slots: 4,
             prefill_chunk: PREFILL_CHUNK_SIZE,
-            prefill_tokens_per_tick: 256,
+            // Long prompts: spend a full tick on prefill when no decode work.
+            prefill_tokens_per_tick: 2048,
         }
     }
 }
@@ -138,9 +148,15 @@ fn admit(pool: &mut KvPool, req: InferenceRequest) -> Result<Active> {
         text: String::new(),
         max_tokens: req.max_tokens.max(1),
         stop,
+        temperature: req.temperature,
+        min_p: req.min_p,
+        rng: req.seed | 1,
         phase: Phase::Prefill { cursor: 0 },
         events: req.events,
         finished: false,
+        admitted_at: Instant::now(),
+        prefill_s: 0.0,
+        decode_s: 0.0,
     })
 }
 
@@ -165,8 +181,11 @@ fn decode_round(
             continue;
         }
         model.bind_slot(pool, req.slot)?;
-        match model.decode_token(last_token) {
+        let t0 = Instant::now();
+        req.rng = req.rng.wrapping_add(0x9E3779B9);
+        match model.decode_token_sampled(last_token, req.temperature, req.min_p, req.rng) {
             Ok(next) => {
+                req.decode_s += t0.elapsed().as_secs_f64();
                 if let Err(e) = pool.bump_len(req.slot) {
                     let _ = req.events.send(StreamEvent::Error(e.to_string()));
                     finish(req, "error");
@@ -180,7 +199,7 @@ fn decode_round(
                 let piece = model
                     .vocab
                     .as_ref()
-                    .map(|v| v.decode(&[next], true))
+                    .map(|v| v.decode(&[next], false))
                     .unwrap_or_default();
                 req.text.push_str(&piece);
                 if let Some(reason) = hit_stop(&req.text, &req.stop) {
@@ -189,6 +208,10 @@ fn decode_round(
                     continue;
                 }
                 req.generated.push(next);
+                if repeating_token(&req.generated, 24) {
+                    finish(req, "stop");
+                    continue;
+                }
                 if req.events.send(StreamEvent::Token(next)).is_err() {
                     finish(req, "cancelled");
                     continue;
@@ -198,6 +221,7 @@ fn decode_round(
                 }
             }
             Err(e) => {
+                req.decode_s += t0.elapsed().as_secs_f64();
                 let _ = req.events.send(StreamEvent::Error(e.to_string()));
                 finish(req, "error");
             }
@@ -221,6 +245,9 @@ fn prefill_round(
     {
         return Ok(());
     }
+    let decoding = active.iter().any(|a| {
+        !a.finished && matches!(a.phase, Phase::Decode { .. })
+    });
     let mut budget = cfg.prefill_tokens_per_tick.max(cfg.prefill_chunk);
     let mut idx = *next_idx % n;
     for _ in 0..n {
@@ -238,35 +265,37 @@ fn prefill_round(
         // Last prompt token is the first decode input (logits), not a prefill step.
         let prefill_end = req.prompt_ids.len().saturating_sub(1);
         if cursor >= prefill_end {
-            let last = req.prompt_ids[req.prompt_ids.len() - 1];
-            req.phase = Phase::Decode { last_token: last };
+            enter_decode(req);
             continue;
         }
         model.bind_slot(pool, req.slot)?;
-        let take = budget.min(cfg.prefill_chunk).min(prefill_end - cursor);
-        let mut c = cursor;
-        for _ in 0..take {
-            if let Err(e) = model.prefill_token(req.prompt_ids[c]) {
-                let _ = req.events.send(StreamEvent::Error(e.to_string()));
-                finish(req, "error");
-                c = prefill_end;
-                break;
-            }
-            if let Err(e) = pool.bump_len(req.slot) {
-                let _ = req.events.send(StreamEvent::Error(e.to_string()));
-                finish(req, "error");
-                c = prefill_end;
-                break;
-            }
-            c += 1;
-            budget = budget.saturating_sub(1);
-        }
-        if matches!(req.phase, Phase::Prefill { .. }) {
-            if c >= prefill_end {
-                let last = req.prompt_ids[req.prompt_ids.len() - 1];
-                req.phase = Phase::Decode { last_token: last };
-            } else {
-                req.phase = Phase::Prefill { cursor: c };
+        // Fairness vs decode: small chunks when mixed; otherwise eat the budget.
+        let cap = if decoding {
+            cfg.prefill_chunk
+        } else {
+            budget
+        };
+        let take = budget.min(cap).min(prefill_end - cursor);
+        let t0 = Instant::now();
+        let slice = &req.prompt_ids[cursor..cursor + take];
+        if let Err(e) = model.prefill_chunk(slice) {
+            req.prefill_s += t0.elapsed().as_secs_f64();
+            let _ = req.events.send(StreamEvent::Error(e.to_string()));
+            finish(req, "error");
+        } else if let Err(e) = pool.bump_len_by(req.slot, take) {
+            req.prefill_s += t0.elapsed().as_secs_f64();
+            let _ = req.events.send(StreamEvent::Error(e.to_string()));
+            finish(req, "error");
+        } else {
+            req.prefill_s += t0.elapsed().as_secs_f64();
+            budget = budget.saturating_sub(take);
+            let c = cursor + take;
+            if matches!(req.phase, Phase::Prefill { .. }) {
+                if c >= prefill_end {
+                    enter_decode(req);
+                } else {
+                    req.phase = Phase::Prefill { cursor: c };
+                }
             }
         }
     }
@@ -285,6 +314,19 @@ fn reap_finished(pool: &mut KvPool, active: &mut Vec<Active>) {
     });
 }
 
+fn enter_decode(req: &mut Active) {
+    let last = req.prompt_ids[req.prompt_ids.len() - 1];
+    req.phase = Phase::Decode { last_token: last };
+    let n = req.prompt_ids.len().saturating_sub(1);
+    eprintln!(
+        "[serve] slot={} prefill={} tok {:.1} tok/s ({:.2}s)",
+        req.slot.0,
+        n,
+        n as f64 / req.prefill_s.max(1e-6),
+        req.prefill_s
+    );
+}
+
 fn finish(req: &mut Active, reason: &str) {
     if req.finished {
         return;
@@ -297,12 +339,25 @@ fn finish(req: &mut Active, reason: &str) {
             completion_tokens: req.generated.len(),
         });
     }
+    let prefill_n = req.prompt_ids.len().saturating_sub(1);
+    let decode_n = req.generated.len();
     eprintln!(
-        "[serve] slot={} prompt={} completion={} reason={reason}",
+        "[serve] slot={} prefill={} tok {:.1} tok/s  decode={} tok {:.1} tok/s  reason={reason} e2e={:.2}s",
         req.slot.0,
-        req.prompt_ids.len(),
-        req.generated.len()
+        prefill_n,
+        prefill_n as f64 / req.prefill_s.max(1e-6),
+        decode_n,
+        decode_n as f64 / req.decode_s.max(1e-6),
+        req.admitted_at.elapsed().as_secs_f64()
     );
+}
+
+fn repeating_token(ids: &[u32], n: usize) -> bool {
+    if ids.len() < n {
+        return false;
+    }
+    let last = *ids.last().unwrap();
+    ids[ids.len() - n..].iter().all(|&t| t == last)
 }
 
 fn hit_stop(text: &str, stops: &[String]) -> Option<String> {

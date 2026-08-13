@@ -704,6 +704,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ksearch_codegen",
+ "ksearch_gguf",
  "ksearch_ir",
  "ksearch_metal",
  "metal",
