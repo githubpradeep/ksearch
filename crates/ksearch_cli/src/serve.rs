@@ -4,7 +4,7 @@
 //! (KV slots, chunked prefill, decode-before-prefill).
 
 use crate::gemma4_chat::{
-    apply_chat_template, awaits_tool_call, infer_tool_calls_without_generation, resolve_tool_calls,
+    apply_chat_template, infer_tool_calls_without_generation, resolve_tool_calls,
     split_reasoning_and_content, ChatMessage, Tool, ToolCall,
 };
 use crate::scheduler::{
@@ -464,7 +464,9 @@ async fn handle_chat(st: AppState, req: ChatCompletionRequest) -> Result<Respons
         }
     }
 
-    let hold_for_tools = n_tools > 0 && awaits_tool_call(&req.messages);
+    // Pi streams. After a tool result the next turn may still be `edit`/`bash`,
+    // not a plain answer — always buffer+parse when tools are declared.
+    let hold_for_tools = n_tools > 0;
     if req.stream {
         Ok(stream_sse(
             ev_rx,

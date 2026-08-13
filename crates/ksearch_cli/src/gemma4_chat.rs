@@ -352,47 +352,340 @@ pub fn infer_tool_calls_without_generation(
         .collect()
 }
 
-fn gemma4_dict_to_json_object(dict: &str) -> Option<Value> {
-    const GEMMA4_STR: &str = "<|\"|>";
-    let mut out = String::new();
-    let mut rest = dict.trim();
-    while let Some(start) = rest.find(GEMMA4_STR) {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + GEMMA4_STR.len()..];
-        let end = after.find(GEMMA4_STR)?;
-        out.push('"');
-        out.push_str(&after[..end]);
-        out.push('"');
-        rest = &after[end + GEMMA4_STR.len()..];
-    }
-    out.push_str(rest);
+const GEMMA4_STR: &str = "<|\"|>";
 
-    let body = out.trim().trim_start_matches('{').trim_end_matches('}');
-    if body.is_empty() {
+fn gemma4_dict_to_json_object(dict: &str) -> Option<Value> {
+    let trimmed = dict.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
         return Some(serde_json::json!({}));
     }
-
-    let mut map = serde_json::Map::new();
-    for pair in body.split(',') {
-        let (key, value) = pair.split_once(':')?;
-        let key = key.trim().trim_matches('"');
-        let value = value.trim();
-        let parsed = if value.starts_with('"') {
-            serde_json::from_str(value).ok()?
-        } else if value == "true" || value == "false" {
-            Value::Bool(value == "true")
-        } else if value == "null" {
-            Value::Null
-        } else if let Ok(n) = value.parse::<f64>() {
-            serde_json::Number::from_f64(n)
-                .map(Value::Number)
-                .unwrap_or_else(|| Value::String(value.to_string()))
-        } else {
-            Value::String(value.to_string())
-        };
-        map.insert(key.to_string(), parsed);
+    let (val, _rest) = parse_gemma4_value(trimmed)?;
+    match val {
+        Value::Object(_) => Some(val),
+        _ => None,
     }
-    Some(Value::Object(map))
+}
+
+fn parse_gemma4_value(s: &str) -> Option<(Value, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with(GEMMA4_STR) {
+        let after = &s[GEMMA4_STR.len()..];
+        let end = after.find(GEMMA4_STR)?;
+        return Some((
+            Value::String(after[..end].to_string()),
+            &after[end + GEMMA4_STR.len()..],
+        ));
+    }
+    if s.starts_with('"') {
+        let (inner, consumed) = parse_json_string_lenient(s)?;
+        return Some((Value::String(inner), &s[consumed..]));
+    }
+    if s.starts_with('{') {
+        return parse_gemma4_object(s);
+    }
+    if s.starts_with('[') {
+        return parse_gemma4_array(s);
+    }
+    if s.starts_with("true") && !ident_continues(&s[4..]) {
+        return Some((Value::Bool(true), &s[4..]));
+    }
+    if s.starts_with("false") && !ident_continues(&s[5..]) {
+        return Some((Value::Bool(false), &s[5..]));
+    }
+    if s.starts_with("null") && !ident_continues(&s[4..]) {
+        return Some((Value::Null, &s[4..]));
+    }
+    if let Some((n, rest)) = parse_gemma4_number(s) {
+        return Some((Value::Number(n), rest));
+    }
+    let end = s
+        .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace() || c == '<')
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((Value::String(s[..end].to_string()), &s[end..]))
+}
+
+fn ident_continues(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_json_string(s: &str) -> Option<(String, usize)> {
+    parse_json_string_inner(s, false)
+}
+
+/// Gemma sometimes emits JSON strings inside native tool dicts with unescaped
+/// quotes (`"eligible": true` inside `oldText`). Close a string only when `"`
+/// is followed by a sibling key / container close, not by more prose.
+fn parse_json_string_lenient(s: &str) -> Option<(String, usize)> {
+    parse_json_string_inner(s, true)
+}
+
+fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn is_lenient_json_string_end(bytes: &[u8], quote_idx: usize) -> bool {
+    let i = skip_ws_bytes(bytes, quote_idx + 1);
+    if i >= bytes.len() {
+        return true;
+    }
+    match bytes[i] {
+        b',' => {
+            let j = skip_ws_bytes(bytes, i + 1);
+            j >= bytes.len()
+                || matches!(bytes[j], b'"' | b'}' | b']' | b'_')
+                || bytes[j].is_ascii_alphabetic()
+        }
+        b'}' | b']' => {
+            let j = skip_ws_bytes(bytes, i + 1);
+            j >= bytes.len() || matches!(bytes[j], b',' | b'}' | b']' | b'<')
+        }
+        _ => false,
+    }
+}
+
+fn parse_json_string_inner(s: &str, lenient: bool) -> Option<(String, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut i = 1usize;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escape {
+            match b {
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                other => out.push(other as char),
+            }
+            escape = false;
+        } else if b == b'\\' {
+            escape = true;
+        } else if b == b'"' {
+            if lenient {
+                if is_lenient_json_string_end(bytes, i) {
+                    return Some((out, i + 1));
+                }
+                out.push('"');
+            } else {
+                return Some((out, i + 1));
+            }
+        } else {
+            out.push(b as char);
+        }
+        i += 1;
+    }
+    if lenient {
+        Some((out, bytes.len()))
+    } else {
+        None
+    }
+}
+
+fn parse_gemma4_number(s: &str) -> Option<(serde_json::Number, &str)> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    if bytes.first() == Some(&b'-') {
+        i = 1;
+    }
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if matches!(bytes.get(i), Some(&b'e' | &b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(&b'+' | &b'-')) {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if ident_continues(&s[i..]) {
+        return None;
+    }
+    let raw = &s[..i];
+    let n = serde_json::from_str::<serde_json::Number>(raw).ok()?;
+    Some((n, &s[i..]))
+}
+
+fn parse_gemma4_key(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    if s.starts_with(GEMMA4_STR) {
+        let after = &s[GEMMA4_STR.len()..];
+        let end = after.find(GEMMA4_STR)?;
+        return Some((after[..end].to_string(), &after[end + GEMMA4_STR.len()..]));
+    }
+    if s.starts_with('"') {
+        let (inner, consumed) = parse_json_string(s)?;
+        return Some((inner, &s[consumed..]));
+    }
+    let end = s
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_alphanumeric() && *c != '_')
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((s[..end].to_string(), &s[end..]))
+}
+
+fn parse_gemma4_object(s: &str) -> Option<(Value, &str)> {
+    debug_assert!(s.starts_with('{'));
+    let mut rest = s[1..].trim_start();
+    let mut map = serde_json::Map::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with('}') {
+            return Some((Value::Object(map), &rest[1..]));
+        }
+        if rest.is_empty() || rest.starts_with('<') {
+            return Some((Value::Object(map), rest));
+        }
+        let (key, after_key) = parse_gemma4_key(rest)?;
+        rest = after_key.trim_start();
+        if !rest.starts_with(':') {
+            return None;
+        }
+        rest = rest[1..].trim_start();
+        let (val, after_val) = parse_gemma4_value(rest)?;
+        map.insert(key, val);
+        rest = after_val.trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+            continue;
+        }
+        if rest.starts_with('}') {
+            return Some((Value::Object(map), &rest[1..]));
+        }
+        if rest.is_empty() || rest.starts_with('<') {
+            return Some((Value::Object(map), rest));
+        }
+        return None;
+    }
+}
+
+fn parse_gemma4_array(s: &str) -> Option<(Value, &str)> {
+    debug_assert!(s.starts_with('['));
+    let mut rest = s[1..].trim_start();
+    let mut items = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with(']') {
+            return Some((Value::Array(items), &rest[1..]));
+        }
+        if rest.is_empty() || rest.starts_with('<') {
+            return Some((Value::Array(items), rest));
+        }
+        let (val, after) = parse_gemma4_value(rest)?;
+        items.push(val);
+        rest = after.trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+            continue;
+        }
+        if rest.starts_with(']') {
+            return Some((Value::Array(items), &rest[1..]));
+        }
+        if rest.is_empty() || rest.starts_with('<') {
+            return Some((Value::Array(items), rest));
+        }
+        return None;
+    }
+}
+
+fn fill_default_tool_args(name: &str, arguments: &str) -> (String, String) {
+    if name == "bash" {
+        let trimmed = arguments.trim();
+        let missing = trimmed.is_empty()
+            || trimmed == "{}"
+            || serde_json::from_str::<Value>(trimmed)
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.trim().is_empty()))
+                .unwrap_or(false);
+        if missing {
+            return (name.to_string(), r#"{"command":"ls -F"}"#.to_string());
+        }
+    }
+    (name.to_string(), arguments.to_string())
+}
+
+/// Map hallucinated tool names (e.g. `list_files`) onto declared tools.
+fn normalize_tool_call(name: &str, arguments: &str, allowed: &[String]) -> (String, String) {
+    if allowed.is_empty() || allowed.iter().any(|n| n == name) {
+        return fill_default_tool_args(name, arguments);
+    }
+    let lower = name.to_lowercase().replace('-', "_");
+    let args_empty = arguments.trim().is_empty() || arguments.trim() == "{}";
+    if (lower.contains("list") || lower == "ls" || lower == "dir")
+        && allowed.iter().any(|n| n == "bash")
+    {
+        let args = if args_empty {
+            r#"{"command":"ls -F"}"#.to_string()
+        } else {
+            arguments.to_string()
+        };
+        return fill_default_tool_args("bash", &args);
+    }
+    if lower.contains("read") && allowed.iter().any(|n| n == "read") {
+        return fill_default_tool_args("read", arguments);
+    }
+    if lower.contains("write") && allowed.iter().any(|n| n == "write") {
+        return fill_default_tool_args("write", arguments);
+    }
+    if lower.contains("edit") && allowed.iter().any(|n| n == "edit") {
+        return fill_default_tool_args("edit", arguments);
+    }
+    if (lower.contains("bash") || lower.contains("shell") || lower.contains("exec") || lower.contains("run"))
+        && allowed.iter().any(|n| n == "bash")
+    {
+        return fill_default_tool_args("bash", arguments);
+    }
+    if let Some(best) = allowed.iter().find(|n| {
+        let nl = n.to_lowercase();
+        lower.starts_with(&nl) || nl.starts_with(&lower)
+    }) {
+        return fill_default_tool_args(best, arguments);
+    }
+    fill_default_tool_args(name, arguments)
+}
+
+fn finish_parse_tool_calls(calls: Vec<ToolCall>, allowed: Option<&[String]>) -> Vec<ToolCall> {
+    match allowed {
+        Some(names) if !names.is_empty() => calls
+            .into_iter()
+            .map(|mut tc| {
+                let (name, args) =
+                    normalize_tool_call(&tc.function.name, &tc.function.arguments, names);
+                tc.function.name = name;
+                tc.function.arguments = args;
+                tc
+            })
+            .collect(),
+        _ => calls,
+    }
 }
 
 fn parse_native_tool_calls(text: &str, allowed: Option<&[String]>) -> Vec<ToolCall> {
@@ -414,9 +707,7 @@ fn parse_native_tool_calls(text: &str, allowed: Option<&[String]>) -> Vec<ToolCa
             let dict = &body[brace..];
             if !name.is_empty() {
                 if let Some(args) = gemma4_dict_to_json_object(dict) {
-                    if allowed.map(|a| a.iter().any(|n| n == name)).unwrap_or(true) {
-                        calls.push(make_tool_call(name, args));
-                    }
+                    calls.push(make_tool_call(name, args));
                 }
             }
         }
@@ -430,7 +721,51 @@ fn parse_native_tool_calls(text: &str, allowed: Option<&[String]>) -> Vec<ToolCa
         }
         rest = &rest[advance.min(rest.len())..];
     }
-    calls
+    if calls.is_empty() {
+        parse_bare_gemma4_call_invocations(text, &mut calls);
+    }
+    finish_parse_tool_calls(calls, allowed)
+}
+
+fn parse_bare_gemma4_call_invocations(text: &str, calls: &mut Vec<ToolCall>) {
+    let mut rest = text;
+    while let Some(idx) = rest.find("call:") {
+        if idx > 0 {
+            let prev = rest.as_bytes()[idx - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                rest = &rest[idx + 5..];
+                continue;
+            }
+        }
+        let after = &rest[idx + 5..];
+        let Some(brace) = after.find('{') else {
+            rest = &rest[idx + 5..];
+            continue;
+        };
+        let name = after[..brace].trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            rest = &rest[idx + 5..];
+            continue;
+        }
+        let dict_start = &after[brace..];
+        let dict = if let Some(end) = dict_start.find(NATIVE_TOOL_CALL_SUFFIX) {
+            &dict_start[..end]
+        } else {
+            dict_start.trim()
+        };
+        if let Some(args) = gemma4_dict_to_json_object(dict) {
+            calls.push(make_tool_call(name, args));
+        }
+        let advance = idx + 5 + brace + dict.len().min(dict_start.len());
+        if advance == 0 || advance > rest.len() {
+            break;
+        }
+        rest = &rest[advance.min(rest.len())..];
+    }
 }
 
 fn has_channel_markup(text: &str) -> bool {
@@ -553,13 +888,15 @@ fn split_channel_markup(text: &str) -> (String, String) {
 }
 
 fn strip_native_tool_calls(text: &mut String) {
-    while let Some(start) = text.find(NATIVE_TOOL_CALL_PREFIX) {
-        match text[start..].find(NATIVE_TOOL_CALL_SUFFIX) {
-            Some(end) => {
-                text.replace_range(start..start + end + NATIVE_TOOL_CALL_SUFFIX.len(), "");
-            }
-            None => break,
-        }
+    while let Some(start) = text.find(NATIVE_TOOL_CALL_TRIGGER) {
+        let after = &text[start + NATIVE_TOOL_CALL_TRIGGER.len()..];
+        let rel_end = if let Some(end) = after.find(NATIVE_TOOL_CALL_SUFFIX) {
+            NATIVE_TOOL_CALL_TRIGGER.len() + end + NATIVE_TOOL_CALL_SUFFIX.len()
+        } else {
+            // Generation often stops on `<tool_call|>`, so the suffix is absent.
+            text.len() - start
+        };
+        text.replace_range(start..start + rel_end, "");
     }
     *text = text.trim().to_string();
 }
@@ -842,6 +1179,127 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].function.arguments, r#"{"path":"AGENTS.md"}"#);
+    }
+
+    #[test]
+    fn parses_native_edit_with_nested_edits_array() {
+        let text = r#"<|tool_call>call:edit{edits:[{oldText:<|"|>Change the JSON type from string to integer.<|"|>,newText:<|"|>Keep it a string like "89".<|"|>}],path:<|"|>demos/max_age_cieiling_proposal.md<|"|>}"#;
+        let allowed = vec![
+            "read".to_string(),
+            "edit".to_string(),
+            "write".to_string(),
+            "bash".to_string(),
+        ];
+        let calls = parse_native_tool_calls(text, Some(&allowed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "edit");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args["path"].as_str(),
+            Some("demos/max_age_cieiling_proposal.md")
+        );
+        let edits = args["edits"].as_array().expect("edits array");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0]["oldText"].as_str(),
+            Some("Change the JSON type from string to integer.")
+        );
+        assert_eq!(
+            edits[0]["newText"].as_str(),
+            Some(r#"Keep it a string like "89"."#)
+        );
+    }
+
+    #[test]
+    fn parses_native_call_without_suffix_stop() {
+        let text = r#"<|channel>thought
+I should edit the file.
+<channel|><|tool_call>call:edit{edits:[{oldText:<|"|>integer<|"|>,newText:<|"|>"89"<|"|>}],path:<|"|>demos/max_age_cieiling_proposal.md<|"|>}"#;
+        let calls = parse_native_tool_calls(text, Some(&["edit".to_string()]));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "edit");
+        let (_, content) = split_reasoning_and_content(text);
+        assert!(!content.contains("<|tool_call>"));
+        assert!(!content.contains("oldText"));
+    }
+
+    #[test]
+    fn parses_json_style_edit_args_with_unescaped_quotes() {
+        let text = r#"<|channel>thought
+The user wants a string ceiling.
+<channel|><|tool_call>call:edit{edits:[{
+  "oldText": "Change the JSON type from string to integer.
+json{
+ "eligible": true,
+ "max_age_cieling": ""
+}
+The type today: string",
+  "newText": "Keep max_age_cieiling a JSON string ("89"), not integer 89."
+}],path:"demos/max_age_cieiling_proposal.md"}"#;
+        let calls = parse_native_tool_calls(
+            text,
+            Some(&["read".to_string(), "edit".to_string()]),
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "edit");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args["path"].as_str(),
+            Some("demos/max_age_cieiling_proposal.md")
+        );
+        let edits = args["edits"].as_array().expect("edits");
+        assert!(edits[0]["oldText"]
+            .as_str()
+            .unwrap()
+            .contains(r#""eligible": true"#));
+        assert!(edits[0]["newText"]
+            .as_str()
+            .unwrap()
+            .contains(r#"("89")"#));
+
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("fix demos/max_age_cieiling_proposal.md".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                tool_calls: Some(vec![make_tool_call(
+                    "read",
+                    serde_json::json!({ "path": "demos/max_age_cieiling_proposal.md" }),
+                )]),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".into(),
+                name: Some("read".into()),
+                content: Some("# RFC\nmax_age_cieiling is unused".into()),
+                ..Default::default()
+            },
+        ];
+        let tools = vec![Tool {
+            tool_type: Some("function".into()),
+            function: FunctionDef {
+                name: "edit".into(),
+                description: None,
+                parameters: None,
+            },
+        }];
+        let resolved = resolve_tool_calls(text, &messages, Some(&tools), None);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].function.name, "edit");
+        assert!(!awaits_tool_call(&messages));
+    }
+
+    #[test]
+    fn remaps_list_files_to_bash() {
+        let text = r#"<|tool_call>call:list_files{}<tool_call|>"#;
+        let allowed = vec!["read".to_string(), "bash".to_string(), "edit".to_string()];
+        let calls = parse_native_tool_calls(text, Some(&allowed));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "bash");
+        assert_eq!(calls[0].function.arguments, r#"{"command":"ls -F"}"#);
     }
 
     #[test]
