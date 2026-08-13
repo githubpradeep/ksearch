@@ -439,6 +439,26 @@ impl GemmaPrimModel {
         let wq = self.weight_bufs.get(q_name).unwrap().buf().clone();
         let wk = self.weight_bufs.get(k_name).unwrap().buf().clone();
         let wv = self.weight_bufs.get(v_name).unwrap().buf().clone();
+        if dq == dk && dk == dv && dq == DType::Q4K {
+            // Tiny rms, then one device-x coop QKV (do not fuse rms: LOCAL x_hat
+            // regresses vs streaming device activations).
+            self.eng
+                .rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+            return self.eng.matvec_qkv_wd(
+                &self.ctx,
+                q_rows,
+                kv_rows,
+                cols,
+                dq,
+                &wq,
+                &wk,
+                &wv,
+                &self.x2,
+                &q,
+                &k,
+                &v,
+            );
+        }
         if dq == dk && dk == dv && !is_packed(dq) {
             return self.eng.rmsnorm_matvec_qkv_wd(
                 &self.ctx,
@@ -786,7 +806,8 @@ impl GemmaPrimModel {
             let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
 
             if packed_gate {
-                // Cut one launch: residual+post-attn rms and ffn rms in one TG.
+                // Residual+post-attn rms and ffn rms in one TG; gate_up stays
+                // device-x coop (LOCAL x_hat in the fused rms+gate_up path is slower).
                 if let Some(ts) = t_section {
                     self.ctx.synchronize()?;
                     ms_attn += ts.elapsed().as_secs_f64() * 1e3;
@@ -934,9 +955,8 @@ impl GemmaPrimModel {
                 self.ctx.synchronize()?;
                 ms_ple_l += ts.elapsed().as_secs_f64() * 1e3;
             }
-            if !want_logits && !profile && (layer + 1) % 4 == 0 {
-                self.ctx.flush_async();
-            }
+            // Decode: keep one encoder/CB for the whole token (llama.cpp-style).
+            // Prefill still commits at token end so the next PLE gather can overlap.
         }
 
         let t_layers = t0.elapsed();
