@@ -104,7 +104,7 @@ Role for ksearch: **scoreboard + Gemma semantics**, not shader source of truth f
 - Expect an initial gap vs oracle; measure honestly.
 - Motivation: MLX-class stacks show Mac LLM can be useful without FA theater; we push how far **generated** kernels get.
 
-See [DESIGN.md](./DESIGN.md).
+See [DESIGN.md](./DESIGN.md) and the beginner curriculum starting at [README.md](./README.md).
 
 ---
 

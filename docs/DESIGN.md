@@ -1,7 +1,8 @@
 # ksearch design — Thesis A (compiler-pure)
 
 **Status:** locked (2026-08) — tinygrad-only IR purge complete  
-**Findings:** [FINDINGS.md](./FINDINGS.md)
+**Findings:** [FINDINGS.md](./FINDINGS.md)  
+**Study path (beginner → reimplement):** [README.md](./README.md)
 
 ---
 
@@ -31,9 +32,9 @@ There is **no** `Ops.MATMUL`, `Ops.RMSNORM`, `Ops.FLASH_ATTN`, `Ops.GELU` in tin
 | gelu (tanh) | `0.5 * x * (1 + tanh(…))` |
 | SDPA | `Q@Kᵀ` → softmax → `@V` (no FlashAttention) |
 
-### Quant (tinygrad CUDA parity)
+### Quant (tinygrad-shaped Load expand)
 
-tinygrad `ggml_data_to_tensor` turns Q4_K into a float Tensor, then typically `.half()`. ksearch: **CPU `dequant_to_f16_bytes` → F16 buffers → generic AST** (ALU in float, store half). Argmax index stays F32 (vocab ids). No `q4k_load`.
+tinygrad `ggml_data_to_tensor` turns Q4_K into a float Tensor, then typically `.half()`. ksearch keeps **Q4_K / Q6_K weights packed** on device. The generic renderer expands `Load(dtype=Q4K|Q6K)` to float (same slot as `Load(F16)` → float). KV cache may be Q4_0 with `Load(Q40)`. Small tensors (norms) still use CPU `dequant_to_f16_bytes`. Activations stay F16. Argmax index stays F32 (vocab ids). No Graph `Op::MatVecQ4K` and no named `q4k_load` matvec product.
 
 ---
 
@@ -72,9 +73,9 @@ GGUF / tensors
 
 | Topic | Stance |
 |-------|--------|
-| **Attention** | SDPA sugar → `Call` + `FuseHint::SdpaNaive` (Q@Kᵀ→softmax→@V fused at schedule) |
-| **Quant** | Like tinygrad: dequant Q4→float then **`.half()` (F16)** buffers; generic AST kernels only |
-| **Serving** | `KvPool::new_f16`; chunked prefill; B≥1 pool types ready |
+| **Attention** | SDPA sugar → `Call` + `FuseHint::SdpaNaive` (Q@Kᵀ→softmax→@V fused at schedule); long KV uses partitioned MWG |
+| **Quant** | Q4_K/Q6_K weights stay packed; renderer `Load` expand to float; KV Q4_0 `Load(Q40)`; acts F16 |
+| **Serving** | `KvPool` (Q4_0 or F16); chunked prefill; B≥1 pool types ready |
 
 ---
 
@@ -86,7 +87,7 @@ GGUF / tensors
 | P1 | BEAM improves dense matvec over untuned | ✅ |
 | P2 | `"Hi"` → `Hi!` + `help` on GemmaPrim | ✅ |
 | P3 | Sugar expand + schedule FuseHint fusion | ✅ |
-| P4 | Q4→F16 dequant (tinygrad `.half()`); no debt Eng; no `q4k_load` | ✅ |
+| P4 | Packed Q4_K `Load` expand; no debt Eng; no catalog `MatVecQ4K` | ✅ |
 | Arch | Eng = Graph→schedule only; no `Op::SdpaNaive` catalog | ✅ |
 | Product | KvPool / B≥1 decode speed vs oracle | open (scoreboard; not blocking IR) |
 
@@ -106,7 +107,7 @@ ksearch/
     ksearch_gguf/            # mmap loader
     ksearch_gemma/           # GemmaPrimModel only
     ksearch_cli/             # benches + generate
-  docs/
+  docs/                      # DESIGN, FINDINGS, 01–08 curriculum
   reference/                 # tinygrad, luminal, metal-llm-server (oracle scoreboard)
 ```
 
@@ -120,7 +121,7 @@ ksearch/
 | **P1** | OptOp BEAM + disk cache | ✅ |
 | **P2** | GemmaPrim `"Hi"` gate | ✅ |
 | **P3** | Sugar expand + FuseHint schedule fusion | ✅ |
-| **P4** | Q4→F16 dequant (tinygrad `.half()`); debt deleted; no `q4k_load` | ✅ |
+| **P4** | Packed Q4_K `Load` expand; debt deleted; no catalog `MatVecQ4K` | ✅ |
 | **P5** | KvPool + chunked prefill | ✅ |
 | **Purge** | Tinygrad-shaped IR; no `GemmaModel` / `debt/` | ✅ |
 | **Arch wire** | Eng Graph-only; `Call`+hints; Reshape/Permute; plan_cache | ✅ |
