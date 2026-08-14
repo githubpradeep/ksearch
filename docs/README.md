@@ -10,7 +10,7 @@ You do **not** need to have written a compiler or GPU kernels before. Start at *
 |---|-----|----------------------------------------|
 | 0a | [00-transformers.md](./00-transformers.md) | Draw a decoder block; explain prefill vs decode and KV cache |
 | 0b | [00-metal.md](./00-metal.md) | Explain gid/lid, threadgroups, buffers, one encoder per token |
-| 0c | [00-gemma-architecture.md](./00-gemma-architecture.md) | Trace SWA, shared-KV, PLE, and a generate sequence |
+| 0c | [00-gemma-architecture.md](./00-gemma-architecture.md) | Trace SWA, shared-KV, PLE, GQA/MQA, and a generate sequence |
 | — | [animations/README.md](./animations/README.md) | Render Manim scenes for the diagrams above |
 | — | [DESIGN.md](./DESIGN.md) | State the thesis in one sentence and name the forbidden shortcuts |
 | — | [FINDINGS.md](./FINDINGS.md) | Explain why tinygrad / luminal / metal-llm-server were studied |
@@ -20,7 +20,7 @@ You do **not** need to have written a compiler or GPU kernels before. Start at *
 | 4 | [04-render-and-metal.md](./04-render-and-metal.md) | Walk an AST node to MSL and launch it |
 | 5 | [05-beam-and-plans.md](./05-beam-and-plans.md) | Say what BEAM searches (tilings) and what it does not |
 | 6 | [06-quant.md](./06-quant.md) | Explain dequant-at-load vs eager CPU dequant |
-| 7 | [07-gemma-runtime.md](./07-gemma-runtime.md) | Trace one decode token through embed → layers → logits |
+| 7 | [07-gemma-runtime.md](./07-gemma-runtime.md) | Trace one decode token; know E2B MQA vs E4B GQA KV layout |
 | 8 | [08-implement-from-scratch.md](./08-implement-from-scratch.md) | Rebuild the stack in stages, with checkpoints |
 
 Read 0a–0c until the pictures are boring. Then DESIGN.md once. Then 01–08. Come back to FINDINGS.md when you wonder “why not just copy llama.cpp kernels?”

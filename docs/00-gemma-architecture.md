@@ -1,6 +1,6 @@
 # 0c. Gemma 4 architecture
 
-Vanilla decoder (previous chapter) plus Gemma 4 E2B specifics that ksearch actually runs. Numbers come from GGUF metadata (`GemmaConfig`); treat them as typical E2B-it, not a second spec.
+Vanilla decoder (previous chapter) plus dense Gemma 4 specifics that ksearch actually runs (**E2B** and **E4B**). Numbers come from GGUF metadata (`GemmaConfig`); the diagrams below use E2B-shaped counts as a teaching default. E4B is the same family with larger hidden size and **GQA** (`n_kv > 1`). MoE A4B is not supported.
 
 Watch: Manim scenes `Gemma4Stack`, `GemmaLayer`, `DecodeTokenSeq` ([animations](./animations/README.md)). Runtime details: [07-gemma-runtime.md](./07-gemma-runtime.md).
 
@@ -35,9 +35,9 @@ flowchart TB
   AN["attn_norm RMS"]
   QKV["Wq,Wk,Wv @ x_hat\n3 outputs"]
   QN["per-head RMS + RoPE on Q"]
-  KN["per-head RMS + RoPE on K\npack Q4_0 → kv_k[pos]"]
-  VN["per-head RMS on V\npack Q4_0 → kv_v[pos]"]
-  SDPA["SDPA hybrid\nQ F16 × K,V Q40"]
+  KN["per-head RMS + RoPE on K\npack Q4_0 → kv_k[pos, n_kv]"]
+  VN["per-head RMS on V\npack Q4_0 → kv_v[pos, n_kv]"]
+  SDPA["SDPA hybrid\nQ F16 × K,V Q40\n1 TG per KV head (GQA)"]
   O["Wo @ attn"]
   PA["post_attn RMS + residual add"]
   FN["ffn_norm RMS"]

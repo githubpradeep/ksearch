@@ -101,7 +101,7 @@ flowchart LR
 
 **Causal mask:** position `p` may only look at keys `0…p` (and, for sliding window, only the last `W` of those).
 
-**GQA / MQA:** many Q heads share fewer K/V heads. Gemma 4 E2B is typically **MQA** (`n_kv = 1`): one K and one V stream, all Q heads share it. That is a bandwidth win when reading the KV cache.
+**GQA / MQA:** many Q heads share fewer K/V heads. Gemma 4 **E2B** is typically **MQA** (`n_kv = 1`): one K/V stream for all Q heads. **E4B** is **GQA** (e.g. `n_kv = 2`): each KV head is shared by `n_heads / n_kv` Q heads. ksearch packs KV as `[seq, n_kv, hd]` and runs one SDPA threadgroup per KV head.
 
 **RoPE:** rotate pairs of dimensions in Q and K by an angle that depends on position, so the dot product encodes relative distance. Implemented as `cos/sin` tables, not as a learned matrix.
 

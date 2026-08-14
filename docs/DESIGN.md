@@ -44,7 +44,7 @@ tinygrad `ggml_data_to_tensor` turns Q4_K into a float Tensor, then typically `.
 - CUDA / Triton (no Triton on Metal)
 - Calling FlashInfer or shipping metal-llm-server MSL as hot path
 - Matching oracle tok/s on day one
-- A4B MoE / vision
+- A4B MoE / vision (dense E2B / E4B GGUFs are in scope)
 - Reintroducing fused catalog Ops to chase tok/s
 
 ---

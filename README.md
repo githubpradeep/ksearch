@@ -20,19 +20,24 @@ cargo run -p ksearch_cli --release -- elem-add --n 1048576
 # Generate a matvec kernel (optionally BEAM-search tilings)
 cargo run -p ksearch_cli --release -- matvec --rows 4096 --cols 4096 --beam
 
-# Run Gemma 4 E2B from a GGUF
+# Run Gemma 4 E2B or E4B from a GGUF (dense; sizes come from metadata)
 cargo run -p ksearch_cli --release -- generate \
   --gguf ~/models/gemma-4-e2b/gemma-4-E2B-it-Q4_K_M.gguf \
   --prompt "Hi" --n-predict 32 --max-seq 64
 
-# Correctness + tok/s regression (Hi gate + essay)
+cargo run -p ksearch_cli --release -- generate \
+  --gguf ~/models/gemma-4-e4b/gemma-4-E4B-it-Q4_K_M.gguf \
+  --prompt "Hi" --n-predict 32 --max-seq 64
+
+# Correctness + tok/s regression (Hi gate + essay; default GGUF is E2B)
 cargo run -p ksearch_cli --release -- bench
 
-# OpenAI-compatible HTTP server
-cargo run -p ksearch_cli --release -- serve --port 8080
+# OpenAI-compatible HTTP server (point --gguf at E2B or E4B)
+cargo run -p ksearch_cli --release -- serve \
+  --gguf ~/models/gemma-4-e4b/gemma-4-E4B-it-Q4_K_M.gguf --port 8080
 ```
 
-`bench` prints Hi pass/fail plus prefill/decode tok/s for `"Hi"` and a short essay prompt. The Hi gate expects the reply to contain `Hi!` and `help`.
+Dense Gemma 4 only: **E2B** (MQA, `n_kv=1`) and **E4B** (GQA, `n_kv=2` in current GGUFs). MoE **A4B** is out of scope. `bench` prints Hi pass/fail plus prefill/decode tok/s; the Hi gate expects the reply to contain `Hi!` and `help`.
 
 ## What this project is (and is not)
 

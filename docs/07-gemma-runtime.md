@@ -13,20 +13,32 @@ Files:
 - `crates/ksearch_cli/src/main.rs` — generate / bench
 - `crates/ksearch_cli/src/serve.rs` + `scheduler.rs` — HTTP + continuous batching
 
-## Gemma 4 E2B shape
+## Dense Gemma 4 shape (E2B / E4B)
 
-`GemmaConfig::from_gguf` reads keys like `gemma4.block_count`, `gemma4.embedding_length`, …
+`GemmaConfig::from_gguf` reads `gemma4.*` keys (and asserts `general.architecture == gemma4`). There is no variant enum: E2B vs E4B differ only by metadata. MoE A4B (`expert_count > 0` or per-layer `head_count_kv`) is rejected.
+
+Typical dense GGUFs (verify on your file):
+
+| | E2B-it | E4B-it |
+|--|--------|--------|
+| `n_layers` | 35 | 42 |
+| `hidden` | 1536 | 2560 |
+| `n_heads` / `n_kv` | 8 / **1 (MQA)** | 8 / **2 (GQA)** |
+| SWA / full `hd` | 256 / 512 | 256 / 512 |
+| `ffn` | per-layer array (6144 / 12288 on shared-KV) | scalar 10240 |
+| `shared_kv_layers` | 20 | 18 |
+| PLE | yes (`ple_dim` 256) | yes |
 
 | Field | Role |
 |-------|------|
 | `n_layers` | Transformer blocks (`blk.{i}.*` in GGUF) |
-| `hidden` | Residual stream width (E2B: 1536) |
-| `n_heads` / `n_kv` | Q heads vs KV heads. E2B is **MQA**: `n_kv` is typically 1 |
-| `head_dim_swa` / `head_dim_full` | Sliding-window layers vs full-attn layers (256 vs 512) |
+| `hidden` | Residual stream width |
+| `n_heads` / `n_kv` | Q heads vs KV heads (`head_count_kv`; must divide `n_heads`) |
+| `head_dim_swa` / `head_dim_full` | Sliding-window vs full-attn head dims |
 | `swa_pattern` | Which layers are sliding-window (often 5 SWA + 1 full) |
 | `sliding_window` | SWA attends only the last W tokens |
 | `shared_kv_layers` | Last N layers **reuse** earlier K/V (no KV write) |
-| `ffn[i]` | Per-layer MLP inner size |
+| `ffn[i]` | Per-layer MLP inner size (scalar FFN is expanded to all layers) |
 | `ple_dim` | Per-layer embedding width (Gemma 4 PLE) |
 | `softcap` | Final logit `cap * tanh(x/cap)` |
 | `rms_eps` | RMSNorm epsilon |
@@ -34,7 +46,7 @@ Files:
 
 `owns_kv(layer)` / `kv_source(layer)` implement shared-KV: a non-owner still runs Q projection + SDPA, but reads another layer’s packed K/V.
 
-SDPA streams **one** K/V sequence `[tlen, hd]` across all Q heads (MQA bandwidth). Packed KV per owning layer is Q4_0 with logical shape `[max_seq, hd]`.
+Packed KV per owning layer is Q4_0 with logical shape **`[max_seq, n_kv, hd]`** (MQA: `n_kv=1`). Byte offset for position `pos` is `pos * n_kv * q40_row_bytes(hd)`. SDPA launches **one threadgroup per KV head**; the `n_heads / n_kv` Q heads in that group share the streamed K/V tile.
 
 ## GGUF and tokenizer
 
@@ -80,13 +92,13 @@ CLI `generate --prompt` always goes through that template. `--tokens 1,2,3` skip
       owner:     rmsnorm_matvec_qkv → tmp_q, tmp_k, tmp_v
       non-owner: rmsnorm_matvec on Q only
    b. Per-head RMS + RoPE
-      owner: pack K/V as Q4_0 into kv_k/v at byte offset pos * q40_row_bytes(hd)
+      owner: pack K/V as Q4_0 into kv_k/v at byte offset pos * n_kv * q40_row_bytes(hd)
       non-owner: RMS+RoPE on Q only
    c. SDPA hybrid
       meta = (tlen, start)   # SWA: last window; full: 0..pos+1
-      if tlen < 128: naive online softmax (one TG streams K/V for all Q heads)
-      else: MWG pass1 (16 partitions) + pass2 reduce
-      K/V Load dtype = Q40
+      if tlen < 128: naive online softmax (one TG per KV head; GQA group shares tile)
+      else: MWG pass1 (16 partitions × n_kv) + pass2 reduce
+      K/V Load dtype = Q40; layout [max_seq, n_kv, hd]
    d. o-proj:  tmp_o → x2
    e. MLP
       rmsnorm_add_then_rmsnorm   (residual + post-attn RMS + ffn RMS, 2 outputs)

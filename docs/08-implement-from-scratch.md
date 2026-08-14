@@ -163,13 +163,13 @@ RoPE: host table `cos||sin` per position; kernel rotates pairs.
 mmap GGUF. Parse Gemma 4 metadata. Load Q4_K weights. Implement layer extras in this order:
 
 1. SWA window + two RoPE tables
-2. Q4_0 KV append + SDPA Q40 loads
+2. Q4_0 KV append as `[seq, n_kv, hd]` + SDPA Q40 loads (MQA `n_kv=1`, GQA for E4B)
 3. Shared-KV (`owns_kv` / `kv_source`)
-4. PLE residual (required for E2B-it quality)
+4. PLE residual (required for E2B/E4B-it quality)
 5. Tied lm_head + softcap argmax
 6. Chat template + tokenizer
 
-**Checkpoint:** this repo’s bench: `"Hi"` → text contains `Hi!` and `help`.
+**Checkpoint:** this repo’s bench: `"Hi"` → text contains `Hi!` and `help`. Optional: same prompt on an E4B GGUF.
 
 ksearch: `gemma_prim.rs` `forward_token`, [07-gemma-runtime.md](./07-gemma-runtime.md).
 
