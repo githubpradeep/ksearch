@@ -37,12 +37,31 @@ pub struct GemmaConfig {
 
 impl GemmaConfig {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
+        if let Some(arch) = g.get_str("general.architecture") {
+            if arch != "gemma4" {
+                return Err(anyhow!("unsupported GGUF architecture `{arch}` (expected gemma4)"));
+            }
+        }
+        if g.get_u32("gemma4.expert_count").unwrap_or(0) > 0 {
+            return Err(anyhow!("Gemma 4 MoE (A4B) is not supported"));
+        }
         let n_layers = g
             .get_u32("gemma4.block_count")
             .ok_or_else(|| anyhow!("block_count"))? as usize;
         let hidden = g.get_u32("gemma4.embedding_length").unwrap() as usize;
         let n_heads = g.get_u32("gemma4.attention.head_count").unwrap() as usize;
-        let n_kv = g.get_u32("gemma4.attention.head_count_kv").unwrap_or(1) as usize;
+        let n_kv_list = g
+            .get_usize_list("gemma4.attention.head_count_kv")
+            .unwrap_or_else(|| vec![1]);
+        if n_kv_list.len() > 1 {
+            return Err(anyhow!(
+                "per-layer head_count_kv is not supported (A4B/MoE)"
+            ));
+        }
+        let n_kv = n_kv_list.first().copied().unwrap_or(1).max(1);
+        if n_heads % n_kv != 0 {
+            return Err(anyhow!("head_count {n_heads} not divisible by head_count_kv {n_kv}"));
+        }
         let head_dim_full = g.get_u32("gemma4.attention.key_length").unwrap_or(512) as usize;
         let head_dim_swa = g.get_u32("gemma4.attention.key_length_swa").unwrap_or(256) as usize;
         let sliding_window = g.get_u32("gemma4.attention.sliding_window").unwrap_or(512) as usize;
@@ -112,7 +131,7 @@ impl GemmaConfig {
     /// Q4_0 K+V bytes for `slots` sequences of `max_seq` (pool uses max head dim).
     pub fn kv_q40_bytes(&self, max_seq: usize, slots: usize) -> usize {
         let hd = self.head_dim_full.max(self.head_dim_swa);
-        slots * self.n_kv_owners() * 2 * q40_nbytes(max_seq, hd)
+        slots * self.n_kv_owners() * 2 * q40_nbytes(max_seq * self.n_kv, hd)
     }
 
     pub fn is_swa(&self, layer: usize) -> bool {

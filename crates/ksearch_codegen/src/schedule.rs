@@ -376,6 +376,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
         },
         FuseHint::SdpaNaiveBatch {
             n_q,
+            n_kv,
             n_tok,
             hd,
             max_t,
@@ -390,6 +391,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             output: out,
             kind: KernelKind::SdpaNaiveBatch {
                 n_q: *n_q,
+                n_kv: *n_kv,
                 n_tok: *n_tok,
                 hd: *hd,
                 max_t: *max_t,
@@ -402,6 +404,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
         },
         FuseHint::SdpaMwgPartBatch {
             n_q,
+            n_kv,
             n_tok,
             hd,
             max_t,
@@ -417,6 +420,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             output: out,
             kind: KernelKind::SdpaMwgPartBatch {
                 n_q: *n_q,
+                n_kv: *n_kv,
                 n_tok: *n_tok,
                 hd: *hd,
                 max_t: *max_t,
@@ -724,6 +728,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
         }
         FuseHint::SdpaNaive {
             n_q,
+            n_kv,
             hd,
             max_t,
             q,
@@ -737,6 +742,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             output: out,
             kind: KernelKind::SdpaNaive {
                 n_q: *n_q,
+                n_kv: *n_kv,
                 hd: *hd,
                 max_t: *max_t,
                 q: *q,
@@ -748,6 +754,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
         },
         FuseHint::SdpaMwgPart {
             n_q,
+            n_kv,
             hd,
             max_t,
             nwg,
@@ -762,6 +769,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             output: out,
             kind: KernelKind::SdpaMwgPart {
                 n_q: *n_q,
+                n_kv: *n_kv,
                 hd: *hd,
                 max_t: *max_t,
                 nwg: *nwg,

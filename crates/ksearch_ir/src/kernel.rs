@@ -204,8 +204,10 @@ pub enum FuseHint {
         w_ffn: TensorId,
     },
     /// Prefill SDPA: `n_tok` query tokens, causal `tlen = meta_tlen + tok`.
+    /// K/V logical shape `[max_t, n_kv, hd]` (MQA: `n_kv=1`).
     SdpaNaiveBatch {
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,
@@ -217,6 +219,7 @@ pub enum FuseHint {
     },
     SdpaMwgPartBatch {
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,
@@ -343,6 +346,7 @@ pub enum FuseHint {
     },
     SdpaNaive {
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         q: TensorId,
@@ -355,6 +359,7 @@ pub enum FuseHint {
     /// Partitioned MWG SDPA pass1: per (head, part) online softmax → F32 tmp `(m,l,O)`.
     SdpaMwgPart {
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         nwg: usize,
@@ -408,6 +413,7 @@ pub enum KernelKind {
     },
     SdpaNaive {
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         q: TensorId,
@@ -418,6 +424,7 @@ pub enum KernelKind {
     },
     SdpaMwgPart {
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         nwg: usize,
@@ -581,6 +588,7 @@ pub enum KernelKind {
     },
     SdpaNaiveBatch {
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,
@@ -592,6 +600,7 @@ pub enum KernelKind {
     },
     SdpaMwgPartBatch {
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,

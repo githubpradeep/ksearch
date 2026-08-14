@@ -139,8 +139,8 @@ impl GemmaPrimModel {
         let cfg = GemmaConfig::from_gguf(&g)?;
         let vocab = ksearch_gguf::Vocab::from_gguf(&g);
         eprintln!(
-            "[prim] layers={} hidden={} heads={} vocab={} (Q4_K weights packed; acts F16)",
-            cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.vocab
+            "[prim] layers={} hidden={} heads={}/{} vocab={} (Q4_K weights packed; acts F16)",
+            cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.n_kv, cfg.vocab
         );
 
         let ctx = MetalContext::new()?;
@@ -202,8 +202,8 @@ impl GemmaPrimModel {
         for i in 0..n_kv_owners {
             let hd = cfg.head_dim(i);
             // Q4_0 packed KV (Thesis A Load(Q40) expand in SDPA).
-            kv_k.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq, hd)));
-            kv_v.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq, hd)));
+            kv_k.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq * cfg.n_kv, hd)));
+            kv_v.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq * cfg.n_kv, hd)));
         }
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
@@ -973,7 +973,7 @@ impl GemmaPrimModel {
             }
 
             if owns_kv {
-                let kv_off = self.pos * q40_row_bytes(hd);
+                let kv_off = self.pos * self.cfg.n_kv * q40_row_bytes(hd);
                 self.eng.rmsnorm_per_head_qkv_q40_off(
                     &self.ctx,
                     n_heads,
@@ -1018,6 +1018,7 @@ impl GemmaPrimModel {
             self.eng.sdpa_hybrid_kv(
                 &self.ctx,
                 n_heads,
+                self.cfg.n_kv,
                 hd,
                 max_seq,
                 attn_t,
@@ -1422,7 +1423,7 @@ impl GemmaPrimModel {
 
             if owns_kv {
                 let rope_off = pos0 * rope_hd;
-                let kv_off = pos0 * q40_row_bytes(hd);
+                let kv_off = pos0 * self.cfg.n_kv * q40_row_bytes(hd);
                 self.eng.rmsnorm_per_head_qkv_q40_batch(
                     &self.ctx,
                     n_heads,
@@ -1472,6 +1473,7 @@ impl GemmaPrimModel {
             self.eng.sdpa_hybrid_kv_batch(
                 &self.ctx,
                 n_heads,
+                self.cfg.n_kv,
                 t,
                 hd,
                 max_seq,
@@ -1636,7 +1638,7 @@ impl GemmaPrimModel {
     pub fn make_kv_pool(&self, max_batch: usize) -> Result<KvPool> {
         let n_kv_layers = self.cfg.n_kv_owners();
         let hd = self.cfg.head_dim_full.max(self.cfg.head_dim_swa);
-        KvPool::new(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
+        KvPool::new(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd, self.cfg.n_kv)
     }
 
     pub fn reset(&mut self) {

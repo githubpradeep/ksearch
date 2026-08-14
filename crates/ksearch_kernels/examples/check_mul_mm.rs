@@ -216,7 +216,7 @@ fn check_sdpa(
     write_meta(&meta, (pos0 + 1) as u32, 0, win);
     let last_tlen = (pos0 + n_tok) as u32;
     eng.sdpa_hybrid_kv_batch(
-        ctx, n_q, n_tok, hd, max_t, last_tlen.min(win), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o_b,
+        ctx, n_q, 1, n_tok, hd, max_t, last_tlen.min(win), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o_b,
     )?;
 
     for t in 0..n_tok {
@@ -227,7 +227,7 @@ fn check_sdpa(
         write_meta(&meta, tlen, start, 0);
         eng.copy_slice(ctx, n_q * hd, &bq, t * n_q * hd, &q1, 0)?;
         eng.sdpa_hybrid_kv(
-            ctx, n_q, hd, max_t, tlen, DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1,
+            ctx, n_q, 1, hd, max_t, tlen, DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1,
         )?;
         eng.copy_slice(ctx, n_q * hd, &o1, 0, &o_s, t * n_q * hd)?;
     }
@@ -280,7 +280,7 @@ fn check_needle(
     let tmp = ctx.buffer_empty_f32(n_q * Eng::SDPA_MWG_NWG * (hd + 2));
     let o = ctx.buffer_empty_f16(qn);
     eng.sdpa_hybrid_kv(
-        ctx, n_q, hd, tlen, tlen as u32, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o,
+        ctx, n_q, 1, hd, tlen, tlen as u32, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o,
     )?;
     ctx.synchronize()?;
     let out = read_f16(ctx, &o, qn);

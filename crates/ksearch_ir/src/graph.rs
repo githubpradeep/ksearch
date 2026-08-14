@@ -16,6 +16,28 @@ fn packed_k_quant(d: DType) -> bool {
     matches!(d, DType::Q4K | DType::Q6K)
 }
 
+/// Infer GQA `n_kv` from packed K/V `[max_t, n_kv, hd]`. MQA is `n_kv = 1`.
+fn sdpa_n_kv(
+    n_q: usize,
+    max_t: usize,
+    hd: usize,
+    k_numel: usize,
+    v_numel: usize,
+) -> Result<usize, IrError> {
+    if n_q == 0 || max_t == 0 || hd == 0 {
+        return Err(IrError::ShapeMismatch);
+    }
+    let row = max_t * hd;
+    if k_numel != v_numel || k_numel % row != 0 {
+        return Err(IrError::ShapeMismatch);
+    }
+    let n_kv = k_numel / row;
+    if n_kv == 0 || n_q % n_kv != 0 {
+        return Err(IrError::ShapeMismatch);
+    }
+    Ok(n_kv)
+}
+
 /// QKV weights: all same float, or any mix of packed K-quants (shared F16 out).
 fn qkv_weight_dtypes_ok(dq: DType, dk: DType, dv: DType, dx: DType, cols: usize) -> Result<DType, IrError> {
     let oq = matvec_weight_act_out(dq, dx, cols)?;
@@ -935,6 +957,7 @@ impl Graph {
 
     /// SDPA sugar → CALL (Q@Kᵀ→softmax→@V fused by schedule; not a Graph catalog Op).
     /// K/V may be F16 or Q40 (Load expand → float in the generic renderer).
+    /// K/V logical shape is `[max_t, n_kv, hd]`; `n_kv` is inferred (MQA = 1).
     pub fn sdpa_naive(
         &mut self,
         q: TensorId,
@@ -949,15 +972,8 @@ impl Graph {
         let (sk, dk) = self.shape_dtype(k)?;
         let (sv, dv) = self.shape_dtype(v)?;
         let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
-        if !dq.is_float()
-            || !kv_ok
-            || sq.numel() != n_q * hd
-            || sk.numel() != max_t * hd
-            || sv.numel() != max_t * hd
-            || n_q == 0
-            || hd == 0
-            || max_t == 0
-        {
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_q * hd {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
@@ -966,6 +982,7 @@ impl Graph {
             dq,
             FuseHint::SdpaNaive {
                 n_q,
+                n_kv,
                 hd,
                 max_t,
                 q,
@@ -993,17 +1010,8 @@ impl Graph {
         let (sk, dk) = self.shape_dtype(k)?;
         let (sv, dv) = self.shape_dtype(v)?;
         let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
-        if !dq.is_float()
-            || !kv_ok
-            || sq.numel() != n_q * hd
-            || sk.numel() != max_t * hd
-            || sv.numel() != max_t * hd
-            || n_q == 0
-            || hd == 0
-            || max_t == 0
-            || nwg == 0
-            || hd % 32 != 0
-        {
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_q * hd || nwg == 0 || hd % 32 != 0 {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
@@ -1012,6 +1020,7 @@ impl Graph {
             DType::F32,
             FuseHint::SdpaMwgPart {
                 n_q,
+                n_kv,
                 hd,
                 max_t,
                 nwg,
@@ -1071,16 +1080,8 @@ impl Graph {
         let (sk, dk) = self.shape_dtype(k)?;
         let (sv, dv) = self.shape_dtype(v)?;
         let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
-        if !dq.is_float()
-            || !kv_ok
-            || sq.numel() != n_tok * n_q * hd
-            || sk.numel() != max_t * hd
-            || sv.numel() != max_t * hd
-            || n_q == 0
-            || n_tok == 0
-            || hd == 0
-            || max_t == 0
-        {
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_tok * n_q * hd || n_tok == 0 {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
@@ -1089,6 +1090,7 @@ impl Graph {
             dq,
             FuseHint::SdpaNaiveBatch {
                 n_q,
+                n_kv,
                 n_tok,
                 hd,
                 max_t,
@@ -1117,17 +1119,8 @@ impl Graph {
         let (sk, dk) = self.shape_dtype(k)?;
         let (sv, dv) = self.shape_dtype(v)?;
         let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
-        if !dq.is_float()
-            || !kv_ok
-            || sq.numel() != n_tok * n_q * hd
-            || sk.numel() != max_t * hd
-            || sv.numel() != max_t * hd
-            || n_q == 0
-            || n_tok == 0
-            || hd == 0
-            || max_t == 0
-            || nwg == 0
-        {
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_tok * n_q * hd || n_tok == 0 || nwg == 0 {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
@@ -1136,6 +1129,7 @@ impl Graph {
             DType::F32,
             FuseHint::SdpaMwgPartBatch {
                 n_q,
+                n_kv,
                 n_tok,
                 hd,
                 max_t,

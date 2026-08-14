@@ -1078,14 +1078,16 @@ impl Eng {
         meta: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
-        self.sdpa_naive_kv(ctx, n_q, hd, max_t, DType::F16, q, k, v, meta, out)
+        self.sdpa_naive_kv(ctx, n_q, 1, hd, max_t, DType::F16, q, k, v, meta, out)
     }
 
     /// SDPA with K/V dtype `kv_dtype` (F16 or Q40 Load expand).
+    /// K/V logical layout `[max_t, n_kv, hd]` (MQA: `n_kv=1`).
     pub fn sdpa_naive_kv(
         &mut self,
         ctx: &MetalContext,
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         kv_dtype: DType,
@@ -1095,12 +1097,12 @@ impl Eng {
         meta: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
-        let key = format!("sdpa_f16_{n_q}_{hd}_{max_t}_{kv_dtype:?}");
+        let key = format!("sdpa_f16_{n_q}_{n_kv}_{hd}_{max_t}_{kv_dtype:?}");
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
-            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
-            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let ki = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_naive(qi, ki, vi, mi, n_q, hd, max_t)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
@@ -1117,6 +1119,7 @@ impl Eng {
         &mut self,
         ctx: &MetalContext,
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         kv_dtype: DType,
@@ -1128,12 +1131,12 @@ impl Eng {
         out: &Buffer,
     ) -> Result<()> {
         let nwg = Self::SDPA_MWG_NWG;
-        let part_key = format!("sdpa_mwg_part_{n_q}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
+        let part_key = format!("sdpa_mwg_part_{n_q}_{n_kv}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
         if !self.cache.contains_key(&part_key) {
             let mut g = Graph::new();
             let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
-            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
-            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let ki = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_mwg_part(qi, ki, vi, mi, n_q, hd, max_t, nwg)?;
             self.ensure(ctx, &part_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
@@ -1155,6 +1158,7 @@ impl Eng {
         &mut self,
         ctx: &MetalContext,
         n_q: usize,
+        n_kv: usize,
         hd: usize,
         max_t: usize,
         attn_t: u32,
@@ -1167,9 +1171,9 @@ impl Eng {
         out: &Buffer,
     ) -> Result<()> {
         if attn_t >= Self::SDPA_MWG_THRESHOLD {
-            self.sdpa_mwg_kv(ctx, n_q, hd, max_t, kv_dtype, q, k, v, meta, tmp, out)
+            self.sdpa_mwg_kv(ctx, n_q, n_kv, hd, max_t, kv_dtype, q, k, v, meta, tmp, out)
         } else {
-            self.sdpa_naive_kv(ctx, n_q, hd, max_t, kv_dtype, q, k, v, meta, out)
+            self.sdpa_naive_kv(ctx, n_q, n_kv, hd, max_t, kv_dtype, q, k, v, meta, out)
         }
     }
 
@@ -1589,6 +1593,7 @@ impl Eng {
         &mut self,
         ctx: &MetalContext,
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,
@@ -1603,15 +1608,17 @@ impl Eng {
     ) -> Result<()> {
         if n_tok == 1 {
             return self.sdpa_hybrid_kv(
-                ctx, n_q, hd, max_t, attn_t, kv_dtype, q, k, v, meta, tmp, out,
+                ctx, n_q, n_kv, hd, max_t, attn_t, kv_dtype, q, k, v, meta, tmp, out,
             );
         }
         if attn_t >= Self::SDPA_MWG_THRESHOLD {
             self.sdpa_mwg_kv_batch(
-                ctx, n_q, n_tok, hd, max_t, kv_dtype, q, k, v, meta, tmp, out,
+                ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, tmp, out,
             )
         } else {
-            self.sdpa_naive_kv_batch(ctx, n_q, n_tok, hd, max_t, kv_dtype, q, k, v, meta, out)
+            self.sdpa_naive_kv_batch(
+                ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, out,
+            )
         }
     }
 
@@ -1619,6 +1626,7 @@ impl Eng {
         &mut self,
         ctx: &MetalContext,
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,
@@ -1629,12 +1637,12 @@ impl Eng {
         meta: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
-        let key = format!("sdpa_f16_b{n_tok}_{n_q}_{hd}_{max_t}_{kv_dtype:?}");
+        let key = format!("sdpa_f16_b{n_tok}_{n_q}_{n_kv}_{hd}_{max_t}_{kv_dtype:?}");
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let qi = g.input(Shape(vec![n_tok * n_q * hd]), DType::F16);
-            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
-            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let ki = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_naive_batch(qi, ki, vi, mi, n_q, n_tok, hd, max_t)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
@@ -1646,6 +1654,7 @@ impl Eng {
         &mut self,
         ctx: &MetalContext,
         n_q: usize,
+        n_kv: usize,
         n_tok: usize,
         hd: usize,
         max_t: usize,
@@ -1658,13 +1667,13 @@ impl Eng {
         out: &Buffer,
     ) -> Result<()> {
         let nwg = Self::SDPA_MWG_NWG;
-        let part_key = format!("sdpa_mwg_part_b{n_tok}_{n_q}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
+        let part_key = format!("sdpa_mwg_part_b{n_tok}_{n_q}_{n_kv}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
         let red_key = format!("sdpa_mwg_red_b{n_tok}_{n_q}_{hd}_{nwg}");
         if !self.cache.contains_key(&part_key) {
             let mut g = Graph::new();
             let qi = g.input(Shape(vec![n_tok * n_q * hd]), DType::F16);
-            let ki = g.input(Shape(vec![max_t * hd]), kv_dtype);
-            let vi = g.input(Shape(vec![max_t * hd]), kv_dtype);
+            let ki = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
+            let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let t = g.sdpa_mwg_part_batch(qi, ki, vi, mi, n_q, n_tok, hd, max_t, nwg)?;
             self.ensure(ctx, &part_key, lower_to_metal_chip(&g, t, &ctx.device_name())?)?;

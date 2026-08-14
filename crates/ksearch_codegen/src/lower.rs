@@ -13,6 +13,15 @@ fn allow_matvec_weight(d: DType) -> bool {
     d.is_float() || packed_k_quant(d)
 }
 
+fn sdpa_groups(n_q: usize, n_kv: usize) -> usize {
+    assert!(n_kv >= 1, "sdpa n_kv must be >= 1");
+    assert!(
+        n_q % n_kv == 0,
+        "sdpa n_q ({n_q}) must be divisible by n_kv ({n_kv})"
+    );
+    n_q / n_kv
+}
+
 pub fn lower_to_kir(
     sk: &ScheduledKernel,
     out_shape: ksearch_ir::Shape,
@@ -478,26 +487,29 @@ pub fn lower_to_kir(
         }
         KernelKind::SdpaNaiveBatch {
             n_q,
+            n_kv,
             n_tok,
             hd,
             max_t,
             kv_dtype,
             ..
         } => {
-            let tg = (*n_q as u64).saturating_mul(32).max(32);
+            let groups = sdpa_groups(*n_q, *n_kv);
+            let tg = (groups as u64).saturating_mul(32).max(32);
             (
                 KirLaunch::RowsParallel {
-                    rows: (*n_tok).max(1),
+                    rows: (*n_tok).saturating_mul(*n_kv).max(1),
                     tg,
                 },
                 lower_sdpa_online(
-                    *n_q, *hd, *max_t, out_dtype, *kv_dtype, tg, *n_tok, &mut next,
+                    *n_q, *n_kv, *hd, *max_t, out_dtype, *kv_dtype, tg, *n_tok, &mut next,
                 ),
                 1,
             )
         }
         KernelKind::SdpaMwgPartBatch {
             n_q,
+            n_kv,
             n_tok,
             hd,
             max_t,
@@ -506,14 +518,15 @@ pub fn lower_to_kir(
             ..
         } => {
             let _ = max_t;
-            let tg = (*n_q as u64).saturating_mul(32).max(32);
+            let groups = sdpa_groups(*n_q, *n_kv);
+            let tg = (groups as u64).saturating_mul(32).max(32);
             (
                 KirLaunch::RowsParallel {
-                    rows: (*nwg).saturating_mul((*n_tok).max(1)),
+                    rows: (*nwg).saturating_mul((*n_tok).max(1)).saturating_mul(*n_kv),
                     tg,
                 },
                 lower_sdpa_mwg_part(
-                    *n_q, *hd, *nwg, DType::F16, *kv_dtype, tg, *n_tok, &mut next,
+                    *n_q, *n_kv, *hd, *nwg, DType::F16, *kv_dtype, tg, *n_tok, &mut next,
                 ),
                 1,
             )
@@ -552,21 +565,27 @@ pub fn lower_to_kir(
         ),
         KernelKind::SdpaNaive {
             n_q,
+            n_kv,
             hd,
             max_t,
             kv_dtype,
             ..
         } => {
-            // One TG streams shared K/V once for all Q heads (MQA/GQA bandwidth).
-            let tg = (*n_q as u64).saturating_mul(32).max(32);
+            // One TG per KV head streams shared K/V for that GQA group (MQA: n_kv=1).
+            let groups = sdpa_groups(*n_q, *n_kv);
+            let tg = (groups as u64).saturating_mul(32).max(32);
             (
-                KirLaunch::RowsParallel { rows: 1, tg },
-                lower_sdpa_online(*n_q, *hd, *max_t, out_dtype, *kv_dtype, tg, 1, &mut next),
+                KirLaunch::RowsParallel {
+                    rows: (*n_kv).max(1),
+                    tg,
+                },
+                lower_sdpa_online(*n_q, *n_kv, *hd, *max_t, out_dtype, *kv_dtype, tg, 1, &mut next),
                 1,
             )
-        },
+        }
         KernelKind::SdpaMwgPart {
             n_q,
+            n_kv,
             hd,
             max_t,
             nwg,
@@ -574,17 +593,18 @@ pub fn lower_to_kir(
             ..
         } => {
             let _ = max_t;
-            // One TG per KV partition; all Q heads share K/V tile (MQA bandwidth).
-            let tg = (*n_q as u64).saturating_mul(32).max(32);
+            // One TG per (KV head, partition); Q heads in the group share the K/V tile.
+            let groups = sdpa_groups(*n_q, *n_kv);
+            let tg = (groups as u64).saturating_mul(32).max(32);
             (
                 KirLaunch::RowsParallel {
-                    rows: (*nwg).max(1),
+                    rows: (*n_kv).saturating_mul((*nwg).max(1)),
                     tg,
                 },
-                lower_sdpa_mwg_part(*n_q, *hd, *nwg, DType::F16, *kv_dtype, tg, 1, &mut next),
+                lower_sdpa_mwg_part(*n_q, *n_kv, *hd, *nwg, DType::F16, *kv_dtype, tg, 1, &mut next),
                 1,
             )
-        },
+        }
         KernelKind::SdpaMwgReduce { n_q, hd, nwg, .. } => (
             KirLaunch::RowsParallel {
                 rows: (*n_q).max(1),
@@ -4876,6 +4896,7 @@ fn lower_quantize_q40(n_in: u32, next: &mut u32) -> Vec<KirStmt> {
 
 fn lower_sdpa_online(
     n_q: usize,
+    n_kv: usize,
     hd: usize,
     max_t: usize,
     q_dt: DType,
@@ -4885,9 +4906,11 @@ fn lower_sdpa_online(
     next: &mut u32,
 ) -> Vec<KirStmt> {
     let _ = max_t;
-    // Shared K/V across Q heads. Contiguous lane slices.
+    // One TG per KV head; Q heads in the GQA group share the K/V tile (MQA: n_kv=1).
     // Max TILE that fits K+V float TG (2 * tile * hd * 4 ≤ 32KB): hd=256→8, hd=512→8.
     assert!(hd % 32 == 0, "sdpa hd must be multiple of 32");
+    let n_groups = sdpa_groups(n_q, n_kv);
+    let n_kv_u = n_kv as u32;
     let tile = (32768 / (2 * hd * 4)).min(8).max(1);
     assert!(2 * tile * hd * 4 <= 32768, "SDPA K+V tile exceeds TG budget");
     let n_own = hd / 32;
@@ -4896,6 +4919,9 @@ fn lower_sdpa_online(
     let q_th = 0u32;
     let o_th = 1u32;
 
+    let tok = fresh(next);
+    let kv_head = fresh(next);
+    let local_head = fresh(next);
     let head = fresh(next);
     let lane = fresh(next);
     let base = fresh(next);
@@ -4914,7 +4940,6 @@ fn lower_sdpa_online(
     let io = fresh(next);
     let iw = fresh(next);
     let q_base = fresh(next);
-    let kv_base = fresh(next);
     let inv_l = fresh(next);
     let mut d_load = Vec::with_capacity(tile);
     let mut d_score = Vec::with_capacity(tile);
@@ -4923,13 +4948,23 @@ fn lower_sdpa_online(
         d_score.push(fresh(next));
     }
 
+    let tok_e = if n_tok > 1 {
+        bin(BinOp::Div, gid(), cu(n_kv_u))
+    } else {
+        cu(0)
+    };
+    let kv_head_e = if n_tok > 1 {
+        bin(BinOp::Sub, gid(), bin(BinOp::Mul, tok_e.clone(), cu(n_kv_u)))
+    } else {
+        gid()
+    };
     let tlen_expr = if n_tok > 1 {
         // Decode meta: tlen is the loop bound (window or abs), start is the KV index.
         // Batch: meta[0]=abs tlen of query 0, meta[2]=window (max_seq for full).
         let abs = bin(
             BinOp::Add,
             KirExpr::CastF32ToU32(Box::new(v(tlen_f))),
-            gid(),
+            uv(tok),
         );
         let win = KirExpr::CastF32ToU32(Box::new(ld(3, cu(2), DType::F32)));
         bin(BinOp::Min, abs, win)
@@ -4940,7 +4975,7 @@ fn lower_sdpa_online(
         let abs = bin(
             BinOp::Add,
             KirExpr::CastF32ToU32(Box::new(v(tlen_f))),
-            gid(),
+            uv(tok),
         );
         bin(BinOp::Sub, abs, uv(tlen))
     } else {
@@ -4949,7 +4984,7 @@ fn lower_sdpa_online(
     let q_base_expr = if n_tok > 1 {
         bin(
             BinOp::Add,
-            bin(BinOp::Mul, gid(), cu((n_q * hd) as u32)),
+            bin(BinOp::Mul, uv(tok), cu((n_q * hd) as u32)),
             bin(BinOp::Mul, uv(head), cu(hd as u32)),
         )
     } else {
@@ -4968,12 +5003,28 @@ fn lower_sdpa_online(
         KirStmt::ThreadDeclF32 { id: q_th, n: n_own },
         KirStmt::ThreadDeclF32 { id: o_th, n: n_own },
         KirStmt::LetU32 {
-            id: head,
+            id: tok,
+            expr: tok_e,
+        },
+        KirStmt::LetU32 {
+            id: kv_head,
+            expr: kv_head_e,
+        },
+        KirStmt::LetU32 {
+            id: local_head,
             expr: bin(BinOp::Div, lid(), cu(32)),
         },
         KirStmt::LetU32 {
             id: lane,
-            expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(head), cu(32))),
+            expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(local_head), cu(32))),
+        },
+        KirStmt::LetU32 {
+            id: head,
+            expr: bin(
+                BinOp::Add,
+                bin(BinOp::Mul, uv(kv_head), cu(n_groups as u32)),
+                uv(local_head),
+            ),
         },
         KirStmt::LetU32 {
             id: base,
@@ -5036,8 +5087,16 @@ fn lower_sdpa_online(
             BinOp::Mul,
             bin(
                 BinOp::Add,
-                uv(start),
-                bin(BinOp::Add, uv(t_base), cu(r as u32)),
+                bin(
+                    BinOp::Mul,
+                    bin(
+                        BinOp::Add,
+                        uv(start),
+                        bin(BinOp::Add, uv(t_base), cu(r as u32)),
+                    ),
+                    cu(n_kv_u),
+                ),
+                uv(kv_head),
             ),
             cu(hd as u32),
         );
@@ -5090,18 +5149,6 @@ fn lower_sdpa_online(
     for r in 0..tile {
         let row_off = (r * hd) as u32;
         let mut body = Vec::new();
-        body.push(KirStmt::LetU32 {
-            id: kv_base,
-            expr: bin(
-                BinOp::Mul,
-                bin(
-                    BinOp::Add,
-                    uv(start),
-                    bin(BinOp::Add, uv(t_base), cu(r as u32)),
-                ),
-                cu(hd as u32),
-            ),
-        });
         body.push(KirStmt::Let {
             id: s,
             expr: c(0.0),
@@ -5312,13 +5359,14 @@ fn lower_sdpa_online(
 }
 
 fn lower_sdpa(n_q: usize, hd: usize, max_t: usize, dt: DType, next: &mut u32) -> Vec<KirStmt> {
-    lower_sdpa_online(n_q, hd, max_t, dt, dt, (n_q as u64) * 32, 1, next)
+    lower_sdpa_online(n_q, 1, hd, max_t, dt, dt, (n_q as u64) * 32, 1, next)
 }
 
-/// MWG pass1: one TG per KV partition; all Q heads share K/V TG tile (MQA-friendly).
+/// MWG pass1: one TG per (KV head, partition); Q heads in the GQA group share the K/V tile.
 /// Writes F32 partials at `(head * nwg + part) * (hd + 2)` → (m, l, O[hd]).
 fn lower_sdpa_mwg_part(
     n_q: usize,
+    n_kv: usize,
     hd: usize,
     nwg: usize,
     q_dt: DType,
@@ -5329,6 +5377,8 @@ fn lower_sdpa_mwg_part(
 ) -> Vec<KirStmt> {
     assert!(hd % 32 == 0, "sdpa mwg hd must be multiple of 32");
     assert!(nwg > 0);
+    let n_groups = sdpa_groups(n_q, n_kv);
+    let n_kv_u = n_kv as u32;
     // Use full TG float budget (hd=256→tile16, hd=512→tile8).
     let tile = (32768 / (2 * hd * 4)).max(1);
     assert!(2 * tile * hd * 4 <= 32768, "SDPA K+V tile exceeds TG budget");
@@ -5338,11 +5388,15 @@ fn lower_sdpa_mwg_part(
     let q_th = 0u32;
     let o_th = 1u32;
     let nwg_u = nwg as u32;
+    let kv_part = n_kv_u * nwg_u;
     let stride = (hd + 2) as u32;
 
+    let kv_head = fresh(next);
+    let local_head = fresh(next);
     let head = fresh(next);
     let lane = fresh(next);
     let part = fresh(next);
+    let rest = fresh(next);
     let base = fresh(next);
     let tlen_f = fresh(next);
     let start_f = fresh(next);
@@ -5370,16 +5424,19 @@ fn lower_sdpa_mwg_part(
         d_score.push(fresh(next));
     }
 
+    // gid = tok * (n_kv * nwg) + kv_head * nwg + part  (tok=0 when n_tok==1)
     let tok_e = if n_tok > 1 {
-        bin(BinOp::Div, gid(), cu(nwg_u))
+        bin(BinOp::Div, gid(), cu(kv_part))
     } else {
         cu(0)
     };
-    let part_expr = if n_tok > 1 {
-        bin(BinOp::Sub, gid(), bin(BinOp::Mul, tok_e.clone(), cu(nwg_u)))
+    let rest_e = if n_tok > 1 {
+        bin(BinOp::Sub, gid(), bin(BinOp::Mul, tok_e.clone(), cu(kv_part)))
     } else {
         gid()
     };
+    let kv_head_e = bin(BinOp::Div, uv(rest), cu(nwg_u));
+    let part_expr = bin(BinOp::Sub, uv(rest), bin(BinOp::Mul, uv(kv_head), cu(nwg_u)));
     let tlen_expr = if n_tok > 1 {
         let abs = bin(
             BinOp::Add,
@@ -5447,16 +5504,32 @@ fn lower_sdpa_mwg_part(
         KirStmt::ThreadDeclF32 { id: q_th, n: n_own },
         KirStmt::ThreadDeclF32 { id: o_th, n: n_own },
         KirStmt::LetU32 {
+            id: rest,
+            expr: rest_e,
+        },
+        KirStmt::LetU32 {
+            id: kv_head,
+            expr: kv_head_e,
+        },
+        KirStmt::LetU32 {
             id: part,
             expr: part_expr,
         },
         KirStmt::LetU32 {
-            id: head,
+            id: local_head,
             expr: bin(BinOp::Div, lid(), cu(32)),
         },
         KirStmt::LetU32 {
             id: lane,
-            expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(head), cu(32))),
+            expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(local_head), cu(32))),
+        },
+        KirStmt::LetU32 {
+            id: head,
+            expr: bin(
+                BinOp::Add,
+                bin(BinOp::Mul, uv(kv_head), cu(n_groups as u32)),
+                uv(local_head),
+            ),
         },
         KirStmt::LetU32 {
             id: base,
@@ -5543,8 +5616,16 @@ fn lower_sdpa_mwg_part(
             BinOp::Mul,
             bin(
                 BinOp::Add,
-                uv(start),
-                bin(BinOp::Add, uv(t_base), cu(r as u32)),
+                bin(
+                    BinOp::Mul,
+                    bin(
+                        BinOp::Add,
+                        uv(start),
+                        bin(BinOp::Add, uv(t_base), cu(r as u32)),
+                    ),
+                    cu(n_kv_u),
+                ),
+                uv(kv_head),
             ),
             cu(hd as u32),
         );
