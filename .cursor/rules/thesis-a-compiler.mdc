@@ -27,10 +27,10 @@ Study source: `reference/tinygrad` UOp `Ops`. No `Ops.MATMUL` / `RMSNORM` / `FLA
 
 ## Quant
 
-- **Allowed:** `Load(dtype=Q4K)` expand in the generic renderer (dequant-at-load to float, like F16→float). Q4_K weight buffers may stay packed; activations stay F16.
+- **Allowed:** `Load(dtype=Q4K|Q6K)` expand in the generic renderer (dequant-at-load to float, like F16→float). Q4_K/Q6_K weight buffers may stay packed; activations stay F16.
 - **Forbidden:** hand `q4k_load` helpers pasted as named matvec kernels / Graph catalog `MatVecQ4K*` / oracle shader paste.
 - **Forbidden:** hand named `matvec_q4k.metal` / catalog `Op::MatVecQ4K*` / fused Q4 matvec MSL templates.
-- Eager F16 dequant is **not** required for Q4_K weights (optional for non-Q4 types).
+- Eager F16 dequant is **not** required for Q4_K/Q6_K weights (optional for non-Q4/Q6 types).
 
 ## Oracle
 

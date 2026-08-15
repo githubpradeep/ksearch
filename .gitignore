@@ -4,6 +4,7 @@
 .DS_Store
 *.metallib
 .plan_cache/
+docs/animations/media/
 
 # Local third-party checkouts (own git histories); keep on disk for design/oracle.
 /reference/

@@ -47,7 +47,7 @@ pub fn validate_q4_matvec_pattern(graph: &Graph, out: TensorId) -> Result<bool, 
     };
     let (_, wd) = graph.shape_dtype(*left)?;
     let (_, xd) = graph.shape_dtype(*row)?;
-    Ok(wd == DType::Q4K && matches!(xd, DType::F16 | DType::F32))
+    Ok(matches!(wd, DType::Q4K | DType::Q6K) && matches!(xd, DType::F16 | DType::F32))
 }
 
 /// Classify weight dtype for a scheduled matvec root (`SumReduce` of `MulBroadcastRow`
@@ -55,6 +55,20 @@ pub fn validate_q4_matvec_pattern(graph: &Graph, out: TensorId) -> Result<bool, 
 pub fn matvec_weight_dtype(graph: &Graph, out: TensorId) -> Result<Option<DType>, CodegenError> {
     if let Some(ksearch_ir::FuseHint::MatvecGateUpGelu { gate, .. }) = graph.fuse_hint(out) {
         return Ok(Some(graph.shape_dtype(*gate)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecGeluMul { w, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*w)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecGeluMulProjRmsAddScale { w_gate, .. }) =
+        graph.fuse_hint(out)
+    {
+        return Ok(Some(graph.shape_dtype(*w_gate)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecRmsNormAdd { w_mat, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*w_mat)?.1));
+    }
+    if let Some(ksearch_ir::FuseHint::MatvecRmsNormAddScale { w_mat, .. }) = graph.fuse_hint(out) {
+        return Ok(Some(graph.shape_dtype(*w_mat)?.1));
     }
     if let Some(ksearch_ir::FuseHint::MatvecQkv { wq, .. }) = graph.fuse_hint(out) {
         return Ok(Some(graph.shape_dtype(*wq)?.1));

@@ -9,3 +9,6 @@ metal.workspace = true
 ksearch_ir.workspace = true
 ksearch_codegen.workspace = true
 ksearch_metal.workspace = true
+
+[dev-dependencies]
+ksearch_gguf.workspace = true

@@ -1,10 +1,11 @@
 //! Thesis A Gemma path: Graph→AST→MSL. Q4_K weights stay packed (`Load(Q4K)` expand);
 //! other quant types dequant → F16. Activations stay F16.
 
-use crate::{GemmaConfig, GenerateStats, LayerMeta, LayerNorms, KvPool};
+use crate::sample::sample_softcap_min_p;
+use crate::{GemmaConfig, GenerateStats, KvPool, LayerMeta, LayerNorms, SlotId};
 use anyhow::{anyhow, bail, Result};
-use ksearch_gguf::{f32_to_f16, ggml_type, Gguf};
-use ksearch_ir::DType;
+use ksearch_gguf::{f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
+use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
 use ksearch_kernels::Eng;
 use ksearch_metal::MetalContext;
 use metal::Buffer;
@@ -12,24 +13,62 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-const PREFILL_CHUNK: usize = 32;
+const PREFILL_CHUNK: usize = 256;
+
+/// Tokens per prefill chunk (also the server scheduler's default slice).
+pub const PREFILL_CHUNK_SIZE: usize = PREFILL_CHUNK;
 
 enum WeightBuf {
     F16(Buffer),
     Q4K(Buffer),
+    Q5K(Buffer),
+    Q6K(Buffer),
 }
+
+fn is_packed(d: DType) -> bool {
+    matches!(d, DType::Q4K | DType::Q6K)
+}
+
+/// Host-side RoPE table: for each pos, `hd` F16s = cos[0..half) || sin[0..half).
+fn precompute_rope_table(max_seq: usize, hd: usize, theta: f32, rope_angles: usize) -> Vec<u8> {
+    let half = hd / 2;
+    let rope_angles = rope_angles.min(half);
+    let mut out = vec![0f32; max_seq * hd];
+    for pos in 0..max_seq {
+        let base = pos * hd;
+        for i in 0..half {
+            if i < rope_angles {
+                let freq = 1.0 / (theta as f64).powf((2 * i) as f64 / hd as f64) as f32;
+                let ang = pos as f32 * freq;
+                out[base + i] = ang.cos();
+                out[base + half + i] = ang.sin();
+            } else {
+                out[base + i] = 1.0;
+                out[base + half + i] = 0.0;
+            }
+        }
+    }
+    let mut bytes = Vec::with_capacity(out.len() * 4);
+    for v in out {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
 
 impl WeightBuf {
     fn dtype(&self) -> DType {
         match self {
             WeightBuf::F16(_) => DType::F16,
             WeightBuf::Q4K(_) => DType::Q4K,
+            WeightBuf::Q5K(_) => DType::Q5K,
+            WeightBuf::Q6K(_) => DType::Q6K,
         }
     }
 
     fn buf(&self) -> &Buffer {
         match self {
-            WeightBuf::F16(b) | WeightBuf::Q4K(b) => b,
+            WeightBuf::F16(b) | WeightBuf::Q4K(b) | WeightBuf::Q5K(b) | WeightBuf::Q6K(b) => b,
         }
     }
 }
@@ -51,27 +90,45 @@ pub struct GemmaPrimModel {
     tmp_k: Buffer,
     tmp_v: Buffer,
     tmp_o: Buffer,
+    /// F32 MWG SDPA scratch: `n_heads * NWG * (max_hd + 2)`.
+    tmp_attn_mwg: Buffer,
     /// FFN intermediates (gate/up) when packings differ and fusion cannot share one weight dtype.
     tmp_ff1: Buffer,
     tmp_ff2: Buffer,
     tmp_ff3: Buffer,
     logits: Buffer,
-    argmax_out: Buffer,
+    /// Ping-pong F32 token ids: decode step i reads `[i&1]`, writes `[(i+1)&1]`.
+    tok_idx: [Buffer; 2],
+    /// Prefill chunk token ids (F32, length `PREFILL_CHUNK`).
+    chunk_tok: Buffer,
     ple_tok: Buffer,
+    /// Packed `per_layer_token_embd` for GPU row gather (Q5_K Load expand).
+    ple_embd: Option<WeightBuf>,
+    /// Double-buffer host→GPU PLE token rows (prefill / fallback).
+    ple_stage: [Buffer; 2],
     ple_ctx: Buffer,
     ple_tmp: Buffer,
     ple_gate: Buffer,
     ple_u: Buffer,
     ple_proj: Buffer,
     meta: Vec<Buffer>,
-    cos_sin: Vec<Buffer>,
-    /// F16 KV caches [max_seq × hd] per owning layer.
+    rope_swa: Buffer,
+    rope_full: Buffer,
+    hd_swa: usize,
+    hd_full: usize,
+    /// Device Q4_0 KV [max_seq × hd] per owning layer (Load(Q40) expand in SDPA).
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
     eng: Eng,
     weight_bufs: HashMap<String, WeightBuf>,
     max_seq: usize,
     pub pos: usize,
+    decode_src: usize,
+    return_token_sync: bool,
+    /// Serve-path sampling; 0 = greedy GPU argmax. Cleared after each sampled step.
+    sample_temperature: f32,
+    sample_min_p: f32,
+    sample_seed: u32,
 }
 
 impl GemmaPrimModel {
@@ -82,8 +139,8 @@ impl GemmaPrimModel {
         let cfg = GemmaConfig::from_gguf(&g)?;
         let vocab = ksearch_gguf::Vocab::from_gguf(&g);
         eprintln!(
-            "[prim] layers={} hidden={} heads={} vocab={} (Q4_K weights packed; acts F16)",
-            cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.vocab
+            "[prim] layers={} hidden={} heads={}/{} vocab={} (Q4_K weights packed; acts F16)",
+            cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.n_kv, cfg.vocab
         );
 
         let ctx = MetalContext::new()?;
@@ -144,37 +201,55 @@ impl GemmaPrimModel {
         let mut kv_v = Vec::new();
         for i in 0..n_kv_owners {
             let hd = cfg.head_dim(i);
-            kv_k.push(ctx.buffer_empty_f16(max_seq * hd));
-            kv_v.push(ctx.buffer_empty_f16(max_seq * hd));
+            // Q4_0 packed KV (Thesis A Load(Q40) expand in SDPA).
+            kv_k.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq * cfg.n_kv, hd)));
+            kv_v.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq * cfg.n_kv, hd)));
         }
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
-        let mut cos_sin = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
             meta.push(
                 ctx.device
                     .new_buffer(32, metal::MTLResourceOptions::StorageModeShared),
             );
-            cos_sin.push(ctx.buffer_empty_f16(max_hd));
         }
+        let rope_swa = {
+            let hd = cfg.head_dim_swa;
+            let bytes = precompute_rope_table(max_seq, hd, cfg.rope_theta_swa, hd / 2);
+            ctx.buffer_bytes(&bytes)
+        };
+        let rope_full = {
+            let hd = cfg.head_dim_full;
+            let angles = ((hd as f32) * cfg.partial_rotary) as usize / 2;
+            let bytes = precompute_rope_table(max_seq, hd, cfg.rope_theta_full, angles);
+            ctx.buffer_bytes(&bytes)
+        };
 
-        let x = ctx.buffer_empty_f16(cfg.hidden);
-        let x2 = ctx.buffer_empty_f16(cfg.hidden);
-        let tmp_q = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
-        let tmp_k = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
-        let tmp_v = ctx.buffer_empty_f16(cfg.n_kv * max_hd);
-        let tmp_o = ctx.buffer_empty_f16(cfg.n_heads * max_hd);
-        let tmp_ff1 = ctx.buffer_empty_f16(max_ff);
-        let tmp_ff2 = ctx.buffer_empty_f16(max_ff);
-        let tmp_ff3 = ctx.buffer_empty_f16(max_ff.max(ple_total));
+        let t = PREFILL_CHUNK;
+        let x = ctx.buffer_empty_f16(t * cfg.hidden);
+        let x2 = ctx.buffer_empty_f16(t * cfg.hidden);
+        let tmp_q = ctx.buffer_empty_f16(t * cfg.n_heads * max_hd);
+        let tmp_k = ctx.buffer_empty_f16(t * cfg.n_kv * max_hd);
+        let tmp_v = ctx.buffer_empty_f16(t * cfg.n_kv * max_hd);
+        let tmp_o = ctx.buffer_empty_f16(t * cfg.n_heads * max_hd);
+        let tmp_attn_mwg =
+            ctx.buffer_empty_f32(t * cfg.n_heads * Eng::SDPA_MWG_NWG * (max_hd + 2));
+        let tmp_ff1 = ctx.buffer_empty_f16(t * max_ff);
+        let tmp_ff2 = ctx.buffer_empty_f16(t * max_ff);
+        let tmp_ff3 = ctx.buffer_empty_f16(t * max_ff.max(ple_total));
         let logits = ctx.buffer_empty_f16(cfg.vocab);
-        let argmax_out = ctx.buffer_empty_f32(1);
-        let ple_tok = ctx.buffer_empty_f16(ple_total);
-        let ple_ctx = ctx.buffer_empty_f16(ple_total);
-        let ple_tmp = ctx.buffer_empty_f16(ple_total);
+        let tok_idx = [ctx.buffer_empty_f32(1), ctx.buffer_empty_f32(1)];
+        let chunk_tok = ctx.buffer_empty_f32(t);
+        let ple_tok = ctx.buffer_empty_f16(t * ple_total);
+        let ple_stage = [
+            ctx.buffer_empty_f16(ple_total),
+            ctx.buffer_empty_f16(ple_total),
+        ];
+        let ple_ctx = ctx.buffer_empty_f16(t * ple_total);
+        let ple_tmp = ctx.buffer_empty_f16(t * ple_total);
         let ple_gate = ctx.buffer_empty_f16(cfg.ple_dim);
-        let ple_u = ctx.buffer_empty_f16(cfg.ple_dim);
-        let ple_proj = ctx.buffer_empty_f16(cfg.hidden);
+        let ple_u = ctx.buffer_empty_f16(t * cfg.ple_dim);
+        let ple_proj = ctx.buffer_empty_f16(t * cfg.hidden);
 
         let mut eng = Eng::new();
         {
@@ -215,7 +290,7 @@ impl GemmaPrimModel {
         }
 
         eprintln!("[prim] load complete");
-        Ok(Self {
+        let mut model = Self {
             cfg: cfg.clone(),
             vocab,
             gguf: g,
@@ -231,37 +306,145 @@ impl GemmaPrimModel {
             tmp_k,
             tmp_v,
             tmp_o,
+            tmp_attn_mwg,
             tmp_ff1,
             tmp_ff2,
             tmp_ff3,
             logits,
-            argmax_out,
+            tok_idx,
+            chunk_tok,
             ple_tok,
+            ple_embd: None,
+            ple_stage,
             ple_ctx,
             ple_tmp,
             ple_gate,
             ple_u,
             ple_proj,
             meta,
-            cos_sin,
+            rope_swa,
+            rope_full,
+            hd_swa: cfg.head_dim_swa,
+            hd_full: cfg.head_dim_full,
             kv_k,
             kv_v,
             eng,
             weight_bufs: HashMap::new(),
             max_seq,
             pos: 0,
-        })
+            decode_src: 0,
+            return_token_sync: true,
+            sample_temperature: 0.0,
+            sample_min_p: 0.05,
+            sample_seed: 1,
+        };
+        if model.gguf.has_tensor("per_layer_model_proj.weight") {
+            let scale = 1.0 / (model.cfg.hidden as f32).sqrt();
+            let mut f = model.gguf.dequant_to_f32("per_layer_model_proj.weight");
+            assert!(f.len() % 256 == 0);
+            for v in &mut f { *v *= scale; }
+            let q4 = quantize_f32_to_q4k(&f);
+            eprintln!("[prim] per_layer_model_proj → Q4_K ({:.1} MB)", q4.len() as f64 / 1e6);
+            model.weight_bufs.insert(
+                "per_layer_model_proj.weight".into(),
+                WeightBuf::Q4K(model.ctx.buffer_bytes(&q4)),
+            );
+        }
+        for layer in 0..model.cfg.n_layers {
+            let pref = format!("blk.{layer}.");
+            for name in [
+                "attn_q.weight","attn_k.weight","attn_v.weight","attn_output.weight",
+                "ffn_gate.weight","ffn_up.weight","ffn_down.weight",
+                "inp_gate.weight","proj.weight",
+            ] {
+                let full = format!("{pref}{name}");
+                if model.gguf.has_tensor(&full) {
+                    model.ensure_weight(&full)?;
+                }
+            }
+        }
+        if model.gguf.has_tensor("per_layer_token_embd.weight") {
+            let ty = model.gguf.tensor_type("per_layer_token_embd.weight");
+            if ty == ggml_type::Q5_K {
+                let raw = model.gguf.tensor_raw("per_layer_token_embd.weight");
+                eprintln!(
+                    "[prim] per_layer_token_embd Q5_K ({:.1} MB) — Load(Q5K) row gather",
+                    raw.len() as f64 / 1e6
+                );
+                model.ple_embd = Some(WeightBuf::Q5K(model.ctx.buffer_bytes(raw)));
+            }
+        }
+        if let Some(ple) = model.ple_embd.as_ref() {
+            let h = model.cfg.hidden;
+            let idx = model.tok_idx[0].clone();
+            let x = model.x.clone();
+            let ple_tok = model.ple_tok.clone();
+            let ple_dt = ple.dtype();
+            let ple_buf = ple.buf().clone();
+            let scale_e = (h as f32).sqrt();
+            let scale_p = (model.cfg.ple_dim as f32).sqrt();
+            match &model.token_embd {
+                WeightBuf::F16(embd) => {
+                    let e = embd.clone();
+                    model.eng.copy_scale_indexed_wd(
+                        &model.ctx, h, scale_e, DType::F16, &e, &idx, &x,
+                    )?;
+                }
+                WeightBuf::Q4K(embd) => {
+                    let e = embd.clone();
+                    model.eng.copy_scale_indexed_wd(
+                        &model.ctx, h, scale_e, DType::Q4K, &e, &idx, &x,
+                    )?;
+                }
+                _ => {}
+            }
+            model.eng.copy_scale_indexed_wd(
+                &model.ctx,
+                model.cfg.ple_total(),
+                scale_p,
+                ple_dt,
+                &ple_buf,
+                &idx,
+                &ple_tok,
+            )?;
+            model.ctx.synchronize()?;
+        }
+        Ok(model)
     }
 
     fn ensure_weight(&mut self, name: &str) -> Result<()> {
         if self.weight_bufs.contains_key(name) {
             return Ok(());
         }
-        let buf = if self.gguf.tensor_type(name) == ggml_type::Q4_K {
+        let ty = self.gguf.tensor_type(name);
+        let buf = if ty == ggml_type::Q4_K {
             WeightBuf::Q4K(self.ctx.buffer_bytes(self.gguf.tensor_raw(name)))
+        } else if ty == ggml_type::Q6_K
+            && (name.ends_with("ffn_down.weight") || name.ends_with("attn_v.weight"))
+        {
+            // Host-requant Q6→Q4 for faster coop matvec (ffn_down + attn_v).
+            let f = self.gguf.dequant_to_f32(name);
+            assert!(f.len() % 256 == 0, "{name}: elems {} not multiple of 256", f.len());
+            let q4 = quantize_f32_to_q4k(&f);
+            eprintln!(
+                "[prim] {name} Q6_K → Q4_K host-requant ({:.1} MB)",
+                q4.len() as f64 / 1e6
+            );
+            WeightBuf::Q4K(self.ctx.buffer_bytes(&q4))
+        } else if ty == ggml_type::Q6_K {
+            eprintln!("[prim] {name} Q6_K native");
+            WeightBuf::Q6K(self.ctx.buffer_bytes(self.gguf.tensor_raw(name)))
         } else {
-            // Non-Q4: dequant → F16 (tinygrad ggml_data_to_tensor → .half()).
-            WeightBuf::F16(self.ctx.buffer_bytes(&self.gguf.dequant_to_f16_bytes(name)))
+            // PLE F32/BF16 etc.: host-quantize to Q4_K for coop path.
+            let f = self.gguf.dequant_to_f32(name);
+            assert!(f.len() % 256 == 0, "{name}: elems {} not multiple of 256", f.len());
+            let q4 = quantize_f32_to_q4k(&f);
+            eprintln!(
+                "[prim] {name} {} → Q4_K ({:.1} MB)",
+                ksearch_gguf::ggml_type_name(ty),
+                q4.len() as f64 / 1e6
+            );
+            WeightBuf::Q4K(self.ctx.buffer_bytes(&q4))
         };
         self.weight_bufs.insert(name.to_string(), buf);
         Ok(())
@@ -283,6 +466,23 @@ impl GemmaPrimModel {
             .matvec_wd(&self.ctx, rows, cols, wd, &w, &x, &y)
     }
 
+    fn matvec_w_batch(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        name: &str,
+        x: Buffer,
+        y: Buffer,
+        batch: usize,
+    ) -> Result<()> {
+        self.ensure_weight(name)?;
+        let w = self.weight_bufs.get(name).unwrap();
+        let wd = w.dtype();
+        let w = w.buf().clone();
+        self.eng
+            .matvec_batch(&self.ctx, rows, cols, batch, wd, &w, &x, &y)
+    }
+
     fn rmsnorm_matvec_w(
         &mut self,
         rows: usize,
@@ -297,6 +497,10 @@ impl GemmaPrimModel {
         let w = self.weight_bufs.get(w_name).unwrap();
         let wd = w.dtype();
         let w = w.buf().clone();
+        if is_packed(wd) {
+            self.eng.rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+            return self.eng.matvec_wd(&self.ctx, rows, cols, wd, &w, &self.x2, &y);
+        }
         self.eng
             .rmsnorm_matvec_wd(&self.ctx, rows, cols, eps, wd, &x, w_norm, &w, &y)
     }
@@ -325,7 +529,27 @@ impl GemmaPrimModel {
         let wq = self.weight_bufs.get(q_name).unwrap().buf().clone();
         let wk = self.weight_bufs.get(k_name).unwrap().buf().clone();
         let wv = self.weight_bufs.get(v_name).unwrap().buf().clone();
-        if dq == dk && dk == dv {
+        if dq == dk && dk == dv && dq == DType::Q4K {
+            // Tiny rms, then one device-x coop QKV (do not fuse rms: LOCAL x_hat
+            // regresses vs streaming device activations).
+            self.eng
+                .rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+            return self.eng.matvec_qkv_wd(
+                &self.ctx,
+                q_rows,
+                kv_rows,
+                cols,
+                dq,
+                &wq,
+                &wk,
+                &wv,
+                &self.x2,
+                &q,
+                &k,
+                &v,
+            );
+        }
+        if dq == dk && dk == dv && !is_packed(dq) {
             return self.eng.rmsnorm_matvec_qkv_wd(
                 &self.ctx,
                 q_rows,
@@ -372,6 +596,13 @@ impl GemmaPrimModel {
         let du = self.weight_bufs.get(up_name).unwrap().dtype();
         let wg = self.weight_bufs.get(gate_name).unwrap().buf().clone();
         let wu = self.weight_bufs.get(up_name).unwrap().buf().clone();
+        if dg == du && is_packed(dg) {
+            self.eng
+                .rmsnorm(&self.ctx, cols, eps, &x, w_norm, &self.x2)?;
+            return self.eng.matvec_gate_up_gelu_wd(
+                &self.ctx, rows, cols, dg, &wg, &wu, &self.x2, &y,
+            );
+        }
         if dg == du {
             return self.eng.rmsnorm_matvec_gate_up_gelu_wd(
                 &self.ctx,
@@ -399,31 +630,19 @@ impl GemmaPrimModel {
     }
 
     fn write_meta(&self, layer: usize, tlen: u32, start: u32) {
-        let ptr = self.meta[layer].contents() as *mut u16;
+        self.write_meta_win(layer, tlen, start, 0);
+    }
+
+    fn write_meta_win(&self, layer: usize, tlen: u32, start: u32, window: u32) {
+        // f32: integers stay exact through max_seq (F16 ULP is 2+ past 2048).
+        let ptr = self.meta[layer].contents() as *mut f32;
         unsafe {
-            *ptr = f32_to_f16(tlen as f32);
-            *ptr.add(1) = f32_to_f16(start as f32);
+            *ptr = tlen as f32;
+            *ptr.add(1) = start as f32;
+            *ptr.add(2) = window as f32;
         }
     }
 
-    fn fill_cos_sin(&self, layer: usize, pos: usize, hd: usize, theta: f32, rope_angles: usize) {
-        let ptr = self.cos_sin[layer].contents() as *mut u16;
-        let half = hd / 2;
-        let rope_angles = rope_angles.min(half);
-        unsafe {
-            for i in 0..half {
-                if i < rope_angles {
-                    let freq = 1.0 / theta.powf((2 * i) as f32 / hd as f32);
-                    let ang = pos as f32 * freq;
-                    *ptr.add(i) = f32_to_f16(ang.cos());
-                    *ptr.add(half + i) = f32_to_f16(ang.sin());
-                } else {
-                    *ptr.add(i) = f32_to_f16(1.0);
-                    *ptr.add(half + i) = f32_to_f16(0.0);
-                }
-            }
-        }
-    }
 
     fn embed_token(&mut self, token: u32) -> Result<()> {
         let h = self.cfg.hidden;
@@ -440,21 +659,158 @@ impl GemmaPrimModel {
                     0,
                 )?;
             }
-            WeightBuf::Q4K(_) => {
-                // Row lookup: host-dequant one Q4_K row → F16 activation (acts stay F16).
-                let mut row = self
-                    .gguf
-                    .dequant_row("token_embd.weight", token as usize);
-                for v in &mut row {
-                    *v *= scale;
-                }
-                let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
-                if self.ctx.has_gpu_work() {
-                    self.ctx.synchronize()?;
-                }
-                self.ctx.write_u16s_nosync(&self.x, &row_h);
+            WeightBuf::Q4K(embd) => {
+                let row_bytes = (h / 256) * 144;
+                self.eng.copy_scale_wd(
+                    &self.ctx,
+                    h,
+                    scale,
+                    DType::Q4K,
+                    embd,
+                    token as usize * row_bytes,
+                    &self.x,
+                    0,
+                )?;
             }
+            WeightBuf::Q5K(_) | WeightBuf::Q6K(_) => bail!("token_embd Q5/Q6 embed not wired"),
         }
+        Ok(())
+    }
+
+    /// GPU-resident embed: row index from F32 token-id buffer.
+    fn embed_from_idx(&mut self, idx: &Buffer) -> Result<()> {
+        let h = self.cfg.hidden;
+        let scale = (h as f32).sqrt();
+        match &self.token_embd {
+            WeightBuf::F16(embd) => {
+                self.eng.copy_scale_indexed_wd(
+                    &self.ctx,
+                    h,
+                    scale,
+                    DType::F16,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q4K(embd) => {
+                self.eng.copy_scale_indexed_wd(
+                    &self.ctx,
+                    h,
+                    scale,
+                    DType::Q4K,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q5K(_) | WeightBuf::Q6K(_) => bail!("token_embd Q5/Q6 embed not wired"),
+        }
+        Ok(())
+    }
+
+    fn embed_from_idx_batch(&mut self, idx: &Buffer, batch: usize) -> Result<()> {
+        let h = self.cfg.hidden;
+        let scale = (h as f32).sqrt();
+        match &self.token_embd {
+            WeightBuf::F16(embd) => {
+                self.eng.copy_scale_indexed_batch_wd(
+                    &self.ctx,
+                    h,
+                    batch,
+                    scale,
+                    DType::F16,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q4K(embd) => {
+                self.eng.copy_scale_indexed_batch_wd(
+                    &self.ctx,
+                    h,
+                    batch,
+                    scale,
+                    DType::Q4K,
+                    embd,
+                    idx,
+                    &self.x,
+                )?;
+            }
+            WeightBuf::Q5K(_) | WeightBuf::Q6K(_) => bail!("token_embd Q5/Q6 embed not wired"),
+        }
+        Ok(())
+    }
+
+    /// GPU-resident PLE row gather from F32 token-id buffer.
+    fn ple_from_idx(&mut self, idx: &Buffer) -> Result<()> {
+        let Some(ple) = self.ple_embd.as_ref() else {
+            bail!("ple_from_idx: packed PLE table not loaded");
+        };
+        let scale = (self.cfg.ple_dim as f32).sqrt();
+        self.eng.copy_scale_indexed_wd(
+            &self.ctx,
+            self.cfg.ple_total(),
+            scale,
+            ple.dtype(),
+            ple.buf(),
+            idx,
+            &self.ple_tok,
+        )?;
+        Ok(())
+    }
+
+    fn ple_from_idx_batch(&mut self, idx: &Buffer, batch: usize) -> Result<()> {
+        let Some(ple) = self.ple_embd.as_ref() else {
+            bail!("ple_from_idx_batch: packed PLE table not loaded");
+        };
+        let scale = (self.cfg.ple_dim as f32).sqrt();
+        self.eng.copy_scale_indexed_batch_wd(
+            &self.ctx,
+            self.cfg.ple_total(),
+            batch,
+            scale,
+            ple.dtype(),
+            ple.buf(),
+            idx,
+            &self.ple_tok,
+        )?;
+        Ok(())
+    }
+
+    fn ple_prepass_batch(&mut self, batch: usize) -> Result<()> {
+        let h = self.cfg.hidden;
+        let ple_total = self.cfg.ple_total();
+        let n_layers = self.cfg.n_layers;
+        let ple_dim = self.cfg.ple_dim;
+        let eps = self.cfg.rms_eps;
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+
+        self.matvec_w_batch(
+            ple_total,
+            h,
+            "per_layer_model_proj.weight",
+            self.x.clone(),
+            self.ple_tmp.clone(),
+            batch,
+        )?;
+        self.eng.rmsnorm_per_head(
+            &self.ctx,
+            batch * n_layers,
+            ple_dim,
+            eps,
+            &self.ple_tmp,
+            &self.ple_proj_norm,
+            &self.ple_ctx,
+        )?;
+        self.eng.add_scale(
+            &self.ctx,
+            batch * ple_total,
+            inv_sqrt2,
+            &self.ple_ctx,
+            &self.ple_tok,
+            &self.ple_ctx,
+        )?;
         Ok(())
     }
 
@@ -467,12 +823,22 @@ impl GemmaPrimModel {
             *v *= scale;
         }
         let row_h: Vec<u16> = row.iter().map(|&v| f32_to_f16(v)).collect();
-        // Avoid a full GPU sync on every token: decode already synced on prior argmax read;
-        // during prefill, flush+wait only if work is in flight.
         if self.ctx.has_gpu_work() {
-            self.ctx.synchronize()?;
+            self.ctx.wait_inflight_at_most(1);
+            let stage = &self.ple_stage[self.pos & 1];
+            self.ctx.write_u16s_nosync(stage, &row_h);
+            self.eng.copy_scale(
+                &self.ctx,
+                self.cfg.ple_total(),
+                1.0,
+                stage,
+                0,
+                &self.ple_tok,
+                0,
+            )?;
+        } else {
+            self.ctx.write_u16s_nosync(&self.ple_tok, &row_h);
         }
-        self.ctx.write_u16s_nosync(&self.ple_tok, &row_h);
         Ok(())
     }
 
@@ -482,7 +848,6 @@ impl GemmaPrimModel {
         let n_layers = self.cfg.n_layers;
         let ple_dim = self.cfg.ple_dim;
         let eps = self.cfg.rms_eps;
-        let inv_sqrt_h = 1.0 / (h as f32).sqrt();
         let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
 
         self.matvec_w(
@@ -492,54 +857,26 @@ impl GemmaPrimModel {
             self.x.clone(),
             self.ple_tmp.clone(),
         )?;
-        self.eng.scale_const(
-            &self.ctx,
-            ple_total,
-            inv_sqrt_h,
-            &self.ple_tmp,
-            &self.ple_ctx,
-        )?;
         self.eng.rmsnorm_per_head(
             &self.ctx,
             n_layers,
             ple_dim,
             eps,
-            &self.ple_ctx,
-            &self.ple_proj_norm,
             &self.ple_tmp,
+            &self.ple_proj_norm,
+            &self.ple_ctx,
         )?;
-        self.eng
-            .add(&self.ctx, ple_total, &self.ple_tmp, &self.ple_tok, &self.ple_ctx)?;
-        self.eng.scale_const(
+        self.eng.add_scale(
             &self.ctx,
             ple_total,
             inv_sqrt2,
             &self.ple_ctx,
+            &self.ple_tok,
             &self.ple_ctx,
         )?;
         Ok(())
     }
 
-    fn kv_append_f16(&mut self, kv_src: usize, hd: usize) -> Result<()> {
-        let pos = self.pos;
-        self.eng.copy_slice(
-            &self.ctx,
-            hd,
-            &self.tmp_k,
-            0,
-            &self.kv_k[kv_src],
-            pos * hd,
-        )?;
-        self.eng.copy_slice(
-            &self.ctx,
-            hd,
-            &self.tmp_v,
-            0,
-            &self.kv_v[kv_src],
-            pos * hd,
-        )?;
-        Ok(())
-    }
 
     fn forward_token(&mut self, token: u32, want_logits: bool) -> Result<Option<u32>> {
         if self.pos >= self.max_seq {
@@ -547,9 +884,27 @@ impl GemmaPrimModel {
         }
         let profile = std::env::var_os("KSEARCH_PROFILE").is_some();
         let t0 = Instant::now();
-        self.embed_token(token)?;
+        let gpu_idx = self.ple_embd.is_some();
+        if gpu_idx && !want_logits {
+            // Ping-pong tok_idx so the next gather can overlap the in-flight token.
+            self.ctx.wait_inflight_at_most(1);
+            self.decode_src ^= 1;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[self.decode_src], &[token as f32]);
+        }
+        if gpu_idx {
+            let src = self.tok_idx[self.decode_src].clone();
+            self.embed_from_idx(&src)?;
+        } else {
+            self.embed_token(token)?;
+        }
         let t_embed = t0.elapsed();
-        self.load_ple_token(token)?;
+        if gpu_idx {
+            let src = self.tok_idx[self.decode_src].clone();
+            self.ple_from_idx(&src)?;
+        } else {
+            self.load_ple_token(token)?;
+        }
         let t_ple = t0.elapsed();
         self.ple_prepass()?;
         let t_pre = t0.elapsed();
@@ -577,17 +932,13 @@ impl GemmaPrimModel {
                 (lw.q_rows, lw.kv_rows, lw.o_in, lw.ffn_inter, lw.hd)
             };
             let is_swa = self.cfg.is_swa(layer);
-            let theta = if is_swa {
-                self.cfg.rope_theta_swa
+            let rope_hd = if is_swa { self.hd_swa } else { self.hd_full };
+            let rope_buf = if is_swa {
+                self.rope_swa.clone()
             } else {
-                self.cfg.rope_theta_full
+                self.rope_full.clone()
             };
-            let rotary_dim = if is_swa {
-                hd
-            } else {
-                ((hd as f32) * self.cfg.partial_rotary) as usize
-            };
-            let rope_angles = rotary_dim / 2;
+            let rope_off = self.pos * rope_hd;
             let pref = format!("blk.{layer}.");
             let owns_kv = self.cfg.owns_kv(layer);
             let kv_src = self.cfg.kv_source(layer);
@@ -621,37 +972,39 @@ impl GemmaPrimModel {
                 )?;
             }
 
-            self.fill_cos_sin(layer, self.pos, hd, theta, rope_angles);
-            self.eng.rmsnorm_per_head_rope(
-                &self.ctx,
-                n_heads,
-                hd,
-                eps,
-                &self.tmp_q,
-                &self.layer_norms[layer].q_norm,
-                &self.cos_sin[layer],
-                &self.tmp_q,
-            )?;
             if owns_kv {
-                self.eng.rmsnorm_per_head_rope(
+                let kv_off = self.pos * self.cfg.n_kv * q40_row_bytes(hd);
+                self.eng.rmsnorm_per_head_qkv_q40_off(
                     &self.ctx,
+                    n_heads,
                     self.cfg.n_kv,
                     hd,
                     eps,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
                     &self.tmp_k,
                     &self.layer_norms[layer].k_norm,
-                    &self.cos_sin[layer],
-                    &self.tmp_k,
+                    &self.tmp_v,
+                    &self.tmp_q,
+                    &self.kv_k[kv_src],
+                    &self.kv_v[kv_src],
+                    kv_off,
                 )?;
-                self.eng.rmsnorm_noweight(
+            } else {
+                self.eng.rmsnorm_per_head_rope_off(
                     &self.ctx,
-                    self.cfg.n_kv,
+                    n_heads,
                     hd,
                     eps,
-                    &self.tmp_v,
-                    &self.tmp_v,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
+                    &self.tmp_q,
+                    0,
                 )?;
-                self.kv_append_f16(kv_src, hd)?;
             }
 
             let kv_len = self.pos + 1;
@@ -662,69 +1015,139 @@ impl GemmaPrimModel {
                 (kv_len as u32, 0u32)
             };
             self.write_meta(layer, attn_t, attn_start);
-            self.eng.sdpa_naive(
+            self.eng.sdpa_hybrid_kv(
                 &self.ctx,
                 n_heads,
+                self.cfg.n_kv,
                 hd,
                 max_seq,
+                attn_t,
+                DType::Q40,
                 &self.tmp_q,
                 &self.kv_k[kv_src],
                 &self.kv_v[kv_src],
                 &self.meta[layer],
+                &self.tmp_attn_mwg,
                 &self.tmp_o,
             )?;
 
             self.matvec_w(h, o_in, &format!("{pref}attn_output.weight"), self.tmp_o.clone(), self.x2.clone())?;
-            self.eng.rmsnorm_add(
-                &self.ctx,
-                h,
-                eps,
-                &self.x2,
-                &self.layer_norms[layer].post_attn_norm,
-                &self.x,
-                &self.x,
-            )?;
-            if let Some(ts) = t_section {
-                self.ctx.synchronize()?;
-                ms_attn += ts.elapsed().as_secs_f64() * 1e3;
-            }
-            let t_mlp = if profile {
-                Some(Instant::now())
-            } else {
-                None
-            };
 
-            // MLP: fused rms → gate/up matvec+gelu → down
+            let gate_name = format!("{pref}ffn_gate.weight");
+            let up_name = format!("{pref}ffn_up.weight");
+            self.ensure_weight(&gate_name)?;
+            self.ensure_weight(&up_name)?;
+            let dg = self.weight_bufs.get(&gate_name).unwrap().dtype();
+            let du = self.weight_bufs.get(&up_name).unwrap().dtype();
+            let packed_gate = dg == du && is_packed(dg);
             let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
-            self.rmsnorm_matvec_gate_up_gelu_w(
-                ffn_inter,
-                h,
-                eps,
-                &format!("{pref}ffn_gate.weight"),
-                &format!("{pref}ffn_up.weight"),
-                self.x.clone(),
-                &ffn_norm,
-                self.tmp_ff3.clone(),
-            )?;
-            self.matvec_w(
-                h,
-                ffn_inter,
-                &format!("{pref}ffn_down.weight"),
-                self.tmp_ff3.clone(),
-                self.x2.clone(),
-            )?;
-            self.eng.rmsnorm_add(
-                &self.ctx,
-                h,
-                eps,
-                &self.x2,
-                &self.layer_norms[layer].post_ffw_norm,
-                &self.x,
-                &self.x,
-            )?;
-            if let Some(ts) = t_mlp {
-                self.ctx.synchronize()?;
-                ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+
+            if packed_gate {
+                // Residual+post-attn rms and ffn rms in one TG; gate_up stays
+                // device-x coop (LOCAL x_hat in the fused rms+gate_up path is slower).
+                if let Some(ts) = t_section {
+                    self.ctx.synchronize()?;
+                    ms_attn += ts.elapsed().as_secs_f64() * 1e3;
+                }
+                let t_mlp = if profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                self.eng.rmsnorm_add_then_rmsnorm(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_attn_norm,
+                    &self.x,
+                    &ffn_norm,
+                    &self.x,
+                    &self.x2,
+                )?;
+                let wg = self.weight_bufs.get(&gate_name).unwrap().buf().clone();
+                let wu = self.weight_bufs.get(&up_name).unwrap().buf().clone();
+                self.eng.matvec_gate_up_gelu_wd(
+                    &self.ctx,
+                    ffn_inter,
+                    h,
+                    dg,
+                    &wg,
+                    &wu,
+                    &self.x2,
+                    &self.tmp_ff3,
+                )?;
+                self.matvec_w(
+                    h,
+                    ffn_inter,
+                    &format!("{pref}ffn_down.weight"),
+                    self.tmp_ff3.clone(),
+                    self.x2.clone(),
+                )?;
+                self.eng.rmsnorm_add(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_ffw_norm,
+                    &self.x,
+                    &self.x,
+                )?;
+                if let Some(ts) = t_mlp {
+                    self.ctx.synchronize()?;
+                    ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+                }
+            } else {
+                self.eng.rmsnorm_add(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_attn_norm,
+                    &self.x,
+                    &self.x,
+                )?;
+                if let Some(ts) = t_section {
+                    self.ctx.synchronize()?;
+                    ms_attn += ts.elapsed().as_secs_f64() * 1e3;
+                }
+                let t_mlp = if profile {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+
+                // MLP: fused rms → gate/up matvec+gelu → down
+                self.rmsnorm_matvec_gate_up_gelu_w(
+                    ffn_inter,
+                    h,
+                    eps,
+                    &gate_name,
+                    &up_name,
+                    self.x.clone(),
+                    &ffn_norm,
+                    self.tmp_ff3.clone(),
+                )?;
+                self.matvec_w(
+                    h,
+                    ffn_inter,
+                    &format!("{pref}ffn_down.weight"),
+                    self.tmp_ff3.clone(),
+                    self.x2.clone(),
+                )?;
+                self.eng.rmsnorm_add(
+                    &self.ctx,
+                    h,
+                    eps,
+                    &self.x2,
+                    &self.layer_norms[layer].post_ffw_norm,
+                    &self.x,
+                    &self.x,
+                )?;
+                if let Some(ts) = t_mlp {
+                    self.ctx.synchronize()?;
+                    ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
+                }
             }
             let t_ple_l = if profile {
                 Some(Instant::now())
@@ -732,35 +1155,35 @@ impl GemmaPrimModel {
                 None
             };
 
-            // PLE
-            self.matvec_w(
-                ple_dim,
-                h,
-                &format!("{pref}inp_gate.weight"),
-                self.x.clone(),
-                self.ple_gate.clone(),
-            )?;
-            self.eng.gelu_mul_at(
+            // PLE: fuse gate matvec + gelu*ctx, then proj matvec + rmsnorm_add_scale (sequenced).
+            let gate_name = format!("{pref}inp_gate.weight");
+            self.ensure_weight(&gate_name)?;
+            let dg = self.weight_bufs.get(&gate_name).unwrap().dtype();
+            let wg = self.weight_bufs.get(&gate_name).unwrap().buf().clone();
+            self.eng.matvec_gelu_mul_at(
                 &self.ctx,
                 ple_dim,
-                &self.ple_gate,
+                h,
+                dg,
+                &wg,
+                &self.x,
                 &self.ple_ctx,
                 layer * ple_dim,
                 &self.ple_u,
             )?;
-            self.matvec_w(
-                h,
-                ple_dim,
-                &format!("{pref}proj.weight"),
-                self.ple_u.clone(),
-                self.ple_proj.clone(),
-            )?;
-            self.eng.rmsnorm_add_scale(
+            let proj_name = format!("{pref}proj.weight");
+            self.ensure_weight(&proj_name)?;
+            let dp = self.weight_bufs.get(&proj_name).unwrap().dtype();
+            let wp = self.weight_bufs.get(&proj_name).unwrap().buf().clone();
+            self.eng.matvec_rmsnorm_add_scale(
                 &self.ctx,
                 h,
+                ple_dim,
                 eps,
                 self.layer_norms[layer].layer_scale,
-                &self.ple_proj,
+                dp,
+                &wp,
+                &self.ple_u,
                 &self.layer_norms[layer].post_norm,
                 &self.x,
                 &self.x,
@@ -769,6 +1192,8 @@ impl GemmaPrimModel {
                 self.ctx.synchronize()?;
                 ms_ple_l += ts.elapsed().as_secs_f64() * 1e3;
             }
+            // Decode: keep one encoder/CB for the whole token (llama.cpp-style).
+            // Prefill still commits at token end so the next PLE gather can overlap.
         }
 
         let t_layers = t0.elapsed();
@@ -786,6 +1211,8 @@ impl GemmaPrimModel {
                     (t_layers - t_pre).as_secs_f64() * 1e3,
                     t0.elapsed().as_secs_f64() * 1e3
                 );
+            } else {
+                self.ctx.flush_async();
             }
             return Ok(None);
         }
@@ -796,21 +1223,40 @@ impl GemmaPrimModel {
         let cap = self.cfg.softcap;
         let embd_dt = self.token_embd.dtype();
         let embd = self.token_embd.buf().clone();
-        self.eng.rmsnorm_matvec_wd(
-            &self.ctx,
-            vocab,
-            h,
-            eps,
-            embd_dt,
-            &self.x,
-            &self.output_norm,
-            &embd,
-            &self.logits,
-        )?;
-        self.eng
-            .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &self.argmax_out)?;
+        if is_packed(embd_dt) {
+            self.eng
+                .rmsnorm(&self.ctx, h, eps, &self.x, &self.output_norm, &self.x2)?;
+            self.eng.matvec_wd(
+                &self.ctx, vocab, h, embd_dt, &embd, &self.x2, &self.logits,
+            )?;
+        } else {
+            self.eng.rmsnorm_matvec_wd(
+                &self.ctx, vocab, h, eps, embd_dt, &self.x, &self.output_norm, &embd, &self.logits,
+            )?;
+        }
+        let dst = self.tok_idx[self.decode_src ^ 1].clone();
+        let sampling = self.sample_temperature >= 1e-6;
+        if !sampling {
+            self.eng
+                .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &dst)?;
+        }
         let t_logits = t0.elapsed();
-        let best = self.ctx.read_f32(&self.argmax_out, 1)[0] as u32;
+        if !self.return_token_sync {
+            return Ok(None);
+        }
+        if sampling {
+            let logits = self.ctx.read_u16(&self.logits, vocab);
+            let best = sample_softcap_min_p(
+                &logits,
+                cap,
+                self.sample_temperature,
+                self.sample_min_p,
+                self.sample_seed,
+            );
+            self.sample_temperature = 0.0;
+            return Ok(Some(best));
+        }
+        let best = self.ctx.read_f32(&dst, 1)[0] as u32;
         if profile {
             eprintln!(
                 "[profile] decode pos={} embed={:.1}ms ple_load={:.1}ms prepass={:.1}ms attn={:.1}ms mlp={:.1}ms ple={:.1}ms logits+sync={:.1}ms total={:.1}ms",
@@ -828,18 +1274,378 @@ impl GemmaPrimModel {
         Ok(Some(best))
     }
 
+    /// Bind this sequence's K/V packs and `pos` to a pool slot (serving).
+    pub fn bind_slot(&mut self, pool: &KvPool, slot: SlotId) -> Result<()> {
+        if self.kv_k.len() != pool.n_kv_layers {
+            bail!(
+                "kv layer mismatch: model={} pool={}",
+                self.kv_k.len(),
+                pool.n_kv_layers
+            );
+        }
+        for i in 0..self.kv_k.len() {
+            self.kv_k[i] = pool.k_buf(slot, i)?.clone();
+            self.kv_v[i] = pool.v_buf(slot, i)?.clone();
+        }
+        self.pos = pool.seq_len(slot)?;
+        Ok(())
+    }
+
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
+    /// Prefill one token (KV write, no logits).
+    pub fn prefill_token(&mut self, token: u32) -> Result<()> {
+        let _ = self.forward_token(token, false)?;
+        Ok(())
+    }
+
+    /// Seq-parallel prefill for `tokens` (any length). Remainder of 1 uses the decode kernel.
+    pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            if chunk.len() == 1 {
+                let _ = self.forward_token(chunk[0], false)?;
+            } else {
+                self.forward_prefill_chunk(chunk)?;
+            }
+        }
+        self.ctx.synchronize()?;
+        Ok(())
+    }
+
+    fn forward_prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        let t = tokens.len();
+        if t == 0 {
+            return Ok(());
+        }
+        if self.pos + t > self.max_seq {
+            bail!("max_seq exceeded");
+        }
+        let ids: Vec<f32> = tokens.iter().map(|&tok| tok as f32).collect();
+        self.ctx.write_buffer_nosync(&self.chunk_tok, &ids);
+
+        let gpu_idx = self.ple_embd.is_some();
+        if gpu_idx {
+            let src = self.chunk_tok.clone();
+            self.embed_from_idx_batch(&src, t)?;
+            self.ple_from_idx_batch(&src, t)?;
+        } else {
+            for (i, &tok) in tokens.iter().enumerate() {
+                self.embed_token(tok)?;
+                self.eng.copy_slice(
+                    &self.ctx,
+                    self.cfg.hidden,
+                    &self.x,
+                    0,
+                    &self.x,
+                    i * self.cfg.hidden,
+                )?;
+                self.load_ple_token(tok)?;
+                self.eng.copy_slice(
+                    &self.ctx,
+                    self.cfg.ple_total(),
+                    &self.ple_tok,
+                    0,
+                    &self.ple_tok,
+                    i * self.cfg.ple_total(),
+                )?;
+            }
+        }
+        self.ple_prepass_batch(t)?;
+
+        let h = self.cfg.hidden;
+        let eps = self.cfg.rms_eps;
+        let n_layers = self.cfg.n_layers;
+        let n_heads = self.cfg.n_heads;
+        let max_seq = self.max_seq;
+        let window = self.cfg.sliding_window;
+        let ple_dim = self.cfg.ple_dim;
+        let pos0 = self.pos;
+
+        for layer in 0..n_layers {
+            let (q_rows, kv_rows, o_in, ffn_inter, hd) = {
+                let lw = &self.layers[layer];
+                (lw.q_rows, lw.kv_rows, lw.o_in, lw.ffn_inter, lw.hd)
+            };
+            let is_swa = self.cfg.is_swa(layer);
+            let rope_hd = if is_swa { self.hd_swa } else { self.hd_full };
+            let rope_buf = if is_swa {
+                self.rope_swa.clone()
+            } else {
+                self.rope_full.clone()
+            };
+            let pref = format!("blk.{layer}.");
+            let owns_kv = self.cfg.owns_kv(layer);
+            let kv_src = self.cfg.kv_source(layer);
+
+            let attn_norm = self.layer_norms[layer].attn_norm.clone();
+            self.eng
+                .rmsnorm_rows(&self.ctx, h, t, eps, &self.x, &attn_norm, &self.x2)?;
+            if owns_kv {
+                self.ensure_weight(&format!("{pref}attn_q.weight"))?;
+                self.ensure_weight(&format!("{pref}attn_k.weight"))?;
+                self.ensure_weight(&format!("{pref}attn_v.weight"))?;
+                self.matvec_w_batch(
+                    q_rows,
+                    h,
+                    &format!("{pref}attn_q.weight"),
+                    self.x2.clone(),
+                    self.tmp_q.clone(),
+                    t,
+                )?;
+                self.matvec_w_batch(
+                    kv_rows,
+                    h,
+                    &format!("{pref}attn_k.weight"),
+                    self.x2.clone(),
+                    self.tmp_k.clone(),
+                    t,
+                )?;
+                self.matvec_w_batch(
+                    kv_rows,
+                    h,
+                    &format!("{pref}attn_v.weight"),
+                    self.x2.clone(),
+                    self.tmp_v.clone(),
+                    t,
+                )?;
+            } else {
+                self.matvec_w_batch(
+                    q_rows,
+                    h,
+                    &format!("{pref}attn_q.weight"),
+                    self.x2.clone(),
+                    self.tmp_q.clone(),
+                    t,
+                )?;
+            }
+
+            if owns_kv {
+                let rope_off = pos0 * rope_hd;
+                let kv_off = pos0 * self.cfg.n_kv * q40_row_bytes(hd);
+                self.eng.rmsnorm_per_head_qkv_q40_batch(
+                    &self.ctx,
+                    n_heads,
+                    self.cfg.n_kv,
+                    hd,
+                    t,
+                    eps,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
+                    &self.tmp_k,
+                    &self.layer_norms[layer].k_norm,
+                    &self.tmp_v,
+                    &self.tmp_q,
+                    &self.kv_k[kv_src],
+                    &self.kv_v[kv_src],
+                    kv_off,
+                )?;
+            } else {
+                let rope_off = pos0 * rope_hd;
+                self.eng.rmsnorm_per_head_rope_batch(
+                    &self.ctx,
+                    n_heads,
+                    hd,
+                    t,
+                    eps,
+                    &self.tmp_q,
+                    &self.layer_norms[layer].q_norm,
+                    &rope_buf,
+                    rope_off,
+                    &self.tmp_q,
+                )?;
+            }
+
+            let last_tlen = pos0 + t;
+            let (attn_t, win) = if is_swa {
+                (
+                    last_tlen.min(window) as u32,
+                    window as u32,
+                )
+            } else {
+                (last_tlen as u32, max_seq as u32)
+            };
+            let tlen0 = (pos0 + 1) as u32;
+            self.write_meta_win(layer, tlen0, 0, win);
+            self.eng.sdpa_hybrid_kv_batch(
+                &self.ctx,
+                n_heads,
+                self.cfg.n_kv,
+                t,
+                hd,
+                max_seq,
+                attn_t,
+                DType::Q40,
+                &self.tmp_q,
+                &self.kv_k[kv_src],
+                &self.kv_v[kv_src],
+                &self.meta[layer],
+                &self.tmp_attn_mwg,
+                &self.tmp_o,
+            )?;
+
+            self.matvec_w_batch(
+                h,
+                o_in,
+                &format!("{pref}attn_output.weight"),
+                self.tmp_o.clone(),
+                self.x2.clone(),
+                t,
+            )?;
+
+            let gate_name = format!("{pref}ffn_gate.weight");
+            let up_name = format!("{pref}ffn_up.weight");
+            self.ensure_weight(&gate_name)?;
+            self.ensure_weight(&up_name)?;
+            let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
+            self.eng.rmsnorm_add_then_rmsnorm_rows(
+                &self.ctx,
+                h,
+                t,
+                eps,
+                &self.x2,
+                &self.layer_norms[layer].post_attn_norm,
+                &self.x,
+                &ffn_norm,
+                &self.x,
+                &self.x2,
+            )?;
+            self.matvec_w_batch(
+                ffn_inter,
+                h,
+                &gate_name,
+                self.x2.clone(),
+                self.tmp_ff1.clone(),
+                t,
+            )?;
+            self.matvec_w_batch(
+                ffn_inter,
+                h,
+                &up_name,
+                self.x2.clone(),
+                self.tmp_ff2.clone(),
+                t,
+            )?;
+            self.eng.gelu_mul(
+                &self.ctx,
+                t * ffn_inter,
+                &self.tmp_ff1,
+                &self.tmp_ff2,
+                &self.tmp_ff3,
+            )?;
+            self.matvec_w_batch(
+                h,
+                ffn_inter,
+                &format!("{pref}ffn_down.weight"),
+                self.tmp_ff3.clone(),
+                self.x2.clone(),
+                t,
+            )?;
+            self.eng.rmsnorm_add_rows(
+                &self.ctx,
+                h,
+                t,
+                eps,
+                &self.x2,
+                &self.layer_norms[layer].post_ffw_norm,
+                &self.x,
+                &self.x,
+            )?;
+
+            let gate_name = format!("{pref}inp_gate.weight");
+            self.ensure_weight(&gate_name)?;
+            let proj_name = format!("{pref}proj.weight");
+            self.ensure_weight(&proj_name)?;
+            let layer_scale = self.layer_norms[layer].layer_scale;
+            self.matvec_w_batch(
+                ple_dim,
+                h,
+                &gate_name,
+                self.x.clone(),
+                self.ple_u.clone(),
+                t,
+            )?;
+            self.eng.gelu_mul_strided(
+                &self.ctx,
+                ple_dim,
+                t,
+                &self.ple_u,
+                &self.ple_ctx,
+                layer * ple_dim,
+                self.cfg.ple_total(),
+                &self.ple_u,
+            )?;
+            self.matvec_w_batch(
+                h,
+                ple_dim,
+                &proj_name,
+                self.ple_u.clone(),
+                self.ple_proj.clone(),
+                t,
+            )?;
+            self.eng.rmsnorm_add_scale_rows(
+                &self.ctx,
+                h,
+                t,
+                eps,
+                layer_scale,
+                &self.ple_proj,
+                &self.layer_norms[layer].post_norm,
+                &self.x,
+                &self.x,
+            )?;
+        }
+
+        self.pos += t;
+        // Must wait: next chunk reuses x/meta/chunk_tok. flush_async raced the
+        // CPU overwrite with in-flight GPU and corrupted early-prompt KV.
+        self.ctx.synchronize()?;
+        Ok(())
+    }
+
+    /// Decode one token: embed/PLE from `token`, return next greedy id.
+    pub fn decode_token(&mut self, token: u32) -> Result<u32> {
+        self.decode_token_sampled(token, 0.0, 0.0, 1)
+    }
+
+    /// Decode one token with oracle-style temperature + min-p (CPU, after softcap).
+    /// `temperature < 1e-6` is greedy GPU argmax.
+    pub fn decode_token_sampled(
+        &mut self,
+        token: u32,
+        temperature: f32,
+        min_p: f32,
+        seed: u32,
+    ) -> Result<u32> {
+        self.decode_src = 0;
+        self.return_token_sync = true;
+        self.sample_temperature = temperature;
+        self.sample_min_p = min_p;
+        self.sample_seed = seed;
+        if self.ple_embd.is_some() {
+            self.ctx.synchronize()?;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[0], &[token as f32]);
+        }
+        self.forward_token(token, true)?
+            .ok_or_else(|| anyhow!("decode expected logits"))
+    }
+
     /// F32 KV pool for multi-stream decode (P5 serving contract).
     pub fn make_kv_pool(&self, max_batch: usize) -> Result<KvPool> {
-        let n_kv_layers = (0..self.cfg.n_layers)
-            .filter(|&i| self.cfg.owns_kv(i))
-            .count()
-            .max(1);
+        let n_kv_layers = self.cfg.n_kv_owners();
         let hd = self.cfg.head_dim_full.max(self.cfg.head_dim_swa);
-        KvPool::new_f16(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd)
+        KvPool::new(&self.ctx, max_batch, self.max_seq, n_kv_layers, hd, self.cfg.n_kv)
     }
 
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.decode_src = 0;
+        self.return_token_sync = true;
+        self.sample_temperature = 0.0;
         self.ctx.synchronize().ok();
         for b in self.kv_k.iter().chain(self.kv_v.iter()) {
             let n = b.length() as usize;
@@ -862,37 +1668,83 @@ impl GemmaPrimModel {
         let mut out = Vec::new();
         let t_prefill = Instant::now();
         let prefill_toks = &prompt_tokens[..prompt_tokens.len().saturating_sub(1)];
-        // P5: chunked prefill (oracle order later; for now chunked serial advances).
-        for chunk in prefill_toks.chunks(PREFILL_CHUNK) {
-            for &tok in chunk {
-                let _ = self.forward_token(tok, false)?;
-            }
-        }
+        self.prefill_chunk(prefill_toks)?;
         let prefill_s = t_prefill.elapsed().as_secs_f64();
         let prefill_tokens = prefill_toks.len();
 
         let mut tok = *prompt_tokens.last().unwrap();
+        let gpu_pipe = self.ple_embd.is_some();
         let t_decode = Instant::now();
-        for i in 0..n_new {
-            let step_t0 = Instant::now();
-            let next = self
-                .forward_token(tok, true)?
-                .ok_or_else(|| anyhow!("decode expected logits"))?;
-            out.push(next);
-            tok = next;
-            if verbose {
-                let piece = self
-                    .vocab
-                    .as_ref()
-                    .map(|v| v.decode(&[next], false))
-                    .unwrap_or_default();
-                eprintln!(
-                    "  token[{i}] = {next} {piece:?}  ({:.0}ms)",
-                    step_t0.elapsed().as_secs_f64() * 1e3
-                );
+        if gpu_pipe {
+            self.ctx.synchronize()?;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[0], &[tok as f32]);
+            self.return_token_sync = false;
+            let mut stopped = false;
+            for i in 0..n_new {
+                let step_t0 = Instant::now();
+                self.decode_src = i & 1;
+                let _ = self.forward_token(tok, true)?;
+                self.ctx.flush_async();
+                if i > 0 {
+                    self.ctx.wait_inflight_at_most(1);
+                    let next = self.ctx.read_f32_nosync(&self.tok_idx[i & 1], 1)[0] as u32;
+                    out.push(next);
+                    tok = next;
+                    if verbose {
+                        let piece = self
+                            .vocab
+                            .as_ref()
+                            .map(|v| v.decode(&[next], false))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "  token[{}] = {next} {piece:?}  ({:.0}ms)",
+                            out.len() - 1,
+                            step_t0.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    if next == 1 || next == 106 {
+                        stopped = true;
+                        break;
+                    }
+                }
             }
-            if next == 1 || next == 106 {
-                break;
+            if !stopped && n_new > 0 {
+                self.ctx.wait_inflight_at_most(0);
+                let next = self.ctx.read_f32_nosync(&self.tok_idx[n_new & 1], 1)[0] as u32;
+                out.push(next);
+                if verbose {
+                    let piece = self
+                        .vocab
+                        .as_ref()
+                        .map(|v| v.decode(&[next], false))
+                        .unwrap_or_default();
+                    eprintln!("  token[{}] = {next} {piece:?}", out.len() - 1);
+                }
+            }
+            self.return_token_sync = true;
+        } else {
+            for i in 0..n_new {
+                let step_t0 = Instant::now();
+                let next = self
+                    .forward_token(tok, true)?
+                    .ok_or_else(|| anyhow!("decode expected logits"))?;
+                out.push(next);
+                tok = next;
+                if verbose {
+                    let piece = self
+                        .vocab
+                        .as_ref()
+                        .map(|v| v.decode(&[next], false))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "  token[{i}] = {next} {piece:?}  ({:.0}ms)",
+                        step_t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                if next == 1 || next == 106 {
+                    break;
+                }
             }
         }
         let decode_s = t_decode.elapsed().as_secs_f64();

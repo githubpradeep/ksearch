@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use crate::{bf16_to_f32, f16_to_f32};
+use crate::{bf16_to_f32, f16_to_f32, f32_to_f16};
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" little-endian
 const DEFAULT_ALIGNMENT: usize = 32;
@@ -790,5 +790,271 @@ fn dequant_blocks(ggml_type: u32, data: &[u8], total_elems: usize, mut sink: imp
             }
         }
         other => panic!("dequant: unsupported ggml type {}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K reference quantizer (llama.cpp `quantize_row_q4_K_ref` / `make_qkx2_quants`)
+// Layout: block_q4_K = half d, half dmin, scales[12], qs[128] = 144 bytes / 256 elems.
+// ---------------------------------------------------------------------------
+
+/// Magic-float nearest-int (matches ggml `nearest_int`).
+#[inline]
+fn nearest_int(fval: f32) -> i32 {
+    debug_assert!(fval.abs() <= 4_194_303.0);
+    let val = fval + 12_582_912.0;
+    let i = val.to_bits() as i32;
+    (i & 0x007f_ffff) - 0x0040_0000
+}
+
+/// Weighted min/scale search for a 32-wide Q4_K subgroup (`make_qkx2_quants`).
+fn make_qkx2_quants(
+    n: usize,
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l_out: &mut [u8],
+    the_min: &mut f32,
+    l_aux: &mut [u8],
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+    use_mad: bool,
+) -> f32 {
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        for i in 0..n {
+            l_out[i] = 0;
+        }
+        *the_min = -min;
+        return 0.0;
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let l = nearest_int(iscale * (x[i] - min)).clamp(0, nmax) as u8;
+        l_out[i] = l;
+        let mut diff = scale * l as f32 + min - x[i];
+        diff = if use_mad { diff.abs() } else { diff * diff };
+        best_error += weights[i] * diff;
+    }
+    if nstep < 1 {
+        *the_min = -min;
+        return scale;
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for i in 0..n {
+            let l = nearest_int(iscale * (x[i] - min)).clamp(0, nmax) as u8;
+            l_aux[i] = l;
+            let w = weights[i];
+            let lf = l as f32;
+            sum_l += w * lf;
+            sum_l2 += w * lf * lf;
+            sum_xl += w * lf * x[i];
+        }
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let mut diff = this_scale * l_aux[i] as f32 + this_min - x[i];
+                diff = if use_mad { diff.abs() } else { diff * diff };
+                cur_error += weights[i] * diff;
+            }
+            if cur_error < best_error {
+                l_out[..n].copy_from_slice(&l_aux[..n]);
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    scale
+}
+
+/// Quantize `elems` (must be a multiple of 256) to ggml `block_q4_K` bytes.
+/// Compatible with `ksearch_load_q4k` / coop helpers and `dequant_type_to_f32(Q4_K, …)`.
+pub fn quantize_f32_to_q4k(elems: &[f32]) -> Vec<u8> {
+    assert!(
+        elems.len() % QK_K == 0,
+        "quantize_f32_to_q4k: len {} not multiple of {}",
+        elems.len(),
+        QK_K
+    );
+    let nb = elems.len() / QK_K;
+    let mut out = vec![0u8; nb * 144];
+    let mut l = [0u8; QK_K];
+    let mut l_aux = [0u8; 32];
+    let mut weights = [0.0f32; 32];
+    let mut mins = [0.0f32; QK_K / 32];
+    let mut scales = [0.0f32; QK_K / 32];
+
+    for b in 0..nb {
+        let x = &elems[b * QK_K..(b + 1) * QK_K];
+        let blk = &mut out[b * 144..(b + 1) * 144];
+        let mut max_scale = 0.0f32;
+        let mut max_min = 0.0f32;
+        for j in 0..(QK_K / 32) {
+            let base = 32 * j;
+            let mut sum_x2 = 0.0f32;
+            for t in 0..32 {
+                sum_x2 += x[base + t] * x[base + t];
+            }
+            let av_x = (sum_x2 / 32.0).sqrt();
+            for t in 0..32 {
+                weights[t] = av_x + x[base + t].abs();
+            }
+            scales[j] = make_qkx2_quants(
+                32,
+                15,
+                &x[base..base + 32],
+                &weights,
+                &mut l[base..base + 32],
+                &mut mins[j],
+                &mut l_aux,
+                -1.0,
+                0.1,
+                20,
+                false,
+            );
+            if scales[j] > max_scale {
+                max_scale = scales[j];
+            }
+            if mins[j] > max_min {
+                max_min = mins[j];
+            }
+        }
+
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
+        let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
+        let d_bits = f32_to_f16(max_scale / 63.0).to_le_bytes();
+        let dmin_bits = f32_to_f16(max_min / 63.0).to_le_bytes();
+        blk[0] = d_bits[0];
+        blk[1] = d_bits[1];
+        blk[2] = dmin_bits[0];
+        blk[3] = dmin_bits[1];
+        {
+            let sc_bytes = &mut blk[4..16];
+            sc_bytes.fill(0);
+            for j in 0..(QK_K / 32) {
+                let mut ls = nearest_int(inv_scale * scales[j]) as u8;
+                let mut lm = nearest_int(inv_min * mins[j]) as u8;
+                ls = ls.min(63);
+                lm = lm.min(63);
+                if j < 4 {
+                    sc_bytes[j] = ls;
+                    sc_bytes[j + 4] = lm;
+                } else {
+                    sc_bytes[j + 4] = (ls & 0x0F) | ((lm & 0x0F) << 4);
+                    sc_bytes[j - 4] |= (ls >> 4) << 6;
+                    sc_bytes[j] |= (lm >> 4) << 6;
+                }
+            }
+        }
+
+        let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let sc_bytes = &blk[4..16];
+        for j in 0..(QK_K / 32) {
+            let (sc, m) = get_scale_min_k4(j, sc_bytes);
+            let dj = d * sc as f32;
+            if dj == 0.0 {
+                continue;
+            }
+            let dm = dmin * m as f32;
+            let base = 32 * j;
+            for ii in 0..32 {
+                let qi = nearest_int((x[base + ii] + dm) / dj).clamp(0, 15) as u8;
+                l[base + ii] = qi;
+            }
+        }
+
+        let qs = &mut blk[16..144];
+        let mut qoff = 0;
+        let mut j = 0;
+        while j < QK_K {
+            for t in 0..32 {
+                qs[qoff + t] = l[j + t] | (l[j + t + 32] << 4);
+            }
+            qoff += 32;
+            j += 64;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q4k_roundtrip_approx() {
+        // Deterministic pseudo-random in a realistic weight range.
+        let mut elems = Vec::with_capacity(256 * 4);
+        for i in 0..(256 * 4) {
+            let t = (i as f32 * 0.017 + 0.3).sin() * 1.7
+                + (i as f32 * 0.041).cos() * 0.4
+                - 0.15;
+            elems.push(t);
+        }
+        // Include a near-zero block and a constant block.
+        for v in &mut elems[256..512] {
+            *v = 0.0;
+        }
+        for v in &mut elems[512..768] {
+            *v = -0.25;
+        }
+
+        let q = quantize_f32_to_q4k(&elems);
+        assert_eq!(q.len(), elems.len() / 256 * 144);
+        let back = dequant_type_to_f32(ggml_type::Q4_K, &q, elems.len());
+        assert_eq!(back.len(), elems.len());
+
+        let mut mse = 0.0f64;
+        let mut max_abs = 0.0f32;
+        for (a, b) in elems.iter().zip(back.iter()) {
+            let e = (a - b).abs();
+            max_abs = max_abs.max(e);
+            mse += (e as f64) * (e as f64);
+        }
+        mse /= elems.len() as f64;
+        // Reference-quality Q4_K: RMSE well under ~0.05 for this signal; zeros exact.
+        assert!(mse < 0.01, "mse={mse}");
+        assert!(max_abs < 0.35, "max_abs={max_abs}");
+        for i in 256..512 {
+            assert_eq!(back[i], 0.0, "zero block at {i}");
+        }
     }
 }

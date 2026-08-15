@@ -3,12 +3,55 @@
 use crate::{DType, FuseHint, IrError, Shape, TensorId};
 use std::collections::HashMap;
 
-/// Out dtype for matvec-like FuseHints: float weights match act, or Q4K×F16 → F16.
+/// Out dtype for matvec-like FuseHints: float weights match act, or Q4K/Q6K×F16 → F16.
 fn matvec_weight_act_out(weight: DType, act: DType, cols: usize) -> Result<DType, IrError> {
     match (weight, act) {
         (d, a) if d.is_float() && a == d => Ok(d),
-        (DType::Q4K, DType::F16) if cols % 256 == 0 => Ok(DType::F16),
+        (DType::Q4K | DType::Q6K, DType::F16) if cols % 256 == 0 => Ok(DType::F16),
         _ => Err(IrError::ShapeMismatch),
+    }
+}
+
+fn packed_k_quant(d: DType) -> bool {
+    matches!(d, DType::Q4K | DType::Q6K)
+}
+
+/// Infer GQA `n_kv` from packed K/V `[max_t, n_kv, hd]`. MQA is `n_kv = 1`.
+fn sdpa_n_kv(
+    n_q: usize,
+    max_t: usize,
+    hd: usize,
+    k_numel: usize,
+    v_numel: usize,
+) -> Result<usize, IrError> {
+    if n_q == 0 || max_t == 0 || hd == 0 {
+        return Err(IrError::ShapeMismatch);
+    }
+    let row = max_t * hd;
+    if k_numel != v_numel || k_numel % row != 0 {
+        return Err(IrError::ShapeMismatch);
+    }
+    let n_kv = k_numel / row;
+    if n_kv == 0 || n_q % n_kv != 0 {
+        return Err(IrError::ShapeMismatch);
+    }
+    Ok(n_kv)
+}
+
+/// QKV weights: all same float, or any mix of packed K-quants (shared F16 out).
+fn qkv_weight_dtypes_ok(dq: DType, dk: DType, dv: DType, dx: DType, cols: usize) -> Result<DType, IrError> {
+    let oq = matvec_weight_act_out(dq, dx, cols)?;
+    let ok = matvec_weight_act_out(dk, dx, cols)?;
+    let ov = matvec_weight_act_out(dv, dx, cols)?;
+    if oq != ok || ok != ov {
+        return Err(IrError::ShapeMismatch);
+    }
+    let same = dq == dk && dk == dv;
+    let all_packed = packed_k_quant(dq) && packed_k_quant(dk) && packed_k_quant(dv);
+    if same || all_packed {
+        Ok(oq)
+    } else {
+        Err(IrError::ShapeMismatch)
     }
 }
 
@@ -159,8 +202,8 @@ impl Graph {
         let out_dtype = match (dl, dr) {
             (DType::F32, DType::F32) => DType::F32,
             (DType::F16, DType::F16) => DType::F16,
-            (DType::Q4K, DType::F32) if sl.0[1] % 256 == 0 => DType::F32,
-            (DType::Q4K, DType::F16) if sl.0[1] % 256 == 0 => DType::F16,
+            (DType::Q4K | DType::Q6K, DType::F32) if sl.0[1] % 256 == 0 => DType::F32,
+            (DType::Q4K | DType::Q6K, DType::F16) if sl.0[1] % 256 == 0 => DType::F16,
             _ => return Err(IrError::ShapeMismatch),
         };
         Ok(self.push(
@@ -362,6 +405,42 @@ impl Graph {
         Ok(out)
     }
 
+    /// Fused attn→MLP: `out_x = residual + rms(y)*w_post`, `out_x2 = rms(out_x)*w_ffn`.
+    /// Call root shape is `out_x`; Metal emits 2 outputs (like MatvecQkv).
+    pub fn rmsnorm_add_then_rmsnorm(
+        &mut self,
+        y: TensorId,
+        w_post: TensorId,
+        residual: TensorId,
+        w_ffn: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sy, dy) = self.shape_dtype(y)?;
+        let (sp, dp) = self.shape_dtype(w_post)?;
+        let (sr, dr) = self.shape_dtype(residual)?;
+        let (sf, df) = self.shape_dtype(w_ffn)?;
+        if sy != sp || sy != sr || sy != sf || sy.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dy.is_float() || dy != dp || dy != dr || dy != df {
+            return Err(IrError::ShapeMismatch);
+        }
+        let n = sy.0[0];
+        Ok(self.call(
+            vec![y, w_post, residual, w_ffn],
+            sy,
+            dy,
+            FuseHint::RmsNormAddThenRmsNorm {
+                n,
+                eps,
+                y,
+                w_post,
+                residual,
+                w_ffn,
+            },
+        ))
+    }
+
     /// Per-head RMSNorm as CALL (movement+reduce fused by schedule).
     pub fn rmsnorm_per_head(
         &mut self,
@@ -415,6 +494,201 @@ impl Graph {
                 hd,
                 eps,
                 with_weight,
+                n_tok: 1,
+                x,
+                w,
+                cos_sin,
+            },
+        ))
+    }
+
+
+    /// Per-head RMSNorm + RoPE, pack Q4_0 (KV K append; one CALL).
+    pub fn rmsnorm_per_head_rope_q40(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || sx.numel() != n_heads * hd || hd % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w, cos_sin],
+            Shape(vec![n_heads * hd]),
+            DType::Q40,
+            FuseHint::RmsNormPerHeadRopeQ40 {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                x,
+                w,
+                cos_sin,
+            },
+        ))
+    }
+
+    /// Per-head RMSNorm, pack Q4_0 (KV V append; one CALL).
+    pub fn rmsnorm_per_head_q40(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || sx.numel() != n_heads * hd || hd % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w],
+            Shape(vec![n_heads * hd]),
+            DType::Q40,
+            FuseHint::RmsNormPerHeadQ40 {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                x,
+                w,
+            },
+        ))
+    }
+
+    /// Q rms+RoPE (F16) + K rms+RoPE+Q40 + V rms+Q40 as one CALL (decode KV owners).
+    pub fn rmsnorm_per_head_qkv_q40(
+        &mut self,
+        q: TensorId,
+        qw: TensorId,
+        cos_sin: TensorId,
+        k: TensorId,
+        kw: TensorId,
+        v: TensorId,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        if !dq.is_float()
+            || dq != dk
+            || dq != dv
+            || sq.numel() != n_q * hd
+            || sk.numel() != n_kv * hd
+            || sv.numel() != n_kv * hd
+            || hd % 32 != 0
+            || n_kv == 0
+            || n_q < n_kv
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, qw, cos_sin, k, kw, v],
+            Shape(vec![n_q * hd]),
+            dq,
+            FuseHint::RmsNormPerHeadQkvQ40 {
+                n_q,
+                n_kv,
+                hd,
+                eps,
+                n_tok: 1,
+                q,
+                qw,
+                cos_sin,
+                k,
+                kw,
+                v,
+            },
+        ))
+    }
+
+    /// Prefill: `n_tok` independent Q heads; K/V packed at `tok * n_kv + head`.
+    pub fn rmsnorm_per_head_qkv_q40_batch(
+        &mut self,
+        q: TensorId,
+        qw: TensorId,
+        cos_sin: TensorId,
+        k: TensorId,
+        kw: TensorId,
+        v: TensorId,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        n_tok: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        if n_tok == 0
+            || !dq.is_float()
+            || dq != dk
+            || dq != dv
+            || sq.numel() != n_tok * n_q * hd
+            || sk.numel() != n_tok * n_kv * hd
+            || sv.numel() != n_tok * n_kv * hd
+            || hd % 32 != 0
+            || n_kv == 0
+            || n_q < n_kv
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, qw, cos_sin, k, kw, v],
+            Shape(vec![n_tok * n_q * hd]),
+            dq,
+            FuseHint::RmsNormPerHeadQkvQ40 {
+                n_q,
+                n_kv,
+                hd,
+                eps,
+                n_tok,
+                q,
+                qw,
+                cos_sin,
+                k,
+                kw,
+                v,
+            },
+        ))
+    }
+
+    /// Prefill: `n_tok * n_heads` TGs; rope is `[n_tok, hd]` (caller offsets pos0).
+    pub fn rmsnorm_per_head_rope_batch(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+        n_heads: usize,
+        hd: usize,
+        n_tok: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if n_tok == 0 || !dx.is_float() || sx.numel() != n_tok * n_heads * hd {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w, cos_sin],
+            Shape(vec![n_tok * n_heads * hd]),
+            dx,
+            FuseHint::RmsNormPerHeadRope {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                n_tok,
                 x,
                 w,
                 cos_sin,
@@ -430,20 +704,229 @@ impl Graph {
         n: usize,
         scale: f32,
     ) -> Result<TensorId, IrError> {
-        let (_, d) = self.shape_dtype(src)?;
-        if !d.is_float() {
+        let (s, d) = self.shape_dtype(src)?;
+        if s.numel() < src_off + n {
             return Err(IrError::ShapeMismatch);
         }
+        // Float: same dtype. Packed K-quant: Load expand → F16 acts (Thesis A).
+        let out_dt = if d.is_float() {
+            d
+        } else if matches!(d, DType::Q4K | DType::Q5K | DType::Q6K) {
+            DType::F16
+        } else {
+            return Err(IrError::ShapeMismatch);
+        };
         Ok(self.call(
             vec![src],
             Shape(vec![n]),
-            d,
+            out_dt,
             FuseHint::CopyScale {
                 src_off,
                 dst_off,
                 n,
                 scale,
                 src,
+                src_dtype: d,
+            },
+        ))
+    }
+
+    /// Gather one packed/F16 row: `out[i] = scale * src[uint(idx[0]) * n + i]`.
+    pub fn copy_scale_indexed(
+        &mut self,
+        src: TensorId,
+        idx: TensorId,
+        n: usize,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (_, d) = self.shape_dtype(src)?;
+        let (is, idt) = self.shape_dtype(idx)?;
+        if is.numel() < 1 || idt != DType::F32 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let out_dt = if d.is_float() {
+            d
+        } else if matches!(d, DType::Q4K | DType::Q5K | DType::Q6K) {
+            DType::F16
+        } else {
+            return Err(IrError::ShapeMismatch);
+        };
+        Ok(self.call(
+            vec![src, idx],
+            Shape(vec![n]),
+            out_dt,
+            FuseHint::CopyScaleIndexed {
+                n,
+                scale,
+                src,
+                idx,
+                src_dtype: d,
+            },
+        ))
+    }
+
+    /// Prefill: gather `batch` rows; `idx` is F32 `[batch]`.
+    pub fn copy_scale_indexed_batch(
+        &mut self,
+        src: TensorId,
+        idx: TensorId,
+        n: usize,
+        batch: usize,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (_, d) = self.shape_dtype(src)?;
+        let (is, idt) = self.shape_dtype(idx)?;
+        if batch == 0 || n == 0 || is.numel() < batch || idt != DType::F32 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let out_dt = if d.is_float() {
+            d
+        } else if matches!(d, DType::Q4K | DType::Q5K | DType::Q6K) {
+            DType::F16
+        } else {
+            return Err(IrError::ShapeMismatch);
+        };
+        Ok(self.call(
+            vec![src, idx],
+            Shape(vec![batch * n]),
+            out_dt,
+            FuseHint::CopyScaleIndexedBatch {
+                n,
+                batch,
+                scale,
+                src,
+                idx,
+                src_dtype: d,
+            },
+        ))
+    }
+
+    /// Prefill: `Y = W @ X` for `batch` token rows (`x` is `[batch, cols]`).
+    pub fn matvec_batch(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if sw.rank() != 2 || batch == 0 || dx != DType::F16 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sw.0[0];
+        let cols = sw.0[1];
+        if sx.numel() < batch * cols {
+            return Err(IrError::ShapeMismatch);
+        }
+        let out_dt = matvec_weight_act_out(dw, dx, cols)?;
+        Ok(self.call(
+            vec![w, x],
+            Shape(vec![batch * rows]),
+            out_dt,
+            FuseHint::MatvecBatch {
+                rows,
+                cols,
+                batch,
+                w,
+                x,
+            },
+        ))
+    }
+
+    pub fn rmsnorm_rows(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        n: usize,
+        rows: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sw, dw) = self.shape_dtype(w)?;
+        if rows == 0 || n == 0 || dx != DType::F16 || dw != DType::F16 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sx.numel() < rows * n || sw.numel() < n {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w],
+            Shape(vec![rows * n]),
+            DType::F16,
+            FuseHint::RmsNormRows {
+                n,
+                rows,
+                eps,
+                x,
+                w,
+            },
+        ))
+    }
+
+    pub fn rmsnorm_add_rows(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        n: usize,
+        rows: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        self.rmsnorm_add_scale_rows(x, w, residual, n, rows, eps, 1.0)
+    }
+
+    /// `out[t, i] = scale * (residual[t, i] + rmsnorm(x[t])*w[i])`.
+    pub fn rmsnorm_add_scale_rows(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        residual: TensorId,
+        n: usize,
+        rows: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        if rows == 0 || n == 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w, residual],
+            Shape(vec![rows * n]),
+            DType::F16,
+            FuseHint::RmsNormAddRows {
+                n,
+                rows,
+                eps,
+                scale,
+                x,
+                w,
+                residual,
+            },
+        ))
+    }
+
+    pub fn rmsnorm_add_then_rmsnorm_rows(
+        &mut self,
+        y: TensorId,
+        w_post: TensorId,
+        residual: TensorId,
+        w_ffn: TensorId,
+        n: usize,
+        rows: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        Ok(self.call(
+            vec![y, w_post, residual, w_ffn],
+            Shape(vec![rows * n]),
+            DType::F16,
+            FuseHint::RmsNormAddThenRmsNormRows {
+                n,
+                rows,
+                eps,
+                y,
+                w_post,
+                residual,
+                w_ffn,
             },
         ))
     }
@@ -473,6 +956,8 @@ impl Graph {
     }
 
     /// SDPA sugar → CALL (Q@Kᵀ→softmax→@V fused by schedule; not a Graph catalog Op).
+    /// K/V may be F16 or Q40 (Load expand → float in the generic renderer).
+    /// K/V logical shape is `[max_t, n_kv, hd]`; `n_kv` is inferred (MQA = 1).
     pub fn sdpa_naive(
         &mut self,
         q: TensorId,
@@ -484,16 +969,11 @@ impl Graph {
         max_t: usize,
     ) -> Result<TensorId, IrError> {
         let (sq, dq) = self.shape_dtype(q)?;
-        let (_, dk) = self.shape_dtype(k)?;
-        let (_, dv) = self.shape_dtype(v)?;
-        if !dq.is_float()
-            || dk != dq
-            || dv != dq
-            || sq.numel() != n_q * hd
-            || n_q == 0
-            || hd == 0
-            || max_t == 0
-        {
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_q * hd {
             return Err(IrError::ShapeMismatch);
         }
         Ok(self.call(
@@ -502,13 +982,210 @@ impl Graph {
             dq,
             FuseHint::SdpaNaive {
                 n_q,
+                n_kv,
                 hd,
                 max_t,
                 q,
                 k,
                 v,
                 meta,
+                kv_dtype: dk,
             },
+        ))
+    }
+
+    /// MWG pass1: `n_q * nwg` TGs write F32 partials `(m, l, O[hd])` per (head, part).
+    pub fn sdpa_mwg_part(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        meta: TensorId,
+        n_q: usize,
+        hd: usize,
+        max_t: usize,
+        nwg: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_q * hd || nwg == 0 || hd % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, k, v, meta],
+            Shape(vec![n_q * nwg * (hd + 2)]),
+            DType::F32,
+            FuseHint::SdpaMwgPart {
+                n_q,
+                n_kv,
+                hd,
+                max_t,
+                nwg,
+                q,
+                k,
+                v,
+                meta,
+                kv_dtype: dk,
+            },
+        ))
+    }
+
+    /// MWG pass2: merge NWG F32 partials → F16 attention output.
+    pub fn sdpa_mwg_reduce(
+        &mut self,
+        tmp: TensorId,
+        n_q: usize,
+        hd: usize,
+        nwg: usize,
+    ) -> Result<TensorId, IrError> {
+        let (st, dt) = self.shape_dtype(tmp)?;
+        if dt != DType::F32
+            || st.numel() != n_q * nwg * (hd + 2)
+            || n_q == 0
+            || hd == 0
+            || nwg == 0
+            || hd % 32 != 0
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![tmp],
+            Shape(vec![n_q * hd]),
+            DType::F16,
+            FuseHint::SdpaMwgReduce {
+                n_q,
+                hd,
+                nwg,
+                tmp,
+            },
+        ))
+    }
+
+    /// Prefill SDPA: `n_tok` queries packed as `[n_tok, n_q, hd]`; causal tlen = meta_tlen + tok.
+    pub fn sdpa_naive_batch(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        meta: TensorId,
+        n_q: usize,
+        n_tok: usize,
+        hd: usize,
+        max_t: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_tok * n_q * hd || n_tok == 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, k, v, meta],
+            Shape(vec![n_tok * n_q * hd]),
+            dq,
+            FuseHint::SdpaNaiveBatch {
+                n_q,
+                n_kv,
+                n_tok,
+                hd,
+                max_t,
+                q,
+                k,
+                v,
+                meta,
+                kv_dtype: dk,
+            },
+        ))
+    }
+
+    pub fn sdpa_mwg_part_batch(
+        &mut self,
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        meta: TensorId,
+        n_q: usize,
+        n_tok: usize,
+        hd: usize,
+        max_t: usize,
+        nwg: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        let kv_ok = matches!(dk, DType::F16 | DType::Q40) && dk == dv;
+        let n_kv = sdpa_n_kv(n_q, max_t, hd, sk.numel(), sv.numel())?;
+        if !dq.is_float() || !kv_ok || sq.numel() != n_tok * n_q * hd || n_tok == 0 || nwg == 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, k, v, meta],
+            Shape(vec![n_tok * n_q * nwg * (hd + 2)]),
+            DType::F32,
+            FuseHint::SdpaMwgPartBatch {
+                n_q,
+                n_kv,
+                n_tok,
+                hd,
+                max_t,
+                nwg,
+                q,
+                k,
+                v,
+                meta,
+                kv_dtype: dk,
+            },
+        ))
+    }
+
+    pub fn sdpa_mwg_reduce_batch(
+        &mut self,
+        tmp: TensorId,
+        n_q: usize,
+        n_tok: usize,
+        hd: usize,
+        nwg: usize,
+    ) -> Result<TensorId, IrError> {
+        let (st, dt) = self.shape_dtype(tmp)?;
+        if dt != DType::F32
+            || st.numel() != n_tok * n_q * nwg * (hd + 2)
+            || n_q == 0
+            || n_tok == 0
+            || hd == 0
+            || nwg == 0
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![tmp],
+            Shape(vec![n_tok * n_q * hd]),
+            DType::F16,
+            FuseHint::SdpaMwgReduceBatch {
+                n_q,
+                n_tok,
+                hd,
+                nwg,
+                tmp,
+            },
+        ))
+    }
+
+    /// Pack `n` F16 elems (n%32==0) into Q4_0 blocks (logical shape stays `n`).
+    pub fn quantize_q40(&mut self, x: TensorId, n: usize) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if dx != DType::F16 || sx.numel() < n || n == 0 || n % 32 != 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x],
+            Shape(vec![n]),
+            DType::Q40,
+            FuseHint::QuantizeQ40 { n, src: x },
         ))
     }
 
@@ -535,6 +1212,46 @@ impl Graph {
             FuseHint::GeluMul {
                 n,
                 up_off,
+                inner: 0,
+                up_stride: 0,
+                gate,
+                up,
+            },
+        );
+        Ok(out)
+    }
+
+    /// `out[t*inner + i] = gelu(gate[t*inner + i]) * up[up_off + t*up_stride + i]`.
+    pub fn gelu_mul_strided(
+        &mut self,
+        gate: TensorId,
+        up: TensorId,
+        inner: usize,
+        n_tok: usize,
+        up_off: usize,
+        up_stride: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sg, dg) = self.shape_dtype(gate)?;
+        let (su, du) = self.shape_dtype(up)?;
+        let n = inner.saturating_mul(n_tok);
+        if inner == 0
+            || n_tok == 0
+            || !dg.is_float()
+            || du != dg
+            || sg.numel() != n
+            || su.numel() < up_off + (n_tok - 1) * up_stride + inner
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        let g = self.gelu_tanh(gate)?;
+        let out = self.mul(g, gate)?;
+        self.hint(
+            out,
+            FuseHint::GeluMul {
+                n,
+                up_off,
+                inner,
+                up_stride,
                 gate,
                 up,
             },
@@ -576,6 +1293,183 @@ impl Graph {
         ))
     }
 
+    /// PLE gate: `out[i] = gelu(W[i]·x) * ctx[ctx_off + i]` (FUSED_MLP_PLE-shaped, one CALL).
+    pub fn matvec_gelu_mul(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        ctx: TensorId,
+        ctx_off: usize,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sc, dc) = self.shape_dtype(ctx)?;
+        if sw.rank() != 2 || sx.rank() != 1 || !dc.is_float() {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sx.0[0] != sw.0[1] {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sw.0[0];
+        let cols = sw.0[1];
+        if sc.numel() < ctx_off + rows {
+            return Err(IrError::ShapeMismatch);
+        }
+        let out_dt = matvec_weight_act_out(dw, dx, cols)?;
+        Ok(self.call(
+            vec![w, x, ctx],
+            Shape(vec![rows]),
+            out_dt,
+            FuseHint::MatvecGeluMul {
+                rows,
+                cols,
+                ctx_off,
+                w,
+                x,
+                ctx,
+            },
+        ))
+    }
+
+    /// PLE: `u = gelu(W_gate@x)*ctx`; `y = W_proj@u`; `out = scale*(residual + rms(y)*w_norm)`.
+    pub fn matvec_gelu_mul_proj_rms_add_scale(
+        &mut self,
+        w_gate: TensorId,
+        x: TensorId,
+        ctx: TensorId,
+        ctx_off: usize,
+        w_proj: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+        eps: f32,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sg, dg) = self.shape_dtype(w_gate)?;
+        let (sp, dp) = self.shape_dtype(w_proj)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sc, dc) = self.shape_dtype(ctx)?;
+        let (sn, dn) = self.shape_dtype(w_norm)?;
+        let (sr, dr) = self.shape_dtype(residual)?;
+        if sg.rank() != 2 || sp.rank() != 2 || sx.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if !dc.is_float() || dn != dx || dr != dx || dg != dp {
+            return Err(IrError::ShapeMismatch);
+        }
+        let gate_rows = sg.0[0];
+        let cols = sg.0[1];
+        let proj_rows = sp.0[0];
+        if sx.0[0] != cols || sp.0[1] != gate_rows {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sn.0[0] != proj_rows || sr.0[0] != proj_rows {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sc.numel() < ctx_off + gate_rows {
+            return Err(IrError::ShapeMismatch);
+        }
+        let out_dt = matvec_weight_act_out(dg, dx, cols)?;
+        Ok(self.call(
+            vec![w_gate, x, ctx, w_proj, w_norm, residual],
+            Shape(vec![proj_rows]),
+            out_dt,
+            FuseHint::MatvecGeluMulProjRmsAddScale {
+                gate_rows,
+                cols,
+                proj_rows,
+                ctx_off,
+                eps,
+                scale,
+                w_gate,
+                x,
+                ctx,
+                w_proj,
+                w_norm,
+                residual,
+            },
+        ))
+    }
+
+    /// `y = W@x` then `out = residual + rmsnorm(y)*w_norm`.
+    pub fn matvec_rmsnorm_add(
+        &mut self,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w_mat)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sn, dn) = self.shape_dtype(w_norm)?;
+        let (sr, dr) = self.shape_dtype(residual)?;
+        if sw.rank() != 2 || sx.rank() != 1 || sn.rank() != 1 || sr.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if dn != dx || dr != dx || sx.0[0] != sw.0[1] || sn.0[0] != sw.0[0] || sr.0[0] != sw.0[0]
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sw.0[0];
+        let cols = sw.0[1];
+        let out_dt = matvec_weight_act_out(dw, dx, cols)?;
+        Ok(self.call(
+            vec![w_mat, x, w_norm, residual],
+            Shape(vec![rows]),
+            out_dt,
+            FuseHint::MatvecRmsNormAdd {
+                rows,
+                cols,
+                eps,
+                w_mat,
+                x,
+                w_norm,
+                residual,
+            },
+        ))
+    }
+
+    /// `y = W@x` then `out = scale * (residual + rmsnorm(y)*w_norm)`.
+    pub fn matvec_rmsnorm_add_scale(
+        &mut self,
+        w_mat: TensorId,
+        x: TensorId,
+        w_norm: TensorId,
+        residual: TensorId,
+        eps: f32,
+        scale: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sw, dw) = self.shape_dtype(w_mat)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        let (sn, dn) = self.shape_dtype(w_norm)?;
+        let (sr, dr) = self.shape_dtype(residual)?;
+        if sw.rank() != 2 || sx.rank() != 1 || sn.rank() != 1 || sr.rank() != 1 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if dn != dx || dr != dx || sx.0[0] != sw.0[1] || sn.0[0] != sw.0[0] || sr.0[0] != sw.0[0]
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sw.0[0];
+        let cols = sw.0[1];
+        let out_dt = matvec_weight_act_out(dw, dx, cols)?;
+        Ok(self.call(
+            vec![w_mat, x, w_norm, residual],
+            Shape(vec![rows]),
+            out_dt,
+            FuseHint::MatvecRmsNormAddScale {
+                rows,
+                cols,
+                eps,
+                scale,
+                w_mat,
+                x,
+                w_norm,
+                residual,
+            },
+        ))
+    }
+
     /// Fused Q/K/V matvecs sharing `x`: Metal emits 3 outputs; Call root shape is Q.
     /// Weights may be F16/F32 (matching act) or Q4K with F16 activations (out F16).
     pub fn matvec_qkv(
@@ -595,13 +1489,10 @@ impl Graph {
         if sk != sv || sq.0[1] != sk.0[1] || sx.0[0] != sq.0[1] {
             return Err(IrError::ShapeMismatch);
         }
-        if dk != dq || dv != dq {
-            return Err(IrError::ShapeMismatch);
-        }
         let q_rows = sq.0[0];
         let kv_rows = sk.0[0];
         let cols = sq.0[1];
-        let out_dt = matvec_weight_act_out(dq, dx, cols)?;
+        let out_dt = qkv_weight_dtypes_ok(dq, dk, dv, dx, cols)?;
         Ok(self.call(
             vec![wq, wk, wv, x],
             Shape(vec![q_rows]),
@@ -722,13 +1613,13 @@ impl Graph {
         if sk != sv || sq.0[1] != sk.0[1] || sx.0[0] != sq.0[1] || sn.0[0] != sx.0[0] {
             return Err(IrError::ShapeMismatch);
         }
-        if dk != dq || dv != dq || dn != dx {
+        if dn != dx {
             return Err(IrError::ShapeMismatch);
         }
         let q_rows = sq.0[0];
         let kv_rows = sk.0[0];
         let cols = sq.0[1];
-        let out_dt = matvec_weight_act_out(dq, dx, cols)?;
+        let out_dt = qkv_weight_dtypes_ok(dq, dk, dv, dx, cols)?;
         Ok(self.call(
             vec![wq, wk, wv, x, w_norm],
             Shape(vec![q_rows]),

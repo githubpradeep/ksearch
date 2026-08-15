@@ -29,7 +29,10 @@ pub fn build_tokenizer_from_gguf(g: &Gguf) -> Result<Tokenizer, String> {
 
     let merges_vec: Vec<(String, String)> = merges
         .iter()
-        .filter_map(|m| m.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string())))
+        .filter_map(|m| {
+            m.split_once(' ')
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+        })
         .collect();
 
     let unk_token = g
@@ -47,7 +50,10 @@ pub fn build_tokenizer_from_gguf(g: &Gguf) -> Result<Tokenizer, String> {
 
     let mut tok = Tokenizer::new(bpe);
 
-    let prepend = if g.get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(false) {
+    let prepend = if g
+        .get_bool("tokenizer.ggml.add_space_prefix")
+        .unwrap_or(false)
+    {
         PrependScheme::First
     } else {
         PrependScheme::Never
@@ -92,9 +98,67 @@ pub fn gemma4_chat_prompt(user: &str) -> String {
     format!("<|turn>user\n{user}<turn|>\n<|turn>model\n")
 }
 
+/// Multi-turn Gemma4 chat template. `messages` are `(role, content)` with roles
+/// `system` / `user` / `assistant`. Always opens a `model` generation turn.
+pub fn gemma4_chat_from_messages<R: AsRef<str>, C: AsRef<str>>(messages: &[(R, C)]) -> String {
+    let mut system = String::new();
+    let mut body = String::new();
+    for (role, content) in messages {
+        let role = role.as_ref();
+        let content = content.as_ref();
+        if role == "system" {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(content);
+            continue;
+        }
+        let mapped = if role == "assistant" { "model" } else { "user" };
+        body.push_str("<|turn>");
+        body.push_str(mapped);
+        body.push('\n');
+        body.push_str(content);
+        body.push_str("<turn|>\n");
+    }
+    let mut prompt = String::new();
+    if !system.is_empty() {
+        // Match metal-llm-server / official E2B template: system turns start
+        // with `<|think|>` so the model actually uses the system content.
+        prompt.push_str("<|turn>system\n<|think|>\n");
+        prompt.push_str(&system);
+        prompt.push_str("<turn|>\n");
+    }
+    prompt.push_str(&body);
+    prompt.push_str("<|turn>model\n");
+    prompt
+}
+
 pub fn encode_prompt(tok: &Tokenizer, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
     let enc = tok
         .encode(text, add_special)
         .map_err(|e| format!("encode failed: {e}"))?;
     Ok(enc.get_ids().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma4_chat_from_messages_opens_model_turn() {
+        let prompt = gemma4_chat_from_messages(&[
+            ("system", "be brief"),
+            ("user", "Hi"),
+            ("assistant", "Hi!"),
+            ("user", "again"),
+        ]);
+        assert_eq!(
+            prompt,
+            "<|turn>system\n<|think|>\nbe brief<turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHi!<turn|>\n<|turn>user\nagain<turn|>\n<|turn>model\n"
+        );
+        assert_eq!(
+            gemma4_chat_prompt("Hi"),
+            "<|turn>user\nHi<turn|>\n<|turn>model\n"
+        );
+    }
 }

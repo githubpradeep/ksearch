@@ -80,6 +80,26 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 residual: *residual,
             },
         },
+        FuseHint::RmsNormAddThenRmsNorm {
+            n,
+            eps,
+            y,
+            w_post,
+            residual,
+            w_ffn,
+        } => ScheduledKernel {
+            name: format!("k_rms_add_then_rms_{}", out.0),
+            inputs: vec![*y, *w_post, *residual, *w_ffn],
+            output: out,
+            kind: KernelKind::RmsNormAddThenRmsNorm {
+                n: *n,
+                eps: *eps,
+                y: *y,
+                w_post: *w_post,
+                residual: *residual,
+                w_ffn: *w_ffn,
+            },
+        },
         FuseHint::RmsNormPerHead {
             n_heads,
             hd,
@@ -105,6 +125,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             hd,
             eps,
             with_weight,
+            n_tok,
             x,
             w,
             cos_sin,
@@ -117,9 +138,82 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 hd: *hd,
                 eps: *eps,
                 with_weight: *with_weight,
+                n_tok: *n_tok,
                 x: *x,
                 w: *w,
                 cos_sin: *cos_sin,
+            },
+        },
+        FuseHint::RmsNormPerHeadRopeQ40 {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            x,
+            w,
+            cos_sin,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_rope_q40_{}", out.0),
+            inputs: vec![*x, *w, *cos_sin],
+            output: out,
+            kind: KernelKind::RmsNormPerHeadRopeQ40 {
+                n_heads: *n_heads,
+                hd: *hd,
+                eps: *eps,
+                with_weight: *with_weight,
+                x: *x,
+                w: *w,
+                cos_sin: *cos_sin,
+            },
+        },
+        FuseHint::RmsNormPerHeadQ40 {
+            n_heads,
+            hd,
+            eps,
+            with_weight,
+            x,
+            w,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_q40_{}", out.0),
+            inputs: vec![*x, *w],
+            output: out,
+            kind: KernelKind::RmsNormPerHeadQ40 {
+                n_heads: *n_heads,
+                hd: *hd,
+                eps: *eps,
+                with_weight: *with_weight,
+                x: *x,
+                w: *w,
+            },
+        },
+            FuseHint::RmsNormPerHeadQkvQ40 {
+            n_q,
+            n_kv,
+            hd,
+            eps,
+            n_tok,
+            q,
+            qw,
+            cos_sin,
+            k,
+            kw,
+            v,
+        } => ScheduledKernel {
+            name: format!("k_rms_ph_qkv_q40_{}", out.0),
+            inputs: vec![*q, *qw, *cos_sin, *k, *kw, *v],
+            output: out,
+            kind: KernelKind::RmsNormPerHeadQkvQ40 {
+                n_q: *n_q,
+                n_kv: *n_kv,
+                hd: *hd,
+                eps: *eps,
+                n_tok: *n_tok,
+                q: *q,
+                qw: *qw,
+                cos_sin: *cos_sin,
+                k: *k,
+                kw: *kw,
+                v: *v,
             },
         },
         FuseHint::Rope {
@@ -144,6 +238,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             n,
             scale,
             src,
+            src_dtype,
         } => ScheduledKernel {
             name: format!("k_csl_sc_{}", out.0),
             inputs: vec![*src],
@@ -154,11 +249,212 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 n: *n,
                 scale: *scale,
                 src: *src,
+                src_dtype: *src_dtype,
+            },
+        },
+        FuseHint::CopyScaleIndexed {
+            n,
+            scale,
+            src,
+            idx,
+            src_dtype,
+        } => ScheduledKernel {
+            name: format!("k_csl_sc_idx_{}", out.0),
+            inputs: vec![*src, *idx],
+            output: out,
+            kind: KernelKind::CopyScaleIndexed {
+                n: *n,
+                scale: *scale,
+                src: *src,
+                idx: *idx,
+                src_dtype: *src_dtype,
+            },
+        },
+        FuseHint::CopyScaleIndexedBatch {
+            n,
+            batch,
+            scale,
+            src,
+            idx,
+            src_dtype,
+        } => ScheduledKernel {
+            name: format!("k_csl_sc_idx_b{batch}_{}", out.0),
+            inputs: vec![*src, *idx],
+            output: out,
+            kind: KernelKind::CopyScaleIndexedBatch {
+                n: *n,
+                batch: *batch,
+                scale: *scale,
+                src: *src,
+                idx: *idx,
+                src_dtype: *src_dtype,
+            },
+        },
+        FuseHint::MatvecBatch {
+            rows,
+            cols,
+            batch,
+            w,
+            x,
+        } => {
+            let wd = graph.shape_dtype(*w)?.1;
+            ScheduledKernel {
+                name: format!("k_matvec_b{batch}_{}", out.0),
+                inputs: vec![*w, *x],
+                output: out,
+                kind: KernelKind::MatvecBatch {
+                    rows: *rows,
+                    cols: *cols,
+                    batch: *batch,
+                    matrix: *w,
+                    vector: *x,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::RmsNormRows {
+            n,
+            rows,
+            eps,
+            x,
+            w,
+        } => ScheduledKernel {
+            name: format!("k_rms_rows_{}", out.0),
+            inputs: vec![*x, *w],
+            output: out,
+            kind: KernelKind::RmsNormRows {
+                n: *n,
+                rows: *rows,
+                eps: *eps,
+                x: *x,
+                w: *w,
+            },
+        },
+        FuseHint::RmsNormAddRows {
+            n,
+            rows,
+            eps,
+            scale,
+            x,
+            w,
+            residual,
+        } => ScheduledKernel {
+            name: format!("k_rms_add_rows_{}", out.0),
+            inputs: vec![*x, *w, *residual],
+            output: out,
+            kind: KernelKind::RmsNormAddRows {
+                n: *n,
+                rows: *rows,
+                eps: *eps,
+                scale: *scale,
+                x: *x,
+                w: *w,
+                residual: *residual,
+            },
+        },
+        FuseHint::RmsNormAddThenRmsNormRows {
+            n,
+            rows,
+            eps,
+            y,
+            w_post,
+            residual,
+            w_ffn,
+        } => ScheduledKernel {
+            name: format!("k_rms_add_then_rms_rows_{}", out.0),
+            inputs: vec![*y, *w_post, *residual, *w_ffn],
+            output: out,
+            kind: KernelKind::RmsNormAddThenRmsNormRows {
+                n: *n,
+                rows: *rows,
+                eps: *eps,
+                y: *y,
+                w_post: *w_post,
+                residual: *residual,
+                w_ffn: *w_ffn,
+            },
+        },
+        FuseHint::SdpaNaiveBatch {
+            n_q,
+            n_kv,
+            n_tok,
+            hd,
+            max_t,
+            q,
+            k,
+            v,
+            meta,
+            kv_dtype,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_b{n_tok}_{}", out.0),
+            inputs: vec![*q, *k, *v, *meta],
+            output: out,
+            kind: KernelKind::SdpaNaiveBatch {
+                n_q: *n_q,
+                n_kv: *n_kv,
+                n_tok: *n_tok,
+                hd: *hd,
+                max_t: *max_t,
+                q: *q,
+                k: *k,
+                v: *v,
+                meta: *meta,
+                kv_dtype: *kv_dtype,
+            },
+        },
+        FuseHint::SdpaMwgPartBatch {
+            n_q,
+            n_kv,
+            n_tok,
+            hd,
+            max_t,
+            nwg,
+            q,
+            k,
+            v,
+            meta,
+            kv_dtype,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_mwg_part_b{n_tok}_{}", out.0),
+            inputs: vec![*q, *k, *v, *meta],
+            output: out,
+            kind: KernelKind::SdpaMwgPartBatch {
+                n_q: *n_q,
+                n_kv: *n_kv,
+                n_tok: *n_tok,
+                hd: *hd,
+                max_t: *max_t,
+                nwg: *nwg,
+                q: *q,
+                k: *k,
+                v: *v,
+                meta: *meta,
+                kv_dtype: *kv_dtype,
+            },
+        },
+        FuseHint::SdpaMwgReduceBatch {
+            n_q,
+            n_tok,
+            hd,
+            nwg,
+            tmp,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_mwg_red_b{n_tok}_{}", out.0),
+            inputs: vec![*tmp],
+            output: out,
+            kind: KernelKind::SdpaMwgReduceBatch {
+                n_q: *n_q,
+                n_tok: *n_tok,
+                hd: *hd,
+                nwg: *nwg,
+                tmp: *tmp,
             },
         },
         FuseHint::GeluMul {
             n,
             up_off,
+            inner,
+            up_stride,
             gate,
             up,
         } => ScheduledKernel {
@@ -168,6 +464,8 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             kind: KernelKind::GeluMul {
                 n: *n,
                 up_off: *up_off,
+                inner: *inner,
+                up_stride: *up_stride,
                 gate: *gate,
                 up: *up,
             },
@@ -194,6 +492,120 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 },
             }
         }
+        FuseHint::MatvecGeluMul {
+            rows,
+            cols,
+            ctx_off,
+            w,
+            x,
+            ctx,
+        } => {
+            let wd = graph.shape_dtype(*w)?.1;
+            ScheduledKernel {
+                name: format!("k_mv_gelu_mul_{}", out.0),
+                inputs: vec![*w, *x, *ctx],
+                output: out,
+                kind: KernelKind::MatvecGeluMul {
+                    rows: *rows,
+                    cols: *cols,
+                    ctx_off: *ctx_off,
+                    w: *w,
+                    x: *x,
+                    ctx: *ctx,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::MatvecGeluMulProjRmsAddScale {
+            gate_rows,
+            cols,
+            proj_rows,
+            ctx_off,
+            eps,
+            scale,
+            w_gate,
+            x,
+            ctx,
+            w_proj,
+            w_norm,
+            residual,
+        } => {
+            let wd = graph.shape_dtype(*w_gate)?.1;
+            ScheduledKernel {
+                name: format!("k_mv_gelu_proj_rms_{}", out.0),
+                inputs: vec![*w_gate, *x, *ctx, *w_proj, *w_norm, *residual],
+                output: out,
+                kind: KernelKind::MatvecGeluMulProjRmsAddScale {
+                    gate_rows: *gate_rows,
+                    cols: *cols,
+                    proj_rows: *proj_rows,
+                    ctx_off: *ctx_off,
+                    eps: *eps,
+                    scale: *scale,
+                    w_gate: *w_gate,
+                    x: *x,
+                    ctx: *ctx,
+                    w_proj: *w_proj,
+                    w_norm: *w_norm,
+                    residual: *residual,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::MatvecRmsNormAdd {
+            rows,
+            cols,
+            eps,
+            w_mat,
+            x,
+            w_norm,
+            residual,
+        } => {
+            let wd = graph.shape_dtype(*w_mat)?.1;
+            ScheduledKernel {
+                name: format!("k_mv_rms_add_{}", out.0),
+                inputs: vec![*w_mat, *x, *w_norm, *residual],
+                output: out,
+                kind: KernelKind::MatvecRmsNormAdd {
+                    rows: *rows,
+                    cols: *cols,
+                    eps: *eps,
+                    w_mat: *w_mat,
+                    x: *x,
+                    w_norm: *w_norm,
+                    residual: *residual,
+                    weight_dtype: wd,
+                },
+            }
+        }
+        FuseHint::MatvecRmsNormAddScale {
+            rows,
+            cols,
+            eps,
+            scale,
+            w_mat,
+            x,
+            w_norm,
+            residual,
+        } => {
+            let wd = graph.shape_dtype(*w_mat)?.1;
+            ScheduledKernel {
+                name: format!("k_mv_rms_add_sc_{}", out.0),
+                inputs: vec![*w_mat, *x, *w_norm, *residual],
+                output: out,
+                kind: KernelKind::MatvecRmsNormAddScale {
+                    rows: *rows,
+                    cols: *cols,
+                    eps: *eps,
+                    scale: *scale,
+                    w_mat: *w_mat,
+                    x: *x,
+                    w_norm: *w_norm,
+                    residual: *residual,
+                    weight_dtype: wd,
+                },
+            }
+        }
         FuseHint::MatvecQkv {
             q_rows,
             kv_rows,
@@ -203,7 +615,9 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             wv,
             x,
         } => {
-            let wd = graph.shape_dtype(*wq)?.1;
+            let wq_dtype = graph.shape_dtype(*wq)?.1;
+            let wk_dtype = graph.shape_dtype(*wk)?.1;
+            let wv_dtype = graph.shape_dtype(*wv)?.1;
             ScheduledKernel {
                 name: format!("k_mv_qkv_{}", out.0),
                 inputs: vec![*wq, *wk, *wv, *x],
@@ -216,7 +630,9 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                     wk: *wk,
                     wv: *wv,
                     x: *x,
-                    weight_dtype: wd,
+                    wq_dtype,
+                    wk_dtype,
+                    wv_dtype,
                 },
             }
         }
@@ -286,7 +702,9 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             wk,
             wv,
         } => {
-            let wd = graph.shape_dtype(*wq)?.1;
+            let wq_dtype = graph.shape_dtype(*wq)?.1;
+            let wk_dtype = graph.shape_dtype(*wk)?.1;
+            let wv_dtype = graph.shape_dtype(*wv)?.1;
             ScheduledKernel {
                 name: format!("k_rms_mv_qkv_{}", out.0),
                 inputs: vec![*wq, *wk, *wv, *x, *w_norm],
@@ -302,30 +720,89 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                     wq: *wq,
                     wk: *wk,
                     wv: *wv,
-                    weight_dtype: wd,
+                    wq_dtype,
+                    wk_dtype,
+                    wv_dtype,
                 },
             }
         }
         FuseHint::SdpaNaive {
             n_q,
+            n_kv,
             hd,
             max_t,
             q,
             k,
             v,
             meta,
+            kv_dtype,
         } => ScheduledKernel {
             name: format!("k_sdpa_naive_{}", out.0),
             inputs: vec![*q, *k, *v, *meta],
             output: out,
             kind: KernelKind::SdpaNaive {
                 n_q: *n_q,
+                n_kv: *n_kv,
                 hd: *hd,
                 max_t: *max_t,
                 q: *q,
                 k: *k,
                 v: *v,
                 meta: *meta,
+                kv_dtype: *kv_dtype,
+            },
+        },
+        FuseHint::SdpaMwgPart {
+            n_q,
+            n_kv,
+            hd,
+            max_t,
+            nwg,
+            q,
+            k,
+            v,
+            meta,
+            kv_dtype,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_mwg_part_{}", out.0),
+            inputs: vec![*q, *k, *v, *meta],
+            output: out,
+            kind: KernelKind::SdpaMwgPart {
+                n_q: *n_q,
+                n_kv: *n_kv,
+                hd: *hd,
+                max_t: *max_t,
+                nwg: *nwg,
+                q: *q,
+                k: *k,
+                v: *v,
+                meta: *meta,
+                kv_dtype: *kv_dtype,
+            },
+        },
+        FuseHint::SdpaMwgReduce {
+            n_q,
+            hd,
+            nwg,
+            tmp,
+        } => ScheduledKernel {
+            name: format!("k_sdpa_mwg_reduce_{}", out.0),
+            inputs: vec![*tmp],
+            output: out,
+            kind: KernelKind::SdpaMwgReduce {
+                n_q: *n_q,
+                hd: *hd,
+                nwg: *nwg,
+                tmp: *tmp,
+            },
+        },
+        FuseHint::QuantizeQ40 { n, src } => ScheduledKernel {
+            name: format!("k_q40_{}", out.0),
+            inputs: vec![*src],
+            output: out,
+            kind: KernelKind::QuantizeQ40 {
+                n: *n,
+                src: *src,
             },
         },
         FuseHint::SoftcapArgmax { n, cap, x } => ScheduledKernel {
@@ -358,14 +835,26 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
         }
         Op::ScaleConst { x, scale } => {
             let n = graph.shape_dtype(out)?.0.numel();
+            // Fold scale(add/mul(...)) into one elementwise (PLE combine).
+            let (expr, inputs) = match &graph.node(*x)?.op {
+                Op::Add { .. } | Op::Mul { .. } => {
+                    let mut inputs = Vec::new();
+                    let inner = build_elem_expr(graph, *x, &mut inputs)?;
+                    (
+                        ElemExpr::Scale(Box::new(inner), *scale),
+                        inputs,
+                    )
+                }
+                _ => (
+                    ElemExpr::Scale(Box::new(ElemExpr::Load(0)), *scale),
+                    vec![*x],
+                ),
+            };
             ScheduledKernel {
                 name: format!("k_scale_{}", out.0),
-                inputs: vec![*x],
+                inputs,
                 output: out,
-                kind: KernelKind::Elementwise {
-                    n,
-                    expr: ElemExpr::Scale(Box::new(ElemExpr::Load(0)), *scale),
-                },
+                kind: KernelKind::Elementwise { n, expr },
             }
         }
         Op::Add { .. } | Op::Mul { .. } => {

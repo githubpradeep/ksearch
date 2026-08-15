@@ -4,12 +4,14 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use ksearch_codegen::{beam_search_matvec, lower_to_metal, lower_with_schedule, CodegenError};
 use ksearch_gemma::GemmaPrimModel;
-use ksearch_gguf::{
-    build_tokenizer_from_gguf, encode_prompt, gemma4_chat_prompt, Gguf,
-};
+use ksearch_gguf::{build_tokenizer_from_gguf, encode_prompt, gemma4_chat_prompt, Gguf};
 use ksearch_ir::{DType, Graph, OptSchedule, Shape};
 use ksearch_metal::MetalContext;
 use std::path::{Path, PathBuf};
+
+mod gemma4_chat;
+mod scheduler;
+mod serve;
 
 const DEFAULT_GGUF: &str = "~/models/gemma-4-e2b/gemma-4-E2B-it-Q4_K_M.gguf";
 const ESSAY_PROMPT: &str =
@@ -62,6 +64,19 @@ enum Cmd {
         #[arg(long, default_value_t = 1024)]
         max_seq: usize,
     },
+    /// OpenAI-compatible HTTP server (`/v1/chat/completions`).
+    Serve {
+        #[arg(long, default_value = DEFAULT_GGUF)]
+        gguf: String,
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// KV slot capacity (tokens). Default 16k like metal-llm-server; model ctx is ~128k.
+        #[arg(long, default_value_t = 16384)]
+        max_seq: usize,
+        /// Concurrent KV slots (llama.cpp `--parallel`).
+        #[arg(long, default_value_t = 4)]
+        slots: usize,
+    },
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -91,6 +106,22 @@ fn main() -> Result<()> {
             n_predict_essay,
             max_seq,
         } => bench(expand_home(&gguf), n_predict_hi, n_predict_essay, max_seq),
+        Cmd::Serve {
+            gguf,
+            port,
+            max_seq,
+            slots,
+        } => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(serve::run_server(serve::ServeArgs {
+                gguf: expand_home(&gguf),
+                port,
+                max_seq,
+                slots,
+            }))
+        }
     }
 }
 
@@ -101,12 +132,7 @@ fn encode_user_prompt(gguf: &Path, text: &str) -> Result<Vec<u32>> {
     encode_prompt(&tok, &chat, true).map_err(|e| anyhow::anyhow!(e))
 }
 
-fn bench(
-    gguf: PathBuf,
-    n_predict_hi: usize,
-    n_predict_essay: usize,
-    max_seq: usize,
-) -> Result<()> {
+fn bench(gguf: PathBuf, n_predict_hi: usize, n_predict_essay: usize, max_seq: usize) -> Result<()> {
     eprintln!("bench gguf={}", gguf.display());
     let hi_ids = encode_user_prompt(&gguf, "Hi")?;
     let essay_ids = encode_user_prompt(&gguf, ESSAY_PROMPT)?;
@@ -119,9 +145,7 @@ fn bench(
         .as_ref()
         .map(|v| v.decode(&hi.tokens, true))
         .unwrap_or_default();
-    let hi_pass = hi_text.contains("Hi!")
-        && hi_text.contains("help")
-        && !hi.tokens.is_empty();
+    let hi_pass = hi_text.contains("Hi!") && hi_text.contains("help") && !hi.tokens.is_empty();
     println!(
         "hi:     prefill={:.1} tok/s  decode={:.1} tok/s  pass={}  text={:?}",
         hi.prefill_tok_s(),
@@ -295,9 +319,8 @@ fn matvec(rows: usize, cols: usize, beam: bool) -> Result<()> {
         let chip = ctx.device_name();
         if std::env::var_os("KSEARCH_BEAM_FORCE").is_some() {
             let key = ksearch_codegen::plan_key("matvec_f16_nr", &[rows, cols], &chip);
-            let _ = std::fs::remove_file(
-                ksearch_codegen::beam_cache_dir().join(format!("{key}.txt")),
-            );
+            let _ =
+                std::fs::remove_file(ksearch_codegen::beam_cache_dir().join(format!("{key}.txt")));
         }
         let result = beam_search_matvec(&g, y, &chip, time_one)?;
         let gflops = (2.0 * rows as f64 * cols as f64) / (result.ms * 1e6);
@@ -360,4 +383,3 @@ fn kernel_tg(kernel: &ksearch_codegen::MetalKernelSource) -> u64 {
         _ => 32,
     }
 }
-
