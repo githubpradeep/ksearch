@@ -1286,6 +1286,45 @@ impl Graph {
             FuseHint::MatvecGateUpGelu {
                 rows,
                 cols,
+                batch: 1,
+                gate,
+                up,
+                x,
+            },
+        ))
+    }
+
+    /// Batched gate∥up+GeLU (MTP verify seq 2..=8).
+    pub fn matvec_gate_up_gelu_batch(
+        &mut self,
+        gate: TensorId,
+        up: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        if batch == 1 {
+            return self.matvec_gate_up_gelu(gate, up, x);
+        }
+        let (sg, dg) = self.shape_dtype(gate)?;
+        let (su, du) = self.shape_dtype(up)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if sg.rank() != 2 || su != sg || !dx.is_float() {
+            return Err(IrError::ShapeMismatch);
+        }
+        if du != dg || sx.numel() < batch * sg.0[1] {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sg.0[0];
+        let cols = sg.0[1];
+        let out_dt = matvec_weight_act_out(dg, dx, cols)?;
+        Ok(self.call(
+            vec![gate, up, x],
+            Shape(vec![batch * rows]),
+            out_dt,
+            FuseHint::MatvecGateUpGelu {
+                rows,
+                cols,
+                batch,
                 gate,
                 up,
                 x,
@@ -1501,6 +1540,50 @@ impl Graph {
                 q_rows,
                 kv_rows,
                 cols,
+                batch: 1,
+                wq,
+                wk,
+                wv,
+                x,
+            },
+        ))
+    }
+
+    /// Batched fused Q/K/V (MTP verify): `x` is `batch*cols` F16, outs are `batch*rows`.
+    pub fn matvec_qkv_batch(
+        &mut self,
+        wq: TensorId,
+        wk: TensorId,
+        wv: TensorId,
+        x: TensorId,
+        batch: usize,
+    ) -> Result<TensorId, IrError> {
+        if batch == 1 {
+            return self.matvec_qkv(wq, wk, wv, x);
+        }
+        let (sq, dq) = self.shape_dtype(wq)?;
+        let (sk, dk) = self.shape_dtype(wk)?;
+        let (sv, dv) = self.shape_dtype(wv)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if sq.rank() != 2 || sk.rank() != 2 || sv.rank() != 2 {
+            return Err(IrError::ShapeMismatch);
+        }
+        if sk != sv || sq.0[1] != sk.0[1] || sx.numel() < batch * sq.0[1] {
+            return Err(IrError::ShapeMismatch);
+        }
+        let q_rows = sq.0[0];
+        let kv_rows = sk.0[0];
+        let cols = sq.0[1];
+        let out_dt = qkv_weight_dtypes_ok(dq, dk, dv, dx, cols)?;
+        Ok(self.call(
+            vec![wq, wk, wv, x],
+            Shape(vec![batch * q_rows]),
+            out_dt,
+            FuseHint::MatvecQkv {
+                q_rows,
+                kv_rows,
+                cols,
+                batch,
                 wq,
                 wk,
                 wv,
@@ -1649,7 +1732,36 @@ impl Graph {
             vec![x],
             Shape(vec![1]),
             DType::F32, // index must stay F32 — half cannot represent vocab ids
-            FuseHint::SoftcapArgmax { n, cap, x },
+            FuseHint::SoftcapArgmax {
+                n,
+                rows: 1,
+                cap,
+                x,
+            },
+        ))
+    }
+
+    /// Softcap+argmax over `rows` packed rows of length `n` (flat `rows*n` input).
+    pub fn softcap_argmax_rows(
+        &mut self,
+        x: TensorId,
+        n: usize,
+        rows: usize,
+        cap: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || rows == 0 || n == 0 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let need = n.saturating_mul(rows);
+        if sx.numel() < need {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x],
+            Shape(vec![rows]),
+            DType::F32,
+            FuseHint::SoftcapArgmax { n, rows, cap, x },
         ))
     }
 }

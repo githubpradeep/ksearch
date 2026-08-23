@@ -43,20 +43,22 @@ pub fn beam_matvec_candidates() -> Vec<OptSchedule> {
     out
 }
 
-/// Discrete TG / UNROLL / NR0 candidates for Q4_K.
-/// Lower clamps TG to `cols/vec` (vec=256 when K%256==0) and ignores `vec` here.
+/// Q4_K coop candidates: the AST writes `nsg*4` rows per Nr4 body (KQ_NR0=4
+/// per simdgroup is baked into the lowering), so the real knobs are nsg
+/// (simdgroups/TG: 1/2/4 → 32/64/128 threads), the row ratio (4 = classic,
+/// 8 = two Nr4 bodies per superblock for short-K ILP) and unroll. Includes
+/// both hand-tuned ggml shapes (nsg2/ratio4, nsg4/ratio4).
 pub fn beam_matvec_q4k_candidates() -> Vec<OptSchedule> {
     let mut out = Vec::new();
-    // Prefer small TG seeds; apply_matvec_sched clamps to useful K-chunks (often 6–24).
-    for &tg in &[8u64, 16, 32, 64] {
-        for &unroll in &[1u32, 2] {
-            for &nr0 in &[4u32, 8, 16] {
+    for &nsg in &[1u32, 2, 4] {
+        for &ratio in &[4u32, 8] {
+            for &unroll in &[1u32, 2] {
                 out.push(OptSchedule {
-                    tg,
+                    tg: (nsg * 32) as u64,
                     vec: 1,
                     unroll,
-                    nsg: 2,
-                    nr0,
+                    nsg,
+                    nr0: nsg * ratio,
                 });
             }
         }

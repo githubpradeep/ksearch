@@ -13,11 +13,31 @@ struct Pending {
     enc: ComputeCommandEncoder,
 }
 
+/// Dispatch telemetry (decode-cost audit): count of kernel dispatches and
+/// total host CPU nanos spent inside encode. Read-and-reset via [`take_telemetry`].
+static DISPATCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ENQUEUE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (dispatches, host-enqueue seconds) since last call; resets both counters.
+pub fn take_telemetry() -> (u64, f64) {
+    use std::sync::atomic::Ordering;
+    (
+        DISPATCH_COUNT.swap(0, Ordering::Relaxed),
+        ENQUEUE_NANOS.swap(0, Ordering::Relaxed) as f64 / 1e9,
+    )
+}
+
+/// Re-export for host-side type hints.
+pub type BufferAlias = Buffer;
+
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
     /// Open CB + compute encoder (many dispatches, one encoder).
     pending: RefCell<Option<Pending>>,
+    /// GPU timestamp counter buffer for phase profiling (KSEARCH_PHASE_GPUTIME).
+    phase_csb: RefCell<Option<CounterSampleBuffer>>,
+    phase_index: std::cell::Cell<usize>,
     /// Committed CBs not yet waited on (retain until synchronize).
     inflight: RefCell<Vec<CommandBuffer>>,
 }
@@ -36,8 +56,66 @@ impl MetalContext {
             device,
             queue,
             pending: RefCell::new(None),
+            phase_csb: RefCell::new(None),
+            phase_index: std::cell::Cell::new(0),
             inflight: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Enable GPU-timestamp sampling (Apple "timestamp" counter set).
+    /// Idempotent; returns Err if the device lacks the counter set.
+    pub fn init_phase_counters(&self, max_samples: u64) -> Result<()> {
+        if self.phase_csb.borrow().is_some() {
+            return Ok(());
+        }
+        let sets = self.device.counter_sets();
+        let ts = sets
+            .iter()
+            .find(|s| s.name().to_ascii_lowercase().contains("timestamp"))
+            .ok_or_else(|| anyhow!("device has no timestamp counter set"))?;
+        let desc = CounterSampleBufferDescriptor::new();
+        desc.set_counter_set(ts);
+        desc.set_sample_count(max_samples);
+        desc.set_storage_mode(MTLStorageMode::Private);
+        let csb = self
+            .device
+            .new_counter_sample_buffer_with_descriptor(&desc)
+            .map_err(|e| anyhow!("counter sample buffer: {e}"))?;
+        self.phase_index.set(0);
+        *self.phase_csb.borrow_mut() = Some(csb);
+        Ok(())
+    }
+
+    /// Sample one GPU timestamp at this point in the open encoder
+    /// (`with_barrier = false` keeps execution pipelined).
+    pub fn phase_mark(&self) {
+        if let Some(csb) = self.phase_csb.borrow().as_ref() {
+            if let Some(p) = self.pending.borrow_mut().as_mut() {
+                let i = self.phase_index.get();
+                p.enc
+                    .sample_counters_in_buffer(csb, i as NSUInteger, false);
+                self.phase_index.set(i + 1);
+            }
+        }
+    }
+
+    /// Per-interval GPU times in ms between consecutive marks (len = marks-1).
+    pub fn resolve_phase_times_ms(&self) -> Vec<f64> {
+        let n = self.phase_index.get();
+        if n < 2 {
+            return Vec::new();
+        }
+        let vals = {
+            let borrow = self.phase_csb.borrow();
+            let csb = borrow.as_ref().expect("init_phase_counters first");
+            csb.resolve_counter_range(NSRange {
+                location: 0,
+                length: n as NSUInteger,
+            })
+        };
+        vals.windows(2)
+            .map(|w| w[1].saturating_sub(w[0]) as f64 / 1e6)
+            .collect()
     }
 
     pub fn device_name(&self) -> String {
@@ -88,6 +166,14 @@ impl MetalContext {
     pub fn buffer_empty_bytes(&self, n: usize) -> Buffer {
         self.device
             .new_buffer(n as u64, MTLResourceOptions::StorageModeShared)
+    }
+
+    /// Raw byte range read from a buffer (forces sync).
+    pub fn read_bytes(&self, buf: &Buffer, offset_bytes: usize, len_bytes: usize) -> Vec<u8> {
+        unsafe {
+            let ptr = (buf.contents() as *const u8).add(offset_bytes);
+            std::slice::from_raw_parts(ptr, len_bytes).to_vec()
+        }
     }
 
     pub fn read_f32(&self, buf: &Buffer, n: usize) -> Vec<f32> {
@@ -201,6 +287,34 @@ impl MetalContext {
         }
     }
 
+    /// GPU buffer→buffer copy on the open command buffer (no CPU wait).
+    /// Ends any open compute encoder, blits, then opens a fresh compute encoder.
+    pub fn blit_copy_bytes(
+        &self,
+        src: &Buffer,
+        src_off: u64,
+        dst: &Buffer,
+        dst_off: u64,
+        nbytes: u64,
+    ) {
+        autoreleasepool(|| {
+            let mut slot = self.pending.borrow_mut();
+            if slot.is_none() {
+                let cmd = self.queue.new_command_buffer().to_owned();
+                *slot = Some(Pending {
+                    cmd: cmd.clone(),
+                    enc: cmd.new_compute_command_encoder().to_owned(),
+                });
+            }
+            let p = slot.as_mut().unwrap();
+            p.enc.end_encoding();
+            let blit = p.cmd.new_blit_command_encoder();
+            blit.copy_from_buffer(src, src_off, dst, dst_off, nbytes);
+            blit.end_encoding();
+            p.enc = p.cmd.new_compute_command_encoder().to_owned();
+        });
+    }
+
     /// Commit pending work and wait for all in-flight CBs (call before host reads).
     pub fn synchronize(&self) -> Result<()> {
         autoreleasepool(|| {
@@ -267,6 +381,34 @@ impl MetalContext {
 
     /// Multi-output encode with per-buffer byte offsets.
     pub fn encode_offsets_multi(
+        &self,
+        pipeline: &ComputePipelineState,
+        kernel: &MetalKernelSource,
+        inputs: &[&Buffer],
+        input_byte_offsets: &[u64],
+        outputs: &[&Buffer],
+        output_byte_offsets: &[u64],
+        tg_size: u64,
+    ) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let r = self.encode_offsets_multi_inner(
+            pipeline,
+            kernel,
+            inputs,
+            input_byte_offsets,
+            outputs,
+            output_byte_offsets,
+            tg_size,
+        );
+        DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ENQUEUE_NANOS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        r
+    }
+
+    fn encode_offsets_multi_inner(
         &self,
         pipeline: &ComputePipelineState,
         kernel: &MetalKernelSource,

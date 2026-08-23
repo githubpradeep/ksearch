@@ -1,6 +1,7 @@
 //! Gemma4 forward — Thesis A [`GemmaPrimModel`] only.
 
 mod gemma_prim;
+pub mod mtp;
 mod kv_pool;
 mod sample;
 

@@ -20,6 +20,7 @@ pub use schedule::{is_primitive_region, lower_kernel, schedule};
 pub use ksearch_ir::OptSchedule;
 
 use ksearch_ir::{DType, Graph, IrError, Op, Shape, TensorId};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
@@ -78,9 +79,9 @@ pub fn lower_to_metal_chip(
         )));
     }
     let sched = match matvec_weight_dtype(graph, out)? {
-        Some(DType::Q4K) => load_plan("matvec_q4k", &matvec_dims(graph, out)?, chip)
+        Some(DType::Q4K) => load_plan("matvec_q4k_v2", &matvec_dims(graph, out)?, chip)
             .unwrap_or_else(OptSchedule::q4k_default),
-        Some(DType::Q6K) => load_plan("matvec_q6k", &matvec_dims(graph, out)?, chip)
+        Some(DType::Q6K) => load_plan("matvec_q6k_v2", &matvec_dims(graph, out)?, chip)
             .unwrap_or_else(OptSchedule::q4k_default),
         Some(DType::F16) => load_plan("matvec_f16_nr", &matvec_dims(graph, out)?, chip)
             .unwrap_or_default(),
@@ -175,6 +176,50 @@ pub fn beam_tg_candidates(rows: usize) -> Vec<u64> {
         .collect()
 }
 
+/// Append one timing to the tuner dataset (unless `KSEARCH_TUNER_LOG=0`).
+fn log_tuner_sample(kind: &str, rows: usize, cols: usize, chip: &str, sched: OptSchedule, ms: f64) {
+    if std::env::var("KSEARCH_TUNER_LOG").is_ok_and(|v| v == "0") {
+        return;
+    }
+    let _ = ksearch_tuner::dataset::append_sample(&ksearch_tuner::Sample {
+        kind: kind.to_string(),
+        rows,
+        cols,
+        chip: chip.to_string(),
+        sched: sched.into(),
+        ms,
+        ts: ksearch_tuner::now_unix(),
+    });
+}
+
+/// Retrain + persist the cost model once enough fresh samples accumulated.
+/// Process-global counter keeps `warm_matvec_plans` from retraining per shape.
+fn tuner_maybe_retrain(chip: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAST_TRAINED: AtomicUsize = AtomicUsize::new(0);
+    const MIN_TRAIN: usize = 96;
+    const RETRAIN_EVERY: usize = 24;
+    let samples = ksearch_tuner::dataset::load_samples(Some(chip));
+    let total = samples.len();
+    if total < MIN_TRAIN
+        || total.saturating_sub(LAST_TRAINED.load(Ordering::Relaxed)) < RETRAIN_EVERY
+    {
+        return;
+    }
+    let model = ksearch_tuner::CostModel::train(
+        &samples,
+        chip,
+        &ksearch_tuner::gbdt::GbdtConfig::default(),
+    );
+    match model.save() {
+        Ok(p) => {
+            LAST_TRAINED.store(total, Ordering::Relaxed);
+            eprintln!("[tuner] cost model updated: {total} samples → {}", p.display());
+        }
+        Err(e) => eprintln!("[tuner] model save failed: {e}"),
+    }
+}
+
 pub fn beam_search_matvec<F>(
     graph: &Graph,
     out: TensorId,
@@ -197,12 +242,17 @@ where
         _ => return Err(CodegenError::Msg("beam_search_matvec: not matvec".into())),
     };
     let dims = [rows, cols];
-    let plan_kind = match matvec_weight_dtype(graph, out)? {
+    let dtype = matvec_weight_dtype(graph, out)?;
+    // `_v2` cache keys: schedules are honored as-is (no clamp), so pre-tuner
+    // plans must not be reused.
+    let plan_kind = match dtype {
         Some(DType::F16) => "matvec_f16_nr",
-        Some(DType::Q4K) => "matvec_q4k",
-        Some(DType::Q6K) => "matvec_q6k",
+        Some(DType::Q4K) => "matvec_q4k_v2",
+        Some(DType::Q6K) => "matvec_q6k_v2",
         _ => "matvec_f32",
     };
+    // Dataset/feature kind keeps the historical name.
+    let sample_kind = plan_kind.strip_suffix("_v2").unwrap_or(plan_kind);
     let force = std::env::var("KSEARCH_BEAM_FORCE").is_ok();
     if !force {
         if let Some(sched) = load_plan(plan_kind, &dims, chip) {
@@ -217,26 +267,88 @@ where
         }
     }
 
-    let untuned = OptSchedule::untuned();
-    let mut best_sched = untuned;
-    let mut best_ms = f64::INFINITY;
-    let mut best_kernel = lower_with_schedule(graph, out, untuned)?;
-
-    let candidates = match matvec_weight_dtype(graph, out)? {
+    // Candidate space; untuned baseline first so every mode has a floor.
+    let mut candidates = match dtype {
         Some(DType::Q4K) | Some(DType::Q6K) => beam_matvec_q4k_candidates(),
         _ => beam_matvec_candidates(),
     };
+    candidates.insert(0, OptSchedule::untuned());
+
+    // Lower once per candidate; drop schedules that render identically AND
+    // launch identically (Q4/Q6 clamping collapses many seeds into one kernel;
+    // the launch hint depends on the schedule, so hash both).
+    let mut uniq: Vec<(OptSchedule, MetalKernelSource)> = Vec::with_capacity(candidates.len());
+    let mut seen: std::collections::HashSet<u64> = Default::default();
     for sched in candidates {
         let kernel = lower_with_schedule(graph, out, sched)?;
-        let ms = time_ms(&kernel)?;
-        if ms < best_ms {
-            best_ms = ms;
-            best_sched = sched;
-            best_kernel = kernel;
+        let mut h = DefaultHasher::new();
+        kernel.source.hash(&mut h);
+        sched.hash(&mut h);
+        if seen.insert(h.finish()) {
+            uniq.push((sched, kernel));
         }
     }
 
+    let scheds: Vec<ksearch_tuner::Sched> = uniq.iter().map(|(s, _)| (*s).into()).collect();
+    let ctx = ksearch_tuner::SearchCtx {
+        kind: sample_kind,
+        rows,
+        cols,
+        chip,
+    };
+    let tuner_cfg = ksearch_tuner::TunerConfig::default();
+    let mut gs = ksearch_tuner::GuidedSearch::new(tuner_cfg.clone(), ctx, &scheds);
+
+    let (best_sched, best_ms, best_kernel) = if gs.should_guide() {
+        eprintln!(
+            "[tuner] guiding {plan_kind} {rows}x{cols}: {} unique kernels, budget {}",
+            uniq.len(),
+            tuner_cfg.budget
+        );
+        while !gs.should_stop() {
+            let batch = gs.next_batch();
+            if batch.is_empty() {
+                break;
+            }
+            for idx in batch {
+                let (sched, kernel) = &uniq[idx];
+                let ms = time_ms(kernel)?;
+                log_tuner_sample(sample_kind, rows, cols, chip, *sched, ms);
+                gs.record(idx, ms);
+            }
+        }
+        let (idx, ms) = gs
+            .best()
+            .ok_or_else(|| CodegenError::Msg("tuner measured nothing".into()))?;
+        eprintln!(
+            "[tuner] {rows}x{cols} → tg={} vec={} unroll={} nr0={} after {} timings (grid would be {})",
+            uniq[idx].0.tg,
+            uniq[idx].0.vec,
+            uniq[idx].0.unroll,
+            uniq[idx].0.nr0,
+            gs.n_measured(),
+            uniq.len()
+        );
+        (uniq[idx].0, ms, uniq[idx].1.clone())
+    } else {
+        // Classic grid over unique kernels — also feeds the dataset.
+        let mut best_sched = OptSchedule::untuned();
+        let mut best_ms = f64::INFINITY;
+        let mut best_kernel = uniq[0].1.clone();
+        for (sched, kernel) in &uniq {
+            let ms = time_ms(kernel)?;
+            log_tuner_sample(sample_kind, rows, cols, chip, *sched, ms);
+            if ms < best_ms {
+                best_ms = ms;
+                best_sched = *sched;
+                best_kernel = kernel.clone();
+            }
+        }
+        (best_sched, best_ms, best_kernel)
+    };
+
     save_plan(plan_kind, &dims, chip, best_sched, best_ms);
+    tuner_maybe_retrain(chip);
     Ok(BeamSearchResult {
         schedule: best_sched,
         ms: best_ms,

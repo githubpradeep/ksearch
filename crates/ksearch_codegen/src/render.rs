@@ -504,9 +504,9 @@ inline void ksearch_q4k_coop_frag_nr4_dev(
     }
     float2 dd = float2(*(device const half2*)dh);
     sumf[row] += dd[0] * ((acc1[0] + (1.0f / 256.0f) * acc1[1]) * float(sc8[0]) +
-                           (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1]) * (1.0f / 16.0f) +
-                           (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4]) +
-                           (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5]) * (1.0f / 16.0f)) -
+                          (acc1[2] + (1.0f / 256.0f) * acc1[3]) * float(sc8[1]) * (1.0f / 16.0f) +
+                          (acc2[0] + (1.0f / 256.0f) * acc2[1]) * float(sc8[4]) +
+                          (acc2[2] + (1.0f / 256.0f) * acc2[3]) * float(sc8[5]) * (1.0f / 16.0f)) -
                   dd[1] * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
                            sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
     q1 += row_bytes_u16;
@@ -682,6 +682,38 @@ inline void ksearch_q4k_coop_frag_nr4_mm(
   }
 }
 
+"#;
+
+/// Fused sweep variants: helper owns the full ix-strided K loop
+/// (`ib = lane/8; ib < nb; ib += 4`) — llama.cpp mul_vec_q4_K structure.
+/// Used when KSEARCH_Q4K_SWEEP is on and dispatch is single-token/exact-rows;
+/// emitting site drops the enclosing ForRange accordingly.
+const Q4K_SWEEP_HELPER: &str = r#"
+// Fused sweep variants: the helper OWNS the full ix-strided K loop
+// (`ib = lane/8; ib < nb; ib += 4`), matching llama.cpp's
+// mul_vec_q4_K_f32_impl structure so the whole K sweep lives in one
+// inlinable frame. Requires exact rows (guards stay in the caller otherwise)
+// and single-token dispatch. Emitting site drops the enclosing ForRange.
+inline void ksearch_q4k_coop_frag_nr4_dev_sweep(
+    device const uchar* A, uint row0_base, uint cols,
+    device const half* x, uint lane,
+    thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
+  uint nb = cols / 256u;
+  for (uint ib = lane / 8u; ib < nb; ib += 4u) {
+    ksearch_q4k_coop_frag_nr4_dev(A, row0_base, cols, ib, x, lane, a0, a1, a2, a3);
+  }
+}
+inline void ksearch_q4k_coop_frag_nr4_dual_dev_sweep(
+    device const uchar* Ag, device const uchar* Au, uint row0_base, uint cols,
+    device const half* x, uint lane,
+    thread float* g0, thread float* g1, thread float* g2, thread float* g3,
+    thread float* u0, thread float* u1, thread float* u2, thread float* u3) {
+  uint nb = cols / 256u;
+  for (uint ib = lane / 8u; ib < nb; ib += 4u) {
+    ksearch_q4k_coop_frag_nr4_dual_dev(Ag, Au, row0_base, cols, ib, x, lane,
+                                       g0, g1, g2, g3, u0, u1, u2, u3);
+  }
+}
 "#;
 
 const K4_SCALE_MIN_HELPER: &str = r#"
@@ -1192,6 +1224,223 @@ inline void ksearch_q4k_mul_mm(
 #undef KSEARCH_FOR_UNROLL
 "#;
 
+/// llama.cpp `mul_mv_ext_q4x4` for MTP verify (batch 2..=8): dequant each weight
+/// row once, dot all activation rows. Acc is only `float sumf[r1ptg]` (no spill).
+/// Activations stay F16 (converted at load); outputs written F16.
+const Q4K_MUL_MV_EXT_HELPER: &str = r#"
+inline uchar2 ksearch_q4k_ext_sc(int j, int k, device const uchar* q) {
+  return j < 4
+      ? uchar2{uchar(q[j + k] & 63), uchar(q[j + 4 + k] & 63)}
+      : uchar2{
+            uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xC0) >> 2)),
+            uchar((q[j + 4 + k] >> 4) | ((q[j + k] & 0xC0) >> 2))};
+}
+inline void ksearch_q4k_dequant_f4x4(device const uchar* blk, short il, thread float4x4& reg) {
+  device const uchar* q = blk + 16;
+  short is = (il / 4) * 2;
+  q = q + (il / 4) * 32 + 16 * (il & 1);
+  il = il & 3;
+  const uchar2 sc = ksearch_q4k_ext_sc(is, il / 2, blk + 4);
+  const float d = il < 2 ? float(*(device const half*)(blk + 0))
+                         : float(*(device const half*)(blk + 0)) / 16.f;
+  const float ml = float(*(device const half*)(blk + 2)) * float(sc[1]);
+  const float dl = d * float(sc[0]);
+  const ushort mask = il < 2 ? 0x0F : 0xF0;
+  for (int i = 0; i < 16; ++i) {
+    reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
+  }
+}
+inline void ksearch_q4k_mul_mv_ext(
+    device const uchar* W, device const half* X, device half* Y,
+    uint M, uint K, uint N, uint r1ptg, uint nsg,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* /*shmem*/) {
+  constexpr uint nxpsg = 8u;
+  constexpr uint nypsg = 32u / nxpsg;
+  constexpr uint chpb = 256u / 16u;
+  const ushort tiisg = tiitg % 32u;
+  const ushort tx = tiisg % nxpsg;
+  const ushort ty = tiisg / nxpsg;
+  const uint i01 = tgpig.x * (nypsg * nsg) + nypsg * uint(sgitg) + uint(ty);
+  const uint i11 = tgpig.y * r1ptg;
+  const uint row_bytes = (K / 256u) * 144u;
+  device const uchar* xq = (i01 < M) ? (W + i01 * row_bytes) : W;
+  xq = xq + (tx / chpb) * 144u;
+  float sumf[8];
+  for (uint ir1 = 0u; ir1 < 8u; ++ir1) sumf[ir1] = 0.0f;
+  short cch = short(tx % chpb);
+  for (uint ich = tx; 16u * ich < K; ich += nxpsg) {
+    float4x4 lx;
+    ksearch_q4k_dequant_f4x4(xq, cch, lx);
+    cch += short(nxpsg);
+    if (cch >= short(chpb)) {
+      xq += (uint(cch) / chpb) * 144u;
+      cch = short(uint(cch) % chpb);
+    }
+    for (uint ir1 = 0u; ir1 < r1ptg; ++ir1) {
+      if (i11 + ir1 >= N) continue;
+      device const half* yp = X + (i11 + ir1) * K + 16u * ich;
+      float4 y0 = float4(float(yp[0]), float(yp[1]), float(yp[2]), float(yp[3]));
+      float4 y1 = float4(float(yp[4]), float(yp[5]), float(yp[6]), float(yp[7]));
+      float4 y2 = float4(float(yp[8]), float(yp[9]), float(yp[10]), float(yp[11]));
+      float4 y3 = float4(float(yp[12]), float(yp[13]), float(yp[14]), float(yp[15]));
+      sumf[ir1] += dot(lx[0], y0) + dot(lx[1], y1) + dot(lx[2], y2) + dot(lx[3], y3);
+    }
+  }
+    for (uint ir1 = 0u; ir1 < r1ptg; ++ir1) {
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 4u);
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 2u);
+      sumf[ir1] += simd_shuffle_down(sumf[ir1], 1u);
+    }
+  if (tx == 0u && i01 < M) {
+    for (uint ir1 = 0u; ir1 < r1ptg && i11 + ir1 < N; ++ir1) {
+      Y[(i11 + ir1) * M + i01] = half(sumf[ir1]);
+    }
+  }
+}
+inline void ksearch_q4k_mul_mv_ext_gate_up_gelu(
+    device const uchar* Wg, device const uchar* Wu, device const half* X, device half* Y,
+    uint M, uint K, uint N, uint r1ptg, uint nsg,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* /*shmem*/) {
+  constexpr uint nxpsg = 8u;
+  constexpr uint nypsg = 32u / nxpsg;
+  constexpr uint chpb = 256u / 16u;
+  const ushort tiisg = tiitg % 32u;
+  const ushort tx = tiisg % nxpsg;
+  const ushort ty = tiisg / nxpsg;
+  const uint i01 = tgpig.x * (nypsg * nsg) + nypsg * uint(sgitg) + uint(ty);
+  const uint i11 = tgpig.y * r1ptg;
+  const uint row_bytes = (K / 256u) * 144u;
+  device const uchar* xqg = (i01 < M) ? (Wg + i01 * row_bytes) : Wg;
+  device const uchar* xqu = (i01 < M) ? (Wu + i01 * row_bytes) : Wu;
+  xqg = xqg + (tx / chpb) * 144u;
+  xqu = xqu + (tx / chpb) * 144u;
+  float sumg[8];
+  float sumu[8];
+  for (uint ir1 = 0u; ir1 < 8u; ++ir1) { sumg[ir1] = 0.0f; sumu[ir1] = 0.0f; }
+  short cch = short(tx % chpb);
+  for (uint ich = tx; 16u * ich < K; ich += nxpsg) {
+    float4x4 lg;
+    float4x4 lu;
+    ksearch_q4k_dequant_f4x4(xqg, cch, lg);
+    ksearch_q4k_dequant_f4x4(xqu, cch, lu);
+    cch += short(nxpsg);
+    if (cch >= short(chpb)) {
+      const uint step = uint(cch) / chpb;
+      xqg += step * 144u;
+      xqu += step * 144u;
+      cch = short(uint(cch) % chpb);
+    }
+    for (uint ir1 = 0u; ir1 < r1ptg; ++ir1) {
+      if (i11 + ir1 >= N) continue;
+      device const half* yp = X + (i11 + ir1) * K + 16u * ich;
+      float4 y0 = float4(float(yp[0]), float(yp[1]), float(yp[2]), float(yp[3]));
+      float4 y1 = float4(float(yp[4]), float(yp[5]), float(yp[6]), float(yp[7]));
+      float4 y2 = float4(float(yp[8]), float(yp[9]), float(yp[10]), float(yp[11]));
+      float4 y3 = float4(float(yp[12]), float(yp[13]), float(yp[14]), float(yp[15]));
+      sumg[ir1] += dot(lg[0], y0) + dot(lg[1], y1) + dot(lg[2], y2) + dot(lg[3], y3);
+      sumu[ir1] += dot(lu[0], y0) + dot(lu[1], y1) + dot(lu[2], y2) + dot(lu[3], y3);
+    }
+  }
+  for (uint ir1 = 0u; ir1 < r1ptg; ++ir1) {
+    sumg[ir1] += simd_shuffle_down(sumg[ir1], 4u);
+    sumg[ir1] += simd_shuffle_down(sumg[ir1], 2u);
+    sumg[ir1] += simd_shuffle_down(sumg[ir1], 1u);
+    sumu[ir1] += simd_shuffle_down(sumu[ir1], 4u);
+    sumu[ir1] += simd_shuffle_down(sumu[ir1], 2u);
+    sumu[ir1] += simd_shuffle_down(sumu[ir1], 1u);
+  }
+  if (tx == 0u && i01 < M) {
+    for (uint ir1 = 0u; ir1 < r1ptg && i11 + ir1 < N; ++ir1) {
+      // Match AST `emit_gelu_of` / decode fused gate_up (clamp gate, then tanh).
+      float ax = clamp(sumg[ir1], -20.0f, 20.0f);
+      float uu = 0.79788456f * (ax + 0.044715f * ax * ax * ax);
+      float gelu = 0.5f * ax * (1.0f + precise::tanh(uu));
+      Y[(i11 + ir1) * M + i01] = half(gelu * sumu[ir1]);
+    }
+  }
+}
+"#;
+
+/// Q6_K variant of mul_mv_ext (same grid / r1ptg tiling).
+const Q6K_MUL_MV_EXT_HELPER: &str = r#"
+inline void ksearch_q6k_dequant_f4x4(device const uchar* blk, short il, thread float4x4& reg) {
+  const half d_all = *(device const half*)(blk + 208);
+  device const uint16_t* ql = (device const uint16_t*)(blk);
+  device const uint16_t* qh = (device const uint16_t*)(blk + 128);
+  device const int8_t* scales = (device const int8_t*)(blk + 192);
+  ql = ql + 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
+  qh = qh + 16 * (il / 8) + 8 * (il & 1);
+  float sc = float(scales[(il % 2) + 2 * ((il / 2))]);
+  il = (il / 2) & 3;
+  const uint32_t kmask1 = il > 1 ? (il > 2 ? 0xC0C0C0C0u : 0x30303030u) : (il > 0 ? 0x0C0C0C0Cu : 0x03030303u);
+  const uint32_t kmask2 = il > 1 ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+  const float ml = float(d_all) * sc * 32.f;
+  const float dl0 = float(d_all) * sc;
+  const float dl1 = dl0 / 256.f;
+  const float dl2 = dl0 / (256.f * 256.f);
+  const float dl3 = dl0 / (256.f * 256.f * 256.f);
+  const uint8_t shr_h = il > 2 ? 2 : 0;
+  const uint8_t shl_h = il > 1 ? 0 : (il > 0 ? 2 : 4);
+  const uint8_t shr_l = il > 1 ? 4 : 0;
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t low = (uint32_t(ql[2 * i]) | (uint32_t(ql[2 * i + 1]) << 16)) & kmask2;
+    const uint32_t high = (uint32_t(qh[2 * i]) | (uint32_t(qh[2 * i + 1]) << 16)) & kmask1;
+    const uint32_t q = ((high << shl_h) >> shr_h) | (low >> shr_l);
+    reg[i][0] = dl0 * float(half(q & 0xFFu)) - ml;
+    reg[i][1] = dl1 * float(q & 0xFF00u) - ml;
+    reg[i][2] = dl2 * float(q & 0xFF0000u) - ml;
+    reg[i][3] = dl3 * float(q & 0xFF000000u) - ml;
+  }
+}
+inline void ksearch_q6k_mul_mv_ext(
+    device const uchar* W, device const half* X, device half* Y,
+    uint M, uint K, uint N, uint r1ptg, uint nsg,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* /*shmem*/) {
+  constexpr uint nxpsg = 8u;
+  constexpr uint nypsg = 32u / nxpsg;
+  constexpr uint chpb = 256u / 16u;
+  const ushort tiisg = tiitg % 32u;
+  const ushort tx = tiisg % nxpsg;
+  const ushort ty = tiisg / nxpsg;
+  const uint i01 = tgpig.x * (nypsg * nsg) + nypsg * uint(sgitg) + uint(ty);
+  const uint i11 = tgpig.y * r1ptg;
+  const uint row_bytes = (K / 256u) * 210u;
+  device const uchar* xq = (i01 < M) ? (W + i01 * row_bytes) : W;
+  xq = xq + (tx / chpb) * 210u;
+  float sumf[8];
+  for (uint ir1 = 0u; ir1 < 8u; ++ir1) sumf[ir1] = 0.0f;
+  short cch = short(tx % chpb);
+  for (uint ich = tx; 16u * ich < K; ich += nxpsg) {
+    float4x4 lx;
+    ksearch_q6k_dequant_f4x4(xq, cch, lx);
+    cch += short(nxpsg);
+    if (cch >= short(chpb)) {
+      xq += (uint(cch) / chpb) * 210u;
+      cch = short(uint(cch) % chpb);
+    }
+    for (uint ir1 = 0u; ir1 < r1ptg; ++ir1) {
+      if (i11 + ir1 >= N) continue;
+      device const half* yp = X + (i11 + ir1) * K + 16u * ich;
+      float4 y0 = float4(float(yp[0]), float(yp[1]), float(yp[2]), float(yp[3]));
+      float4 y1 = float4(float(yp[4]), float(yp[5]), float(yp[6]), float(yp[7]));
+      float4 y2 = float4(float(yp[8]), float(yp[9]), float(yp[10]), float(yp[11]));
+      float4 y3 = float4(float(yp[12]), float(yp[13]), float(yp[14]), float(yp[15]));
+      sumf[ir1] += dot(lx[0], y0) + dot(lx[1], y1) + dot(lx[2], y2) + dot(lx[3], y3);
+    }
+  }
+  for (uint ir1 = 0u; ir1 < r1ptg; ++ir1) {
+    sumf[ir1] += simd_shuffle_down(sumf[ir1], 4u);
+    sumf[ir1] += simd_shuffle_down(sumf[ir1], 2u);
+    sumf[ir1] += simd_shuffle_down(sumf[ir1], 1u);
+  }
+  if (tx == 0u && i01 < M) {
+    for (uint ir1 = 0u; ir1 < r1ptg && i11 + ir1 < N; ++ir1) {
+      Y[(i11 + ir1) * M + i01] = half(sumf[ir1]);
+    }
+  }
+}
+"#;
+
 const Q6K_MUL_MM_HELPER: &str = r#"
 inline void ksearch_q6k_mul_mm(
     device const uchar* W, device const half* X, device half* C,
@@ -1296,8 +1545,12 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
     let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
     if body_needs_q4(&kir.body) {
         src.push_str(Q4K_LOAD_HELPER);
+        src.push_str(Q4K_SWEEP_HELPER);
         if body_has_mul_mm_q4(&kir.body) {
             src.push_str(Q4K_MUL_MM_HELPER);
+        }
+        if body_has_mul_mv_ext_q4(&kir.body) {
+            src.push_str(Q4K_MUL_MV_EXT_HELPER);
         }
     }
     if body_needs_q5(&kir.body) {
@@ -1310,6 +1563,9 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
         src.push_str(Q6K_LOAD_HELPER);
         if body_has_mul_mm_q6(&kir.body) {
             src.push_str(Q6K_MUL_MM_HELPER);
+        }
+        if body_has_mul_mv_ext_q6(&kir.body) {
+            src.push_str(Q6K_MUL_MV_EXT_HELPER);
         }
     }
     if body_needs_q40(&kir.body) {
@@ -1544,6 +1800,9 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
             }
             KirStmt::Q4kMulMm {
                 w_buf, x_buf, ..
+            }
+            | KirStmt::Q4kMulMvExt {
+                w_buf, x_buf, ..
             } => {
                 if (*w_buf as usize) < in_dt.len() {
                     in_dt[*w_buf as usize] = DType::Q4K;
@@ -1552,7 +1811,26 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
                     in_dt[*x_buf as usize] = DType::F16;
                 }
             }
+            KirStmt::Q4kMulMvExtGateUpGelu {
+                gate_buf,
+                up_buf,
+                x_buf,
+                ..
+            } => {
+                if (*gate_buf as usize) < in_dt.len() {
+                    in_dt[*gate_buf as usize] = DType::Q4K;
+                }
+                if (*up_buf as usize) < in_dt.len() {
+                    in_dt[*up_buf as usize] = DType::Q4K;
+                }
+                if (*x_buf as usize) < in_dt.len() {
+                    in_dt[*x_buf as usize] = DType::F16;
+                }
+            }
             KirStmt::Q6kMulMm {
+                w_buf, x_buf, ..
+            }
+            | KirStmt::Q6kMulMvExt {
                 w_buf, x_buf, ..
             } => {
                 if (*w_buf as usize) < in_dt.len() {
@@ -1871,12 +2149,22 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
-            KirStmt::Q4kMulMm { w_buf, .. } => {
+            KirStmt::Q4kMulMm { w_buf, .. }
+            | KirStmt::Q4kMulMvExt { w_buf, .. } => {
                 if *w_buf == buf {
                     return true;
                 }
             }
-            KirStmt::Q6kMulMm { .. } => {}
+            KirStmt::Q4kMulMvExtGateUpGelu {
+                gate_buf,
+                up_buf,
+                ..
+            } => {
+                if *gate_buf == buf || *up_buf == buf {
+                    return true;
+                }
+            }
+            KirStmt::Q6kMulMm { .. } | KirStmt::Q6kMulMvExt { .. } => {}
         }
     }
     false
@@ -1906,11 +2194,51 @@ fn body_has_mul_mm_q4(stmts: &[KirStmt]) -> bool {
     walk(stmts)
 }
 
+fn body_has_mul_mv_ext_q4(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::Q4kMulMvExt { .. } | KirStmt::Q4kMulMvExtGateUpGelu { .. } => return true,
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
 fn body_has_mul_mm_q6(stmts: &[KirStmt]) -> bool {
     fn walk(stmts: &[KirStmt]) -> bool {
         for s in stmts {
             match s {
                 KirStmt::Q6kMulMm { .. } => return true,
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+fn body_has_mul_mv_ext_q6(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::Q6kMulMvExt { .. } => return true,
                 KirStmt::For { body, .. }
                 | KirStmt::If { body, .. }
                 | KirStmt::ForRange { body, .. } => {
@@ -2073,12 +2401,14 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
-            KirStmt::Q6kMulMm { w_buf, .. } => {
+            KirStmt::Q6kMulMm { w_buf, .. } | KirStmt::Q6kMulMvExt { w_buf, .. } => {
                 if *w_buf == buf {
                     return true;
                 }
             }
-            KirStmt::Q4kMulMm { .. } => {}
+            KirStmt::Q4kMulMm { .. }
+            | KirStmt::Q4kMulMvExt { .. }
+            | KirStmt::Q4kMulMvExtGateUpGelu { .. } => {}
         }
     }
     false
@@ -2207,6 +2537,7 @@ fn body_needs_q40(stmts: &[KirStmt]) -> bool {
     }
     walk(stmts)
 }
+
 
 fn emit_stmts(
     stmts: &[KirStmt],
@@ -2426,10 +2757,18 @@ fn emit_stmts(
                 } else {
                     let xb = buf_name(*x_buf, n_in, n_out);
                     let xp = device_x_plus(xb, x_off, n_in, n_out, elem)?;
-                    format!(
-                        "ksearch_q4k_coop_frag_nr4_dev({a}, ({rb}), {cols}u, ({ib_s}), {xp}, ({lane_s}), &v{}, &v{}, &v{}, &v{})",
-                        acc_ids[0], acc_ids[1], acc_ids[2], acc_ids[3]
-                    )
+                    let sweep = std::env::var("KSEARCH_Q4K_SWEEP").as_deref() == Ok("1");
+                    if sweep {
+                        format!(
+                            "ksearch_q4k_coop_frag_nr4_dev_sweep({a}, ({rb}), {cols}u, {xp}, ({lane_s}), &v{}, &v{}, &v{}, &v{})",
+                            acc_ids[0], acc_ids[1], acc_ids[2], acc_ids[3]
+                        )
+                    } else {
+                        format!(
+                            "ksearch_q4k_coop_frag_nr4_dev({a}, ({rb}), {cols}u, ({ib_s}), {xp}, ({lane_s}), &v{}, &v{}, &v{}, &v{})",
+                            acc_ids[0], acc_ids[1], acc_ids[2], acc_ids[3]
+                        )
+                    }
                 };
                 s.push_str(&format!("{pad}{call};\n"));
             }
@@ -2456,11 +2795,20 @@ fn emit_stmts(
                 } else {
                     let xb = buf_name(*x_buf, n_in, n_out);
                     let xp = device_x_plus(xb, x_off, n_in, n_out, elem)?;
-                    format!(
-                        "ksearch_q4k_coop_frag_nr4_dual_dev(in0, in1, ({rb}), {cols}u, ({ib_s}), {xp}, ({lane_s}), &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{})",
-                        acc_g[0], acc_g[1], acc_g[2], acc_g[3],
-                        acc_u[0], acc_u[1], acc_u[2], acc_u[3]
-                    )
+                    let sweep = std::env::var("KSEARCH_Q4K_SWEEP").as_deref() == Ok("1");
+                    if sweep {
+                        format!(
+                            "ksearch_q4k_coop_frag_nr4_dual_dev_sweep(in0, in1, ({rb}), {cols}u, {xp}, ({lane_s}), &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{})",
+                            acc_g[0], acc_g[1], acc_g[2], acc_g[3],
+                            acc_u[0], acc_u[1], acc_u[2], acc_u[3]
+                        )
+                    } else {
+                        format!(
+                            "ksearch_q4k_coop_frag_nr4_dual_dev(in0, in1, ({rb}), {cols}u, ({ib_s}), {xp}, ({lane_s}), &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{}, &v{})",
+                            acc_g[0], acc_g[1], acc_g[2], acc_g[3],
+                            acc_u[0], acc_u[1], acc_u[2], acc_u[3]
+                        )
+                    }
                 };
                 s.push_str(&format!("{pad}{call};\n"));
             }
@@ -2539,6 +2887,86 @@ fn emit_stmts(
                 let o = buf_name(*out_buf, n_in, n_out);
                 s.push_str(&format!(
                     "{pad}ksearch_q6k_mul_mm({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
+                ));
+            }
+            KirStmt::Q4kMulMvExt {
+                rows,
+                cols,
+                batch,
+                w_buf,
+                x_buf,
+                out_buf,
+            } => {
+                let w = buf_name(*w_buf, n_in, n_out);
+                let x = buf_name(*x_buf, n_in, n_out);
+                let o = buf_name(*out_buf, n_in, n_out);
+                let r1 = match *batch {
+                    2 => 2u32,
+                    3 | 6 => 3,
+                    5 => 5,
+                    _ => 4,
+                };
+                let nsg = std::env::var("KSEARCH_MV_EXT_NSG")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &u32| (1..=8).contains(&n))
+                    .unwrap_or(4);
+                s.push_str(&format!(
+                    "{pad}ksearch_q4k_mul_mv_ext({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, {r1}u, {nsg}u, tgpig, tiitg, sgitg, shmem);\n"
+                ));
+            }
+            KirStmt::Q4kMulMvExtGateUpGelu {
+                rows,
+                cols,
+                batch,
+                gate_buf,
+                up_buf,
+                x_buf,
+                out_buf,
+            } => {
+                let wg = buf_name(*gate_buf, n_in, n_out);
+                let wu = buf_name(*up_buf, n_in, n_out);
+                let x = buf_name(*x_buf, n_in, n_out);
+                let o = buf_name(*out_buf, n_in, n_out);
+                let r1 = match *batch {
+                    2 => 2u32,
+                    3 | 6 => 3,
+                    5 => 5,
+                    _ => 4,
+                };
+                let nsg = std::env::var("KSEARCH_MV_EXT_NSG")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &u32| (1..=8).contains(&n))
+                    .unwrap_or(4);
+                s.push_str(&format!(
+                    "{pad}ksearch_q4k_mul_mv_ext_gate_up_gelu({wg}, {wu}, {x}, {o}, {rows}u, {cols}u, {batch}u, {r1}u, {nsg}u, tgpig, tiitg, sgitg, shmem);\n"
+                ));
+            }
+            KirStmt::Q6kMulMvExt {
+                rows,
+                cols,
+                batch,
+                w_buf,
+                x_buf,
+                out_buf,
+            } => {
+                let w = buf_name(*w_buf, n_in, n_out);
+                let x = buf_name(*x_buf, n_in, n_out);
+                let o = buf_name(*out_buf, n_in, n_out);
+                let r1 = match *batch {
+                    2 => 2u32,
+                    3 | 6 => 3,
+                    5 => 5,
+                    _ => 4,
+                };
+                let nsg = std::env::var("KSEARCH_MV_EXT_NSG")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &u32| (1..=8).contains(&n))
+                    .unwrap_or(4);
+                s.push_str(&format!(
+                    "{pad}ksearch_q6k_mul_mv_ext({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, {r1}u, {nsg}u, tgpig, tiitg, sgitg, shmem);\n"
                 ));
             }
             KirStmt::Q40PackBlock {

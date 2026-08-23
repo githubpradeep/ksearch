@@ -22,8 +22,9 @@ You do **not** need to have written a compiler or GPU kernels before. Start at *
 | 6 | [06-quant.md](./06-quant.md) | Explain dequant-at-load vs eager CPU dequant |
 | 7 | [07-gemma-runtime.md](./07-gemma-runtime.md) | Trace one decode token; know E2B MQA vs E4B GQA KV layout |
 | 8 | [08-implement-from-scratch.md](./08-implement-from-scratch.md) | Rebuild the stack in stages, with checkpoints |
+| 9 | [09-tuner.md](./09-tuner.md) | Explain the cost model, the bandit loop, and why log(ms) trees |
 
-Read 0a–0c until the pictures are boring. Then DESIGN.md once. Then 01–08. Come back to FINDINGS.md when you wonder “why not just copy llama.cpp kernels?”
+Read 0a–0c until the pictures are boring. Then DESIGN.md once. Then 01–09. Come back to FINDINGS.md when you wonder “why not just copy llama.cpp kernels?”
 
 ## How to study (not just read)
 
@@ -48,6 +49,7 @@ Suggested loop for each chapter:
 | KernelKind → AST | `crates/ksearch_codegen/src/lower.rs` |
 | AST → MSL | `crates/ksearch_codegen/src/render.rs` |
 | BEAM + disk cache | `crates/ksearch_codegen/src/beam.rs`, `plan_cache.rs` |
+| Cost model + guided search | `crates/ksearch_tuner/src/` (`gbdt.rs`, `model.rs`, `search.rs`) |
 | `lower_to_metal` entry | `crates/ksearch_codegen/src/lib.rs` |
 | Metal device / launch | `crates/ksearch_metal/src/lib.rs` |
 | Runtime that builds Graphs | `crates/ksearch_kernels/src/lib.rs` (`Eng`) |

@@ -260,6 +260,49 @@ impl Eng {
         self.run_multi(ctx, &key, &[wq, wk, wv, x], &[q, k, v])
     }
 
+    /// Batched fused Q/K/V (MTP verify 2..=8): one dispatch, three mul_mv_ext passes.
+    pub fn matvec_qkv_batch_wd(
+        &mut self,
+        ctx: &MetalContext,
+        q_rows: usize,
+        kv_rows: usize,
+        cols: usize,
+        batch: usize,
+        wq_dtype: DType,
+        wk_dtype: DType,
+        wv_dtype: DType,
+        wq: &Buffer,
+        wk: &Buffer,
+        wv: &Buffer,
+        x: &Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec_qkv_wds(
+                ctx, q_rows, kv_rows, cols, wq_dtype, wk_dtype, wv_dtype, wq, wk, wv, x, q, k, v,
+            );
+        }
+        let tag = format!(
+            "{}_{}_{}",
+            weight_cache_tag(wq_dtype),
+            weight_cache_tag(wk_dtype),
+            weight_cache_tag(wv_dtype)
+        );
+        let key = format!("mv_qkv_b{batch}_{tag}_{q_rows}x{kv_rows}x{cols}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wq_i = g.input(Shape(vec![q_rows, cols]), wq_dtype);
+            let wk_i = g.input(Shape(vec![kv_rows, cols]), wk_dtype);
+            let wv_i = g.input(Shape(vec![kv_rows, cols]), wv_dtype);
+            let x_i = g.input(Shape(vec![batch * cols]), DType::F16);
+            let out = g.matvec_qkv_batch(wq_i, wk_i, wv_i, x_i, batch)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run_multi(ctx, &key, &[wq, wk, wv, x], &[q, k, v])
+    }
+
     /// RMSNorm(x,w_norm) fused into dense matvec (LOCAL-stages `x_hat`).
     pub fn rmsnorm_matvec(
         &mut self,
@@ -974,6 +1017,40 @@ impl Eng {
         self.run(ctx, &key, &[gate, up, x], y)
     }
 
+    /// Batched gate∥up+GeLU (MTP verify 2..=8).
+    pub fn matvec_gate_up_gelu_batch_wd(
+        &mut self,
+        ctx: &MetalContext,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        weight_dtype: DType,
+        gate: &Buffer,
+        up: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        if batch == 1 {
+            return self.matvec_gate_up_gelu_wd(ctx, rows, cols, weight_dtype, gate, up, x, y);
+        }
+        let tag = weight_cache_tag(weight_dtype);
+        let nsg = std::env::var("KSEARCH_MV_EXT_NSG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &u32| (1..=8).contains(&n))
+            .unwrap_or(4);
+        let key = format!("mv_gate_up_gelu_b{batch}_{tag}_{rows}x{cols}_nsg{nsg}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let wg = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let wu = g.input(Shape(vec![rows, cols]), weight_dtype);
+            let v = g.input(Shape(vec![batch * cols]), DType::F16);
+            let out = g.matvec_gate_up_gelu_batch(wg, wu, v, batch)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+        }
+        self.run(ctx, &key, &[gate, up, x], y)
+    }
+
     /// RMSNorm into LOCAL `x_hat`, then fused gate/up matvecs + GELU*mul.
     pub fn rmsnorm_matvec_gate_up_gelu(
         &mut self,
@@ -1426,7 +1503,12 @@ impl Eng {
             return self.matvec_wd(ctx, rows, cols, weight_dtype, a, x, y);
         }
         let tag = weight_cache_tag(weight_dtype);
-        let key = format!("mv_b{batch}_{tag}_{rows}x{cols}");
+        let nsg = std::env::var("KSEARCH_MV_EXT_NSG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &u32| (1..=8).contains(&n))
+            .unwrap_or(4);
+        let key = format!("mv_b{batch}_{tag}_{rows}x{cols}_nsg{nsg}");
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let w = g.input(Shape(vec![rows, cols]), weight_dtype);
@@ -1609,6 +1691,13 @@ impl Eng {
         if n_tok == 1 {
             return self.sdpa_hybrid_kv(
                 ctx, n_q, n_kv, hd, max_t, attn_t, kv_dtype, q, k, v, meta, tmp, out,
+            );
+        }
+        // Small verify batches: prefer naive over MWG×n_tok (re-reads KV per row).
+        // Shared-q: opt-in KSEARCH_SDPA_SHARED=1 (short-ctx regression if always on).
+        if (2..=8).contains(&n_tok) {
+            return self.sdpa_naive_kv_batch(
+                ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, out,
             );
         }
         if attn_t >= Self::SDPA_MWG_THRESHOLD {
@@ -1907,6 +1996,7 @@ impl Eng {
         ctx_buf: &Buffer,
         ctx_off_elems: usize,
         y: &Buffer,
+        y_off_elems: usize,
     ) -> Result<()> {
         let tag = weight_cache_tag(weight_dtype);
         let key = format!("mv_gelu_mul_{tag}_{rows}x{cols}");
@@ -1925,7 +2015,7 @@ impl Eng {
             &[w, x, ctx_buf],
             &[0, x_off_elems as u64 * b, ctx_off_elems as u64 * b],
             y,
-            0,
+            y_off_elems as u64 * b,
         )
     }
 
@@ -1971,11 +2061,51 @@ impl Eng {
         x: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
+        self.softcap_argmax_at(ctx, n, cap, x, 0, out, 0)
+    }
+
+    /// Softcap + argmax on logits row `x[x_off_elems .. x_off_elems+n]`.
+    /// `out[out_off_elems]` is F32.
+    pub fn softcap_argmax_at(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        cap: f32,
+        x: &Buffer,
+        x_off_elems: usize,
+        out: &Buffer,
+        out_off_elems: usize,
+    ) -> Result<()> {
         let key = format!("sca_f16_{n}_{}", cap.to_bits());
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n]), DType::F16);
             let o = g.softcap_argmax(xi, cap)?;
+            self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+        }
+        let xb = (x_off_elems * DType::F16.size_bytes()) as u64;
+        let yb = (out_off_elems * DType::F32.size_bytes()) as u64;
+        self.run_offsets(ctx, &key, &[x], &[xb], out, yb)
+    }
+
+    /// Softcap+argmax for `rows` packed logit rows (MTP verify).
+    pub fn softcap_argmax_rows(
+        &mut self,
+        ctx: &MetalContext,
+        n: usize,
+        rows: usize,
+        cap: f32,
+        x: &Buffer,
+        out: &Buffer,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.softcap_argmax(ctx, n, cap, x, out);
+        }
+        let key = format!("sca_f16_r{rows}_{n}_{}", cap.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![rows * n]), DType::F16);
+            let o = g.softcap_argmax_rows(xi, n, rows, cap)?;
             self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
         }
         self.run(ctx, &key, &[x], out)
@@ -1993,8 +2123,8 @@ impl Eng {
         use ksearch_codegen::{beam_search_matvec, load_plan};
         let chip = ctx.device_name();
         let plan_kind = match weight_dtype {
-            DType::Q4K => "matvec_q4k",
-            DType::Q6K => "matvec_q6k",
+            DType::Q4K => "matvec_q4k_v2",
+            DType::Q6K => "matvec_q6k_v2",
             DType::F16 => "matvec_f16_nr",
             _ => "matvec_f32",
         };

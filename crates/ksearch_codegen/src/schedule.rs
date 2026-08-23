@@ -473,18 +473,20 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
         FuseHint::MatvecGateUpGelu {
             rows,
             cols,
+            batch,
             gate,
             up,
             x,
         } => {
             let wd = graph.shape_dtype(*gate)?.1;
             ScheduledKernel {
-                name: format!("k_mv_gate_up_gelu_{}", out.0),
+                name: format!("k_mv_gate_up_gelu_b{batch}_{}", out.0),
                 inputs: vec![*gate, *up, *x],
                 output: out,
                 kind: KernelKind::MatvecGateUpGelu {
                     rows: *rows,
                     cols: *cols,
+                    batch: *batch,
                     gate: *gate,
                     up: *up,
                     x: *x,
@@ -610,6 +612,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             q_rows,
             kv_rows,
             cols,
+            batch,
             wq,
             wk,
             wv,
@@ -619,13 +622,14 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             let wk_dtype = graph.shape_dtype(*wk)?.1;
             let wv_dtype = graph.shape_dtype(*wv)?.1;
             ScheduledKernel {
-                name: format!("k_mv_qkv_{}", out.0),
+                name: format!("k_mv_qkv_b{batch}_{}", out.0),
                 inputs: vec![*wq, *wk, *wv, *x],
                 output: out,
                 kind: KernelKind::MatvecQkv {
                     q_rows: *q_rows,
                     kv_rows: *kv_rows,
                     cols: *cols,
+                    batch: *batch,
                     wq: *wq,
                     wk: *wk,
                     wv: *wv,
@@ -805,12 +809,13 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 src: *src,
             },
         },
-        FuseHint::SoftcapArgmax { n, cap, x } => ScheduledKernel {
-            name: format!("k_sca_{}", out.0),
+        FuseHint::SoftcapArgmax { n, rows, cap, x } => ScheduledKernel {
+            name: format!("k_sca_r{rows}_{}", out.0),
             inputs: vec![*x],
             output: out,
             kind: KernelKind::SoftcapArgmax {
                 n: *n,
+                rows: *rows,
                 cap: *cap,
                 x: *x,
             },

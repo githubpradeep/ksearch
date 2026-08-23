@@ -1,10 +1,13 @@
 //! Thesis A Gemma path: Graph→AST→MSL. Q4_K weights stay packed (`Load(Q4K)` expand);
 //! other quant types dequant → F16. Activations stay F16.
 
+use crate::mtp::MtpDraft;
 use crate::sample::sample_softcap_min_p;
 use crate::{GemmaConfig, GenerateStats, KvPool, LayerMeta, LayerNorms, SlotId};
 use anyhow::{anyhow, bail, Result};
-use ksearch_gguf::{f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
+use ksearch_gguf::{
+    dequant_row_to_f32, f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf,
+};
 use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
 use ksearch_kernels::Eng;
 use ksearch_metal::MetalContext;
@@ -14,6 +17,18 @@ use std::path::Path;
 use std::time::Instant;
 
 const PREFILL_CHUNK: usize = 256;
+/// id_last + drafts in one verify forward (metal-llm-server `MAX_MTP_VERIFY_SEQ`).
+const MAX_MTP_VERIFY: usize = 8;
+
+fn mtp_draft_steps() -> usize {
+    std::env::var("KSEARCH_MTP_DRAFT_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0 && v < MAX_MTP_VERIFY)
+        // K=1: verify batch=2 is the only draft depth that doesn't lose to
+        // baseline today (longer chains: verify grows faster than E).
+        .unwrap_or(1)
+}
 
 /// Tokens per prefill chunk (also the server scheduler's default slice).
 pub const PREFILL_CHUNK_SIZE: usize = PREFILL_CHUNK;
@@ -77,6 +92,14 @@ pub struct GemmaPrimModel {
     pub cfg: GemmaConfig,
     pub vocab: Option<ksearch_gguf::Vocab>,
     gguf: Gguf,
+    /// MTP draft head + acceptance-probe state (KSEARCH_MTP / --mtp).
+    mtp: Option<MtpDraft>,
+    mtp_hits: usize,
+    mtp_tried: usize,
+    mtp_pending: Option<u32>,
+    mtp_hseed: Option<Buffer>,
+    mtp_verify_logits: Option<Buffer>,
+    mtp_verify_argmax: Option<Buffer>,
     ctx: MetalContext,
     /// Tied lm_head / embed (Q4_K packed when GGUF type is Q4_K, else F16).
     token_embd: WeightBuf,
@@ -294,6 +317,13 @@ impl GemmaPrimModel {
             cfg: cfg.clone(),
             vocab,
             gguf: g,
+            mtp: None,
+            mtp_hits: 0,
+            mtp_tried: 0,
+            mtp_pending: None,
+            mtp_hseed: None,
+            mtp_verify_logits: None,
+            mtp_verify_argmax: None,
             ctx,
             token_embd,
             output_norm,
@@ -883,8 +913,25 @@ impl GemmaPrimModel {
             bail!("max_seq exceeded");
         }
         let profile = std::env::var_os("KSEARCH_PROFILE").is_some();
+        let gphase = std::env::var("KSEARCH_PHASE_GPUTIME")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        // Ablation profiling: KSEARCH_ABLATE=noattn|nomlp|nople|nohead skips a
+        // component end-to-end; Δ vs baseline attributes real token time.
+        let abl = std::env::var("KSEARCH_ABLATE").unwrap_or_default();
+        let a_attn = abl == "noattn";
+        let a_mlp = abl == "nomlp";
+        let a_ple = abl == "nople";
+        let a_head = abl == "nohead";
+        if gphase {
+            let _ = self.ctx.init_phase_counters(4096);
+            self.ctx.phase_mark();
+        }
         let t0 = Instant::now();
-        let gpu_idx = self.ple_embd.is_some();
+        // GPU-resident token-id gather is the ping-pong decode pipe. MTP
+        // forces a synced host `token` (the probe embeds `best` + this
+        // hidden); reading stale `tok_idx` here produced garbage drafts.
+        let gpu_idx = self.ple_embd.is_some() && !(want_logits && self.mtp.is_some());
         if gpu_idx && !want_logits {
             // Ping-pong tok_idx so the next gather can overlap the in-flight token.
             self.ctx.wait_inflight_at_most(1);
@@ -906,7 +953,12 @@ impl GemmaPrimModel {
             self.load_ple_token(token)?;
         }
         let t_ple = t0.elapsed();
-        self.ple_prepass()?;
+        if !a_ple {
+            self.ple_prepass()?;
+        }
+        if gphase {
+            self.ctx.phase_mark();
+        }
         let t_pre = t0.elapsed();
 
         let h = self.cfg.hidden;
@@ -943,34 +995,35 @@ impl GemmaPrimModel {
             let owns_kv = self.cfg.owns_kv(layer);
             let kv_src = self.cfg.kv_source(layer);
 
-            if owns_kv {
-                let attn_norm = self.layer_norms[layer].attn_norm.clone();
-                self.rmsnorm_matvec_qkv_w(
-                    q_rows,
-                    kv_rows,
-                    h,
-                    eps,
-                    &format!("{pref}attn_q.weight"),
-                    &format!("{pref}attn_k.weight"),
-                    &format!("{pref}attn_v.weight"),
-                    self.x.clone(),
-                    &attn_norm,
-                    self.tmp_q.clone(),
-                    self.tmp_k.clone(),
-                    self.tmp_v.clone(),
-                )?;
-            } else {
-                let attn_norm = self.layer_norms[layer].attn_norm.clone();
-                self.rmsnorm_matvec_w(
-                    q_rows,
-                    h,
-                    eps,
-                    &format!("{pref}attn_q.weight"),
-                    self.x.clone(),
-                    &attn_norm,
-                    self.tmp_q.clone(),
-                )?;
-            }
+            if !a_attn {
+                if owns_kv {
+                    let attn_norm = self.layer_norms[layer].attn_norm.clone();
+                    self.rmsnorm_matvec_qkv_w(
+                        q_rows,
+                        kv_rows,
+                        h,
+                        eps,
+                        &format!("{pref}attn_q.weight"),
+                        &format!("{pref}attn_k.weight"),
+                        &format!("{pref}attn_v.weight"),
+                        self.x.clone(),
+                        &attn_norm,
+                        self.tmp_q.clone(),
+                        self.tmp_k.clone(),
+                        self.tmp_v.clone(),
+                    )?;
+                } else {
+                    let attn_norm = self.layer_norms[layer].attn_norm.clone();
+                    self.rmsnorm_matvec_w(
+                        q_rows,
+                        h,
+                        eps,
+                        &format!("{pref}attn_q.weight"),
+                        self.x.clone(),
+                        &attn_norm,
+                        self.tmp_q.clone(),
+                    )?;
+                }
 
             if owns_kv {
                 let kv_off = self.pos * self.cfg.n_kv * q40_row_bytes(hd);
@@ -1032,6 +1085,7 @@ impl GemmaPrimModel {
             )?;
 
             self.matvec_w(h, o_in, &format!("{pref}attn_output.weight"), self.tmp_o.clone(), self.x2.clone())?;
+            } // !a_attn
 
             let gate_name = format!("{pref}ffn_gate.weight");
             let up_name = format!("{pref}ffn_up.weight");
@@ -1042,6 +1096,7 @@ impl GemmaPrimModel {
             let packed_gate = dg == du && is_packed(dg);
             let ffn_norm = self.layer_norms[layer].ffn_norm.clone();
 
+            if !a_mlp {
             if packed_gate {
                 // Residual+post-attn rms and ffn rms in one TG; gate_up stays
                 // device-x coop (LOCAL x_hat in the fused rms+gate_up path is slower).
@@ -1149,6 +1204,7 @@ impl GemmaPrimModel {
                     ms_mlp += ts.elapsed().as_secs_f64() * 1e3;
                 }
             }
+            } // !a_mlp
             let t_ple_l = if profile {
                 Some(Instant::now())
             } else {
@@ -1156,6 +1212,7 @@ impl GemmaPrimModel {
             };
 
             // PLE: fuse gate matvec + gelu*ctx, then proj matvec + rmsnorm_add_scale (sequenced).
+            if !a_ple {
             let gate_name = format!("{pref}inp_gate.weight");
             self.ensure_weight(&gate_name)?;
             let dg = self.weight_bufs.get(&gate_name).unwrap().dtype();
@@ -1188,6 +1245,7 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x,
             )?;
+            } // !a_ple
             if let Some(ts) = t_ple_l {
                 self.ctx.synchronize()?;
                 ms_ple_l += ts.elapsed().as_secs_f64() * 1e3;
@@ -1197,6 +1255,9 @@ impl GemmaPrimModel {
         }
 
         let t_layers = t0.elapsed();
+        if gphase {
+            self.ctx.phase_mark();
+        }
         self.pos += 1;
         if !want_logits {
             // Keep GPU pipeline full — host only syncs when reading argmax / generate end.
@@ -1218,12 +1279,19 @@ impl GemmaPrimModel {
         }
 
         // Thesis-A fused output head: RmsNormMatvec(output_norm, token_embd)
+        // MTP probe note: while probing we fall through to the synced branch
+        // below regardless of return_token_sync.
         // then parallel softcap_argmax — Q4_K embd uses Load(Q4K) expand.
         let vocab = self.cfg.vocab;
         let cap = self.cfg.softcap;
         let embd_dt = self.token_embd.dtype();
         let embd = self.token_embd.buf().clone();
-        if is_packed(embd_dt) {
+        let dst = self.tok_idx[self.decode_src ^ 1].clone();
+        let sampling = self.sample_temperature >= 1e-6;
+        if !a_head {
+        // MTP needs the post-final-norm hidden (`x2`) as h_nextn. The fused
+        // F16 rmsnorm+lm_head path never materializes it.
+        if is_packed(embd_dt) || self.mtp.is_some() {
             self.eng
                 .rmsnorm(&self.ctx, h, eps, &self.x, &self.output_norm, &self.x2)?;
             self.eng.matvec_wd(
@@ -1234,16 +1302,12 @@ impl GemmaPrimModel {
                 &self.ctx, vocab, h, eps, embd_dt, &self.x, &self.output_norm, &embd, &self.logits,
             )?;
         }
-        let dst = self.tok_idx[self.decode_src ^ 1].clone();
-        let sampling = self.sample_temperature >= 1e-6;
         if !sampling {
             self.eng
                 .softcap_argmax(&self.ctx, vocab, cap, &self.logits, &dst)?;
         }
+        } // !a_head
         let t_logits = t0.elapsed();
-        if !self.return_token_sync {
-            return Ok(None);
-        }
         if sampling {
             let logits = self.ctx.read_u16(&self.logits, vocab);
             let best = sample_softcap_min_p(
@@ -1256,7 +1320,132 @@ impl GemmaPrimModel {
             self.sample_temperature = 0.0;
             return Ok(Some(best));
         }
+        let mtp_probe = self.mtp.is_some();
+        if !self.return_token_sync && !mtp_probe {
+            // Keep the GPU pipeline full; host reads the argmax later.
+            if profile || gphase {
+                if gphase {
+                    self.ctx.phase_mark();
+                    self.ctx.synchronize()?;
+                } else {
+                    // One sync so the printed segments reflect real GPU time.
+                    let _ = self.ctx.read_f32(&dst, 1)[0] as u32;
+                }
+                let (dispatches, enqueue_s) = ksearch_metal::take_telemetry();
+                if gphase {
+                    let ph = self.ctx.resolve_phase_times_ms();
+                    let gpu_busy: f64 = ph.iter().sum();
+                    let wall = t0.elapsed().as_secs_f64() * 1e3;
+                    let phase_str = ph
+                        .iter()
+                        .map(|v| format!("{v:.2}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    eprintln!(
+                        "[gputime] pos={} phases=[{phase_str}]ms gpu_busy={wall:.2}->{gpu_busy:.2}ms dispatches={dispatches} cpu_enq={:.2}ms",
+                        self.pos - 1,
+                        enqueue_s * 1e3,
+                    );
+                }
+                if profile {
+                    eprintln!(
+                        "[profile] decode pos={} embed={:.1}ms ple_load={:.1}ms prepass={:.1}ms attn={:.1}ms mlp={:.1}ms ple={:.1}ms logits+sync={:.1}ms total={:.1}ms",
+                        self.pos - 1,
+                        t_embed.as_secs_f64() * 1e3,
+                        (t_ple - t_embed).as_secs_f64() * 1e3,
+                        (t_pre - t_ple).as_secs_f64() * 1e3,
+                        ms_attn,
+                        ms_mlp,
+                        ms_ple_l,
+                        (t0.elapsed() - t_logits).as_secs_f64() * 1e3
+                            + (t_logits - t_layers).as_secs_f64() * 1e3,
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
+            return Ok(None);
+        }
         let best = self.ctx.read_f32(&dst, 1)[0] as u32;
+
+        // ---- MTP acceptance probe ------------------------------------
+        // Truth check: did the previous draft step predict `best`?
+        // Probe-only: KSEARCH_MTP_PROBE=1 drafts one token after each decode
+        // (acceptance measurement without spec-dec). Default --mtp uses
+        // generate_timed speculative verify instead.
+        if mtp_probe && std::env::var_os("KSEARCH_MTP_PROBE").is_some() {
+            if let Some(pred) = self.mtp_pending.take() {
+                self.mtp_tried += 1;
+                if pred == best as u32 {
+                    self.mtp_hits += 1;
+                }
+                if self.mtp_tried % 16 == 0 {
+                    eprintln!(
+                        "[mtp] tried={} pred={pred} actual={best}",
+                        self.mtp_tried + 1,
+                    );
+                }
+                if self.mtp_tried % 64 == 0 {
+                    eprintln!(
+                        "[mtp-accept] {}/{} = {:.1}%",
+                        self.mtp_hits,
+                        self.mtp_tried,
+                        100.0 * self.mtp_hits as f64 / self.mtp_tried.max(1) as f64
+                    );
+                }
+            }
+            // Contract (llama.cpp gemma4-assistant / metal-llm-server draft_chain):
+            //   xh = concat(embed(best) * √hb, h_post_norm)
+            // `best` is the token just sampled; `x2` is this step's post-final-norm
+            // hidden. RoPE pos = KV length = index of `best` (not yet written).
+            let h_seed: Vec<f32> = self
+                .ctx
+                .read_u16(&self.x2, h)
+                .iter()
+                .map(|&v| ksearch_gguf::f16_to_f32(v))
+                .collect();
+            let scale = (h as f32).sqrt();
+            let mut emb_row = self.mtp_embedding_row(best)?;
+            for v in emb_row.iter_mut() {
+                *v *= scale;
+            }
+            let ks = self.kv_k.clone();
+            let vs = self.kv_v.clone();
+            let seq_len = self.pos;
+            let capacity = self.max_seq;
+            let (pred, _hnext) = {
+                let draft = self.mtp.as_mut().expect("mtp");
+                draft.forward_step(
+                    &self.ctx,
+                    &emb_row,
+                    &h_seed,
+                    seq_len,
+                    seq_len,
+                    capacity,
+                    &ks,
+                    &vs,
+                )?
+            };
+            if std::env::var("MTP_DEBUG").is_ok() {
+                let lg: Vec<f32> = self
+                    .ctx
+                    .read_u16(self.mtp.as_ref().unwrap().debug_logits(), self.cfg.vocab)
+                    .iter()
+                    .map(|&v| ksearch_gguf::f16_to_f32(v))
+                    .collect();
+                let mut idx: Vec<(usize, f32)> = lg.iter().cloned().enumerate().collect();
+                idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                eprintln!(
+                    "[mtp-top] actual={best} draft={pred} pred_top3={:?}",
+                    &idx[..3]
+                        .iter()
+                        .map(|(i, v)| format!("{i}:{v:.1}"))
+                        .collect::<Vec<_>>()
+                );
+            }
+            self.mtp_pending = Some(pred);
+        }
+        // ---------------------------------------------------------------
+
         if profile {
             eprintln!(
                 "[profile] decode pos={} embed={:.1}ms ple_load={:.1}ms prepass={:.1}ms attn={:.1}ms mlp={:.1}ms ple={:.1}ms logits+sync={:.1}ms total={:.1}ms",
@@ -1267,11 +1456,139 @@ impl GemmaPrimModel {
                 ms_attn,
                 ms_mlp,
                 ms_ple_l,
-                (t0.elapsed() - t_logits).as_secs_f64() * 1e3 + (t_logits - t_layers).as_secs_f64() * 1e3,
+                (t0.elapsed() - t_logits).as_secs_f64() * 1e3
+                    + (t_logits - t_layers).as_secs_f64() * 1e3,
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
         Ok(Some(best))
+    }
+
+    /// Load the MTP draft head and enable the acceptance-rate probe.
+    pub fn load_mtp(&mut self, path: &Path) -> Result<()> {
+        // Last non-shared layer of each attention type (metal-llm-server
+        // `mtp_kv_source_layer`). Shared tail layers have empty KV slots.
+        let n_own = self
+            .cfg
+            .n_layers
+            .saturating_sub(self.cfg.shared_kv_layers)
+            .max(1);
+        let kv_map_swa = (0..n_own)
+            .rev()
+            .find(|&i| self.cfg.is_swa(i))
+            .unwrap_or(0);
+        let kv_map_full = (0..n_own)
+            .rev()
+            .find(|&i| !self.cfg.is_swa(i))
+            .unwrap_or(kv_map_swa);
+        eprintln!(
+            "[mtp] kv maps: swa→{kv_map_swa} full→{kv_map_full} (last non-shared owners)"
+        );
+        let draft = MtpDraft::load(
+            Eng::new(),
+            &self.ctx,
+            path,
+            &self.cfg,
+            self.max_seq,
+            kv_map_swa,
+            kv_map_full,
+        )?;
+        eprintln!(
+            "[mtp] draft loaded: vocab={} hb={} (kv maps: swa→{} full→{})",
+            draft.vocab,
+            draft.hb,
+            kv_map_swa,
+            kv_map_full
+        );
+        let h = self.cfg.hidden;
+        let vocab = self.cfg.vocab;
+        self.mtp_hseed = Some(self.ctx.buffer_empty_f16(h));
+        self.mtp_verify_logits = Some(self.ctx.buffer_empty_f16(MAX_MTP_VERIFY * vocab));
+        self.mtp_verify_argmax = Some(self.ctx.buffer_empty_f32(MAX_MTP_VERIFY));
+        self.mtp = Some(draft);
+        // Compile verify (mul_mm batch) + one draft step before generate timing.
+        let n = mtp_draft_steps() + 1;
+        let dummy = vec![0u32; n];
+        let _ = self.forward_verify_batch(&dummy)?;
+        {
+            let ks = self.kv_k.clone();
+            let vs = self.kv_v.clone();
+            let cap = self.max_seq;
+            let xh = self.mtp.as_ref().unwrap().xh_buf().clone();
+            let z = vec![0u16; h * 2];
+            self.ctx.write_u16s(&xh, &z);
+            let draft = self.mtp.as_mut().unwrap();
+            draft.forward_from_xh(&self.ctx, 0, n.max(1), cap, &ks, &vs)?;
+            self.ctx.synchronize()?;
+        }
+        self.reset();
+        self.mtp_hits = 0;
+        self.mtp_tried = 0;
+        eprintln!(
+            "[mtp] spec-dec ready: draft_steps={} verify_batch={}",
+            mtp_draft_steps(),
+            mtp_draft_steps() + 1
+        );
+        Ok(())
+    }
+
+    pub fn mtp_stats(&self) -> (usize, usize) {
+        (self.mtp_hits, self.mtp_tried)
+    }
+
+    fn mtp_embedding_row(&mut self, token: u32) -> Result<Vec<f32>> {
+        // Same GPU dequant path as `embed_token` (Q4_K Load expand).
+        let h = self.cfg.hidden;
+        let dt = self.token_embd.dtype();
+        let buf = self.token_embd.buf().clone();
+        match dt {
+            DType::Q4K => {
+                let row_bytes = (h / 256) * 144;
+                self.eng.copy_scale_wd(
+                    &self.ctx,
+                    h,
+                    1.0,
+                    DType::Q4K,
+                    &buf,
+                    token as usize * row_bytes,
+                    &self.tmp_ff3,
+                    0,
+                )?;
+            }
+            DType::F16 => {
+                self.eng.copy_scale(
+                    &self.ctx,
+                    h,
+                    1.0,
+                    &buf,
+                    token as usize * h,
+                    &self.tmp_ff3,
+                    0,
+                )?;
+            }
+            _ => {
+                let row_bytes = match dt {
+                    DType::Q5K => h / 256 * 176,
+                    DType::Q6K => h / 256 * 210,
+                    _ => h * 2,
+                };
+                return ctx_read_row(
+                    self,
+                    &buf,
+                    token as usize * row_bytes,
+                    row_bytes,
+                    h,
+                    dt,
+                );
+            }
+        }
+        self.ctx.synchronize()?;
+        Ok(self
+            .ctx
+            .read_u16(&self.tmp_ff3, h)
+            .iter()
+            .map(|&v| ksearch_gguf::f16_to_f32(v))
+            .collect())
     }
 
     /// Bind this sequence's K/V packs and `pos` to a pool slot (serving).
@@ -1307,23 +1624,68 @@ impl GemmaPrimModel {
             if chunk.len() == 1 {
                 let _ = self.forward_token(chunk[0], false)?;
             } else {
-                self.forward_prefill_chunk(chunk)?;
+                self.forward_seq_tokens(chunk, false)?;
             }
         }
         self.ctx.synchronize()?;
         Ok(())
     }
 
-    fn forward_prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+    /// Batched target forward for MTP verify: writes KV, returns greedy id after each row.
+    fn forward_verify_batch(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        if tokens.len() > MAX_MTP_VERIFY {
+            bail!(
+                "mtp verify batch {} > MAX_MTP_VERIFY {}",
+                tokens.len(),
+                MAX_MTP_VERIFY
+            );
+        }
+        self.forward_seq_tokens(tokens, true)
+    }
+
+    /// Verify using tokens already packed in `chunk_tok` (GPU draft handoff).
+    fn forward_verify_from_chunk(&mut self, t: usize) -> Result<Vec<u32>> {
+        if t == 0 {
+            return Ok(Vec::new());
+        }
+        if t > MAX_MTP_VERIFY {
+            bail!("mtp verify batch {t} > MAX_MTP_VERIFY {MAX_MTP_VERIFY}");
+        }
+        // Dummy slice — `forward_seq_tokens` rewrites chunk_tok; use a path that
+        // skips the rewrite when tokens is empty sentinel... instead inline skip:
+        self.forward_seq_tokens_prepacked(t, true)
+    }
+
+    fn forward_seq_tokens(&mut self, tokens: &[u32], want_head: bool) -> Result<Vec<u32>> {
         let t = tokens.len();
         if t == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if self.pos + t > self.max_seq {
             bail!("max_seq exceeded");
         }
         let ids: Vec<f32> = tokens.iter().map(|&tok| tok as f32).collect();
         self.ctx.write_buffer_nosync(&self.chunk_tok, &ids);
+        self.forward_seq_tokens_prepacked(t, want_head)
+    }
+
+    fn forward_seq_tokens_prepacked(&mut self, t: usize, want_head: bool) -> Result<Vec<u32>> {
+        if t == 0 {
+            return Ok(Vec::new());
+        }
+        if self.pos + t > self.max_seq {
+            bail!("max_seq exceeded");
+        }
+        let vprof = want_head && std::env::var_os("KSEARCH_VERIFY_PROFILE").is_some();
+        let mut vp_embed = 0.0f64;
+        let mut vp_attn = 0.0f64;
+        let mut vp_mlp = 0.0f64;
+        let mut vp_ple = 0.0f64;
+        let mut vp_head = 0.0f64;
+        let vp_t0 = Instant::now();
 
         let gpu_idx = self.ple_embd.is_some();
         if gpu_idx {
@@ -1331,7 +1693,10 @@ impl GemmaPrimModel {
             self.embed_from_idx_batch(&src, t)?;
             self.ple_from_idx_batch(&src, t)?;
         } else {
-            for (i, &tok) in tokens.iter().enumerate() {
+            // CPU gather fallback: read packed ids.
+            let ids = self.ctx.read_f32(&self.chunk_tok, t);
+            for (i, &tok_f) in ids.iter().enumerate() {
+                let tok = tok_f as u32;
                 self.embed_token(tok)?;
                 self.eng.copy_slice(
                     &self.ctx,
@@ -1353,6 +1718,10 @@ impl GemmaPrimModel {
             }
         }
         self.ple_prepass_batch(t)?;
+        if vprof {
+            self.ctx.synchronize()?;
+            vp_embed = vp_t0.elapsed().as_secs_f64() * 1e3;
+        }
 
         let h = self.cfg.hidden;
         let eps = self.cfg.rms_eps;
@@ -1363,6 +1732,13 @@ impl GemmaPrimModel {
         let ple_dim = self.cfg.ple_dim;
         let pos0 = self.pos;
 
+        // Coarse phase syncs only (not per-layer): otherwise profile cost
+        // dominates and numbers are useless for optimization.
+        let mut vp_attn_t = if vprof {
+            Some(Instant::now())
+        } else {
+            None
+        };
         for layer in 0..n_layers {
             let (q_rows, kv_rows, o_in, ffn_inter, hd) = {
                 let lw = &self.layers[layer];
@@ -1496,6 +1872,15 @@ impl GemmaPrimModel {
                 t,
             )?;
 
+            if layer == 0 && vp_attn_t.is_some() {
+                self.ctx.synchronize()?;
+                if let Some(ts) = vp_attn_t.take() {
+                    // Estimate full-stack attn as first-layer sample × n_layers.
+                    vp_attn = ts.elapsed().as_secs_f64() * 1e3 * n_layers as f64;
+                }
+                // Start MLP timing after first-layer attn sample.
+            }
+
             let gate_name = format!("{pref}ffn_gate.weight");
             let up_name = format!("{pref}ffn_up.weight");
             self.ensure_weight(&gate_name)?;
@@ -1513,29 +1898,51 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x2,
             )?;
-            self.matvec_w_batch(
-                ffn_inter,
-                h,
-                &gate_name,
-                self.x2.clone(),
-                self.tmp_ff1.clone(),
-                t,
-            )?;
-            self.matvec_w_batch(
-                ffn_inter,
-                h,
-                &up_name,
-                self.x2.clone(),
-                self.tmp_ff2.clone(),
-                t,
-            )?;
-            self.eng.gelu_mul(
-                &self.ctx,
-                t * ffn_inter,
-                &self.tmp_ff1,
-                &self.tmp_ff2,
-                &self.tmp_ff3,
-            )?;
+            // Fused gate∥up+GeLU ext matches decode float gelu (correct vs target).
+            // Separate F16-rounds gate/up before gelu — slightly higher draft accept
+            // but wrong vs decode. Default fused; opt out: KSEARCH_MTP_FUSE_GATE=0.
+            let fuse_gate = std::env::var("KSEARCH_MTP_FUSE_GATE").ok().as_deref() != Some("0");
+            let dg = self.weight_bufs.get(&gate_name).unwrap().dtype();
+            let du = self.weight_bufs.get(&up_name).unwrap().dtype();
+            if fuse_gate && dg == du && is_packed(dg) && (2..=8).contains(&t) {
+                let wg = self.weight_bufs.get(&gate_name).unwrap().buf().clone();
+                let wu = self.weight_bufs.get(&up_name).unwrap().buf().clone();
+                self.eng.matvec_gate_up_gelu_batch_wd(
+                    &self.ctx,
+                    ffn_inter,
+                    h,
+                    t,
+                    dg,
+                    &wg,
+                    &wu,
+                    &self.x2,
+                    &self.tmp_ff3,
+                )?;
+            } else {
+                self.matvec_w_batch(
+                    ffn_inter,
+                    h,
+                    &gate_name,
+                    self.x2.clone(),
+                    self.tmp_ff1.clone(),
+                    t,
+                )?;
+                self.matvec_w_batch(
+                    ffn_inter,
+                    h,
+                    &up_name,
+                    self.x2.clone(),
+                    self.tmp_ff2.clone(),
+                    t,
+                )?;
+                self.eng.gelu_mul(
+                    &self.ctx,
+                    t * ffn_inter,
+                    &self.tmp_ff1,
+                    &self.tmp_ff2,
+                    &self.tmp_ff3,
+                )?;
+            }
             self.matvec_w_batch(
                 h,
                 ffn_inter,
@@ -1598,12 +2005,64 @@ impl GemmaPrimModel {
                 &self.x,
             )?;
         }
+        if vprof {
+            self.ctx.synchronize()?;
+            // Rough: remaining time after attn estimate is mlp+ple+glue.
+            let after_layers = vp_t0.elapsed().as_secs_f64() * 1e3;
+            vp_mlp = (after_layers - vp_embed - vp_attn).max(0.0);
+            vp_ple = 0.0; // folded into mlp bucket above for coarse profile
+        }
 
         self.pos += t;
+        if want_head {
+            let vp_head_t = if vprof {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let vocab = self.cfg.vocab;
+            let cap = self.cfg.softcap;
+            let embd_dt = self.token_embd.dtype();
+            let embd = self.token_embd.buf().clone();
+            let logits = self
+                .mtp_verify_logits
+                .as_ref()
+                .ok_or_else(|| anyhow!("mtp verify logits missing"))?
+                .clone();
+            let argmax = self
+                .mtp_verify_argmax
+                .as_ref()
+                .ok_or_else(|| anyhow!("mtp verify argmax missing"))?
+                .clone();
+            self.eng
+                .rmsnorm_rows(&self.ctx, h, t, eps, &self.x, &self.output_norm, &self.x2)?;
+            self.eng.matvec_batch(
+                &self.ctx,
+                vocab,
+                h,
+                t,
+                embd_dt,
+                &embd,
+                &self.x2,
+                &logits,
+            )?;
+            self.eng
+                .softcap_argmax_rows(&self.ctx, vocab, t, cap, &logits, &argmax)?;
+            self.ctx.synchronize()?;
+            if let Some(ts) = vp_head_t {
+                vp_head = ts.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "[verify-profile] t={t} embed={vp_embed:.1} attn={vp_attn:.1} mlp={vp_mlp:.1} ple={vp_ple:.1} head={vp_head:.1} total={:.1}ms",
+                    vp_t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            let ids = self.ctx.read_f32(&argmax, t);
+            return Ok(ids.iter().map(|&v| v as u32).collect());
+        }
         // Must wait: next chunk reuses x/meta/chunk_tok. flush_async raced the
         // CPU overwrite with in-flight GPU and corrupted early-prompt KV.
         self.ctx.synchronize()?;
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// Decode one token: embed/PLE from `token`, return next greedy id.
@@ -1655,6 +2114,185 @@ impl GemmaPrimModel {
         }
     }
 
+    fn mtp_copy_hseed(&mut self, row: usize) -> Result<()> {
+        let h = self.cfg.hidden;
+        let dst = self
+            .mtp_hseed
+            .as_ref()
+            .ok_or_else(|| anyhow!("mtp hseed missing"))?
+            .clone();
+        self.eng.copy_scale_wd(
+            &self.ctx,
+            h,
+            1.0,
+            DType::F16,
+            &self.x2,
+            row * h * DType::F16.size_bytes(),
+            &dst,
+            0,
+        )?;
+        self.ctx.encoder_barrier();
+        Ok(())
+    }
+
+    /// Draft `n` tokens from `id_last` + `mtp_hseed`. All steps share the same
+    /// RoPE pos / KV (metal-llm-server `draft_chain`). Leaves `draft_ids` on GPU
+    /// — caller syncs once after verify (no mid-cycle CPU round-trip).
+    fn mtp_draft_chain(&mut self, id_last: u32, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let h = self.cfg.hidden;
+        let scale = (h as f32).sqrt();
+        let dt = self.token_embd.dtype();
+        let embd = self.token_embd.buf().clone();
+        let hseed = self
+            .mtp_hseed
+            .as_ref()
+            .ok_or_else(|| anyhow!("mtp hseed missing"))?
+            .clone();
+        let xh = self.mtp.as_ref().unwrap().xh_buf().clone();
+        let argmax = self.mtp.as_ref().unwrap().argmax_buf().clone();
+        let hnext = self.mtp.as_ref().unwrap().hnext_buf().clone();
+        let draft_ids = self
+            .mtp_verify_argmax
+            .as_ref()
+            .ok_or_else(|| anyhow!("mtp draft ids missing"))?
+            .clone();
+        let pos = self.pos;
+        let cap = self.max_seq;
+        let ks = self.kv_k.clone();
+        let vs = self.kv_v.clone();
+
+        self.ctx.write_buffer_nosync(&self.tok_idx[0], &[id_last as f32]);
+        for step in 0..n {
+            let idx = if step == 0 {
+                &self.tok_idx[0]
+            } else {
+                &argmax
+            };
+            self.eng
+                .copy_scale_indexed_wd(&self.ctx, h, scale, dt, &embd, idx, &xh)?;
+            self.ctx.encoder_barrier();
+            let hsrc = if step == 0 { &hseed } else { &hnext };
+            self.eng
+                .copy_scale_wd(&self.ctx, h, 1.0, DType::F16, hsrc, 0, &xh, h * 2)?;
+            self.ctx.encoder_barrier();
+            {
+                let draft = self.mtp.as_mut().expect("mtp");
+                draft.forward_from_xh(&self.ctx, pos, pos, cap, &ks, &vs)?;
+            }
+            self.ctx.blit_copy_bytes(
+                &argmax,
+                0,
+                &draft_ids,
+                (step * std::mem::size_of::<f32>()) as u64,
+                std::mem::size_of::<f32>() as u64,
+            );
+        }
+        Ok(())
+    }
+
+    /// Build verify token buffer on GPU: `chunk_tok = [id_last] ++ draft_ids[0..n_draft]`.
+    fn mtp_pack_verify_toks(&mut self, id_last: u32, n_draft: usize) -> Result<()> {
+        let draft_ids = self
+            .mtp_verify_argmax
+            .as_ref()
+            .ok_or_else(|| anyhow!("mtp draft ids missing"))?
+            .clone();
+        self.ctx.write_buffer_nosync(&self.chunk_tok, &[id_last as f32]);
+        if n_draft > 0 {
+            self.ctx.encoder_barrier();
+            self.ctx.blit_copy_bytes(
+                &draft_ids,
+                0,
+                &self.chunk_tok,
+                std::mem::size_of::<f32>() as u64,
+                (n_draft * std::mem::size_of::<f32>()) as u64,
+            );
+        }
+        self.ctx.encoder_barrier();
+        Ok(())
+    }
+
+    fn generate_mtp(
+        &mut self,
+        mut id_last: u32,
+        n_new: usize,
+        verbose: bool,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
+        let max_draft = mtp_draft_steps();
+        let mut n_cycles = 0usize;
+        let mut draft_ms = 0.0f64;
+        let mut verify_ms = 0.0f64;
+        while out.len() < n_new {
+            let remain = n_new - out.len();
+            let n_draft = max_draft.min(remain).max(1);
+            let pos_before = self.pos;
+            let t0 = Instant::now();
+            self.mtp_draft_chain(id_last, n_draft)?;
+            self.mtp_pack_verify_toks(id_last, n_draft)?;
+            draft_ms += t0.elapsed().as_secs_f64() * 1e3;
+            self.mtp_tried += n_draft;
+
+            let t1 = Instant::now();
+            let preds = self.forward_verify_from_chunk(n_draft + 1)?;
+            // Drafts live in chunk_tok[1..] (argmax was overwritten by verify).
+            let packed = self.ctx.read_f32(&self.chunk_tok, n_draft + 1);
+            let drafted: Vec<u32> = packed[1..].iter().map(|&v| v as u32).collect();
+            verify_ms += t1.elapsed().as_secs_f64() * 1e3;
+            n_cycles += 1;
+
+            let mut ids = Vec::new();
+            let mut n_acc = 0usize;
+            for i in 0..drafted.len() {
+                ids.push(preds[i]);
+                if preds[i] != drafted[i] {
+                    break;
+                }
+                n_acc += 1;
+            }
+            if n_acc == drafted.len() {
+                ids.push(preds[drafted.len()]);
+            }
+            self.mtp_hits += n_acc;
+
+            let rewind = drafted.len() - n_acc;
+            self.pos = pos_before + (n_draft + 1) - rewind;
+            let i_h = n_acc.min(n_draft);
+            self.mtp_copy_hseed(i_h)?;
+
+            for &tok in &ids {
+                if out.len() >= n_new {
+                    break;
+                }
+                out.push(tok);
+                if verbose {
+                    let piece = self
+                        .vocab
+                        .as_ref()
+                        .map(|v| v.decode(&[tok], false))
+                        .unwrap_or_default();
+                    eprintln!("  token[{}] = {tok} {piece:?}", out.len() - 1);
+                }
+                if tok == 1 || tok == 106 {
+                    return Ok(());
+                }
+            }
+            id_last = *ids.last().unwrap();
+        }
+        if n_cycles > 0 {
+            eprintln!(
+                "[mtp-time] cycles={} draft={:.1}ms/cyc verify={:.1}ms/cyc",
+                n_cycles,
+                draft_ms / n_cycles as f64,
+                verify_ms / n_cycles as f64
+            );
+        }
+        Ok(())
+    }
+
     pub fn generate_timed(
         &mut self,
         prompt_tokens: &[u32],
@@ -1673,9 +2311,27 @@ impl GemmaPrimModel {
         let prefill_tokens = prefill_toks.len();
 
         let mut tok = *prompt_tokens.last().unwrap();
-        let gpu_pipe = self.ple_embd.is_some();
+        // MTP spec-dec cannot use the ping-pong GPU pipe (needs `best` + `x2`).
+        let gpu_pipe = self.ple_embd.is_some() && self.mtp.is_none();
         let t_decode = Instant::now();
-        if gpu_pipe {
+        if self.mtp.is_some() {
+            let next = self
+                .forward_token(tok, true)?
+                .ok_or_else(|| anyhow!("decode expected logits"))?;
+            out.push(next);
+            if verbose {
+                let piece = self
+                    .vocab
+                    .as_ref()
+                    .map(|v| v.decode(&[next], false))
+                    .unwrap_or_default();
+                eprintln!("  token[0] = {next} {piece:?}");
+            }
+            if next != 1 && next != 106 && out.len() < n_new {
+                self.mtp_copy_hseed(0)?;
+                self.generate_mtp(next, n_new, verbose, &mut out)?;
+            }
+        } else if gpu_pipe {
             self.ctx.synchronize()?;
             self.ctx
                 .write_buffer_nosync(&self.tok_idx[0], &[tok as f32]);
@@ -1770,4 +2426,26 @@ impl GemmaPrimModel {
     pub fn generate(&mut self, prompt_tokens: &[u32], n_new: usize) -> Result<Vec<u32>> {
         Ok(self.generate_timed(prompt_tokens, n_new, true)?.tokens)
     }
+}
+
+
+/// Read one weight row off the GPU and dequantize to f32 (probe helper).
+fn ctx_read_row(
+    model: &mut GemmaPrimModel,
+    buf: &Buffer,
+    off: usize,
+    len: usize,
+    h: usize,
+    dt: DType,
+) -> Result<Vec<f32>> {
+    let raw = model.ctx.read_bytes(buf, off, len);
+    let mut out = vec![0f32; h];
+    let gt = match dt {
+        DType::Q4K => ggml_type::Q4_K,
+        DType::Q5K => ggml_type::Q5_K,
+        DType::Q6K => ggml_type::Q6_K,
+        _ => ggml_type::F16,
+    };
+    dequant_row_to_f32(gt, &raw, h, &mut out);
+    Ok(out)
 }

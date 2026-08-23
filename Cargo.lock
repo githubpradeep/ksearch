@@ -653,6 +653,7 @@ dependencies = [
  "ksearch_gguf",
  "ksearch_ir",
  "ksearch_metal",
+ "ksearch_tuner",
  "serde",
  "serde_json",
  "tokenizers",
@@ -667,6 +668,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ksearch_ir",
+ "ksearch_tuner",
  "thiserror",
 ]
 
@@ -675,11 +677,13 @@ name = "ksearch_gemma"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ksearch_codegen",
  "ksearch_gguf",
  "ksearch_ir",
  "ksearch_kernels",
  "ksearch_metal",
  "metal",
+ "serde_json",
 ]
 
 [[package]]
@@ -719,6 +723,15 @@ dependencies = [
  "ksearch_ir",
  "metal",
  "objc",
+]
+
+[[package]]
+name = "ksearch_tuner"
+version = "0.1.0"
+dependencies = [
+ "ksearch_ir",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

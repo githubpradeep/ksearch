@@ -73,4 +73,12 @@ write s to disk keyed by (op, rows, cols, device)
 
 Correctness: always check the tuned kernel against the untuned kernel (or CPU) before saving. ksearch’s CLI `matvec --beam` compares to a CPU reference.
 
+## Making the search itself cheap
+
+Timing every candidate is fine once (plans are cached), but the first search
+per shape pays full price. Chapter [09-tuner.md](./09-tuner.md) adds a learned
+cost model trained on these very timings: after ~128 samples exist,
+`KSEARCH_TUNER=1` measures only the model’s top picks (~6 timings instead of
+~48) and usually lands on the same winner.
+
 Next: [06-quant.md](./06-quant.md).

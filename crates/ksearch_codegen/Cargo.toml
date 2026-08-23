@@ -5,5 +5,6 @@ edition.workspace = true
 
 [dependencies]
 ksearch_ir.workspace = true
+ksearch_tuner.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

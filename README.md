@@ -10,6 +10,7 @@ ksearch is a local Metal inference stack: load a GGUF, generate text, or serve a
 
 - **Local Gemma 4 on Mac** — Q4_K-style GGUFs, chat template, generate or HTTP serve
 - **Compiler, not a shader farm** — ops expand to primitives; Metal is rendered from an AST
+- **Self-tuning kernels** — BEAM picks tilings by timing them; an optional learned cost model (`KSEARCH_TUNER=1`) trained on your own timings cuts the search from ~48 timings to ~6
 - **Dense E2B and E4B** — sizes and GQA/MQA come from GGUF metadata (MoE A4B is not supported yet)
 - **OpenAI-style server** — `/v1/chat/completions` for tools and apps that already speak that API
 
@@ -97,6 +98,7 @@ cargo run -p ksearch_cli --release -- matvec --rows 4096 --cols 4096 --beam
 | `KSEARCH_BEAM_CACHE` | Plan cache dir (default `~/.cache/ksearch/beam`) |
 | `KSEARCH_PROFILE` | Per-section GPU timings |
 | `KSEARCH_CHIP` | Plan-cache chip key (default: Metal device name) |
+| `KSEARCH_TUNER=1` | Guided autotuning: a cost model trained on your own kernel timings picks which tilings to measure ([docs/09-tuner.md](docs/09-tuner.md)) |
 
 ## How it works (short)
 

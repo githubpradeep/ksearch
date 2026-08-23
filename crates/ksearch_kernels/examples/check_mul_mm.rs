@@ -1,4 +1,5 @@
-//! Compare prefill Q4_K mul_mm (`matvec_batch` with batch>8) against decode GEMV.
+//! Compare Q4_K matvec_batch (small-N GEMM for batch 2..=8, mul_mm for batch>8)
+//! against serial decode GEMV.
 use anyhow::Result;
 use ksearch_gguf::{dequant_type_to_f32, f16_to_f32, f32_to_f16, ggml_type, quantize_f32_to_q4k};
 use ksearch_ir::DType;
@@ -297,6 +298,12 @@ fn main() -> Result<()> {
     let ctx = MetalContext::new()?;
     let mut eng = Eng::new();
     println!("device={}", ctx.device_name());
+    // Small-N GEMM (MTP verify): must match serial GEMV.
+    check(&ctx, &mut eng, 64, 256, 2)?;
+    check(&ctx, &mut eng, 64, 256, 5)?;
+    check(&ctx, &mut eng, 2048, 1536, 5)?;
+    check(&ctx, &mut eng, 4096, 1536, 5)?;
+    // Prefill mul_mm (batch>8).
     check(&ctx, &mut eng, 64, 256, 16)?;
     check(&ctx, &mut eng, 128, 256, 9)?;
     check(&ctx, &mut eng, 2048, 1536, 256)?;
@@ -304,6 +311,10 @@ fn main() -> Result<()> {
     check(&ctx, &mut eng, 4096, 1536, 55)?;
     check_qkv(&ctx, &mut eng, 8, 1, 256, 16)?;
     check_qkv(&ctx, &mut eng, 8, 1, 512, 16)?;
+    check_sdpa(&ctx, &mut eng, 8, 256, 2, 64, 0, 64)?;
+    check_sdpa(&ctx, &mut eng, 8, 512, 5, 64, 0, 64)?;
+    check_sdpa(&ctx, &mut eng, 8, 256, 5, 256, 120, 256)?;
+    check_sdpa(&ctx, &mut eng, 8, 512, 3, 256, 200, 256)?;
     check_sdpa(&ctx, &mut eng, 8, 256, 16, 64, 0, 64)?;
     check_sdpa(&ctx, &mut eng, 8, 512, 16, 64, 0, 64)?;
     check_sdpa(&ctx, &mut eng, 8, 256, 16, 256, 0, 256)?;

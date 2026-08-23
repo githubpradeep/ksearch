@@ -1,10 +1,19 @@
 //! Lower KernelKind → Kernel IR AST (no Metal strings).
 
+mod sdpa_shared;
+
 use crate::CodegenError;
 use ksearch_ir::{
     BinOp, DType, ElemExpr, KirExpr, KirLaunch, KirStmt, KernelIr, KernelKind, OptSchedule,
     ScheduledKernel, UnaryOp,
 };
+
+fn want_sdpa_shared_q(n_tok: usize) -> bool {
+    // Opt-in: short-ctx MTP sees a wash/regression; long-ctx wins (metal-llm M4).
+    (2..=8).contains(&n_tok)
+        && std::env::var_os("KSEARCH_SDPA_SHARED").is_some()
+        && std::env::var("KSEARCH_SDPA_SHARED").ok().as_deref() != Some("0")
+}
 
 fn packed_k_quant(d: DType) -> bool {
     matches!(d, DType::Q4K | DType::Q6K)
@@ -57,6 +66,7 @@ pub fn lower_to_kir(
         KernelKind::MatvecGateUpGelu {
             rows,
             cols,
+            batch,
             weight_dtype,
             ..
         } => {
@@ -65,27 +75,47 @@ pub fn lower_to_kir(
                     "lower matvec_gate_up_gelu: weight dtype must be float or Q4K".into(),
                 ));
             }
-            validate_sched(sched)?;
-            let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
-            (
-                matvec_launch(*weight_dtype, *rows, sched, 1),
-                lower_matvec_gate_up_gelu(
-                    *rows,
-                    *cols,
-                    *weight_dtype,
-                    sched,
-                    2,
-                    3,
-                    None,
-                    &mut next,
-                )?,
-                1,
-            )
+            if matvec_ext_batch(*batch)
+                && *weight_dtype == DType::Q4K
+                && *cols % 256 == 0
+            {
+                (
+                    mul_mv_ext_launch(*rows, *batch),
+                    vec![KirStmt::Q4kMulMvExtGateUpGelu {
+                        rows: *rows as u32,
+                        cols: *cols as u32,
+                        batch: *batch as u32,
+                        gate_buf: 0,
+                        up_buf: 1,
+                        x_buf: 2,
+                        out_buf: 3,
+                    }],
+                    1,
+                )
+            } else {
+                validate_sched(sched)?;
+                let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
+                (
+                    matvec_launch(*weight_dtype, *rows, sched, 1),
+                    lower_matvec_gate_up_gelu(
+                        *rows,
+                        *cols,
+                        *weight_dtype,
+                        sched,
+                        2,
+                        3,
+                        None,
+                        &mut next,
+                    )?,
+                    1,
+                )
+            }
         }
         KernelKind::MatvecQkv {
             q_rows,
             kv_rows,
             cols,
+            batch,
             wq_dtype,
             wk_dtype,
             wv_dtype,
@@ -100,28 +130,65 @@ pub fn lower_to_kir(
                 // Homogeneous only on HEAD lower; mixed uses wq for schedule, per-buf via separate path later.
             }
             let wd = *wq_dtype;
-            validate_sched(sched)?;
             let max_rows = (*q_rows).max(*kv_rows);
-            let sched = apply_matvec_sched(wd, *cols, max_rows, sched);
-            (
-                matvec_launch(wd, max_rows, sched, 1),
-                lower_matvec_qkv(
-                    *q_rows,
-                    *kv_rows,
-                    *cols,
-                    *wq_dtype,
-                    *wk_dtype,
-                    *wv_dtype,
-                    sched,
+            if matvec_ext_batch(*batch)
+                && wd == DType::Q4K
+                && *cols % 256 == 0
+            {
+                // One dispatch, three ext passes (same grid = max rows).
+                (
+                    mul_mv_ext_launch(max_rows, *batch),
+                    vec![
+                        KirStmt::Q4kMulMvExt {
+                            rows: *q_rows as u32,
+                            cols: *cols as u32,
+                            batch: *batch as u32,
+                            w_buf: 0,
+                            x_buf: 3,
+                            out_buf: 4,
+                        },
+                        KirStmt::Q4kMulMvExt {
+                            rows: *kv_rows as u32,
+                            cols: *cols as u32,
+                            batch: *batch as u32,
+                            w_buf: 1,
+                            x_buf: 3,
+                            out_buf: 5,
+                        },
+                        KirStmt::Q4kMulMvExt {
+                            rows: *kv_rows as u32,
+                            cols: *cols as u32,
+                            batch: *batch as u32,
+                            w_buf: 2,
+                            x_buf: 3,
+                            out_buf: 6,
+                        },
+                    ],
                     3,
-                    4,
-                    5,
-                    6,
-                    None,
-                    &mut next,
-                )?,
-                3,
-            )
+                )
+            } else {
+                validate_sched(sched)?;
+                let sched = apply_matvec_sched(wd, *cols, max_rows, sched);
+                (
+                    matvec_launch(wd, max_rows, sched, 1),
+                    lower_matvec_qkv(
+                        *q_rows,
+                        *kv_rows,
+                        *cols,
+                        *wq_dtype,
+                        *wk_dtype,
+                        *wv_dtype,
+                        sched,
+                        3,
+                        4,
+                        5,
+                        6,
+                        None,
+                        &mut next,
+                    )?,
+                    3,
+                )
+            }
         }
         KernelKind::RmsNormMatvec {
             eps,
@@ -422,6 +489,15 @@ pub fn lower_to_kir(
                     lower_mul_mm(*rows, *cols, *batch, *weight_dtype),
                     1,
                 )
+            } else if matvec_ext_batch(*batch)
+                && matches!(*weight_dtype, DType::Q4K | DType::Q6K)
+                && *cols % 256 == 0
+            {
+                (
+                    mul_mv_ext_launch(*rows, *batch),
+                    lower_mul_mv_ext(*rows, *cols, *batch, *weight_dtype),
+                    1,
+                )
             } else {
                 validate_sched(sched)?;
                 let sched = apply_matvec_sched(*weight_dtype, *cols, *rows, sched);
@@ -496,11 +572,16 @@ pub fn lower_to_kir(
         } => {
             let groups = sdpa_groups(*n_q, *n_kv);
             let tg = (groups as u64).saturating_mul(32).max(32);
+            // MTP verify shared-q: env KSEARCH_SDPA_SHARED=1/0, or Eng auto via
+            // `set_sdpa_shared_q_pref` when attn_t is long.
+            let shared = want_sdpa_shared_q(*n_tok);
+            let rows = if shared {
+                (*n_kv).max(1)
+            } else {
+                (*n_tok).saturating_mul(*n_kv).max(1)
+            };
             (
-                KirLaunch::RowsParallel {
-                    rows: (*n_tok).saturating_mul(*n_kv).max(1),
-                    tg,
-                },
+                KirLaunch::RowsParallel { rows, tg },
                 lower_sdpa_online(
                     *n_q, *n_kv, *hd, *max_t, out_dtype, *kv_dtype, tg, *n_tok, &mut next,
                 ),
@@ -693,13 +774,13 @@ pub fn lower_to_kir(
             (launch, body, 1)
         }
 
-        KernelKind::SoftcapArgmax { n, cap, .. } => (
-            // One threadgroup, lid-strided scan + tg reduce (not 1 thread × vocab).
+        KernelKind::SoftcapArgmax { n, rows, cap, .. } => (
+            // One TG per row: lid-strided scan + tg reduce (not 1 thread × vocab).
             KirLaunch::RowsParallel {
-                rows: 1,
+                rows: (*rows).max(1),
                 tg: 1024,
             },
-            lower_softcap_argmax(*n, *cap, DType::F16, 1024, &mut next),
+            lower_softcap_argmax(*n, *rows, *cap, DType::F16, 1024, &mut next),
             1,
         ),
     };
@@ -771,18 +852,73 @@ fn batch_store_idx(tok: Option<u32>, row: KirExpr, rows: usize) -> KirExpr {
     }
 }
 
-/// Oracle `should_use_mul_mm`: seq_len > 8. Decode (`batch==1`) stays GEMV.
+/// Prefill (`batch>8`) uses llama.cpp-style mul_mm. MTP verify (2–8) uses
+/// `mul_mv_ext` (dequant weight once × all batch rows). Decode is GEMV.
 fn matvec_gemm_batch(batch: usize) -> bool {
     batch > 8
 }
 
-/// Tokens per row-TG in prefill GEMM. Unused: batch>8 uses mul_mm MMA instead.
-#[allow(dead_code)]
-const MATVEC_GEMM_TILE: usize = 8;
+/// Small-N verify: llama.cpp `mul_mv_ext` regime (not coop GEMM — that spills).
+fn matvec_ext_batch(batch: usize) -> bool {
+    (2..=8).contains(&batch)
+}
 
+fn mv_ext_r1ptg(batch: u32) -> u32 {
+    match batch {
+        2 => 2,
+        3 | 6 => 3,
+        5 => 5,
+        _ => 4,
+    }
+}
+
+fn mul_mv_ext_launch(rows: usize, batch: usize) -> KirLaunch {
+    // llama.cpp defaults nsg=2; metal-llm-server notes M1 Pro prefers more SGs
+    // to hide Q4_K dequant latency on small-batch verify.
+    const NXPSG: u32 = 8;
+    let nsg: u32 = std::env::var("KSEARCH_MV_EXT_NSG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| (1..=8).contains(&n))
+        .unwrap_or(4);
+    let nypsg = 32 / NXPSG;
+    let r0ptg = nypsg * nsg;
+    let r1ptg = mv_ext_r1ptg(batch as u32);
+    KirLaunch::MulMm {
+        tg_x: (rows as u64).div_ceil(r0ptg as u64).max(1),
+        tg_y: (batch as u64).div_ceil(r1ptg as u64).max(1),
+        tw: 32,
+        nsg: nsg as u64,
+        smem: 32, // unused by ext helper; Metal wants a non-zero TG binding
+    }
+}
+
+fn lower_mul_mv_ext(rows: usize, cols: usize, batch: usize, dtype: DType) -> Vec<KirStmt> {
+    match dtype {
+        DType::Q4K => vec![KirStmt::Q4kMulMvExt {
+            rows: rows as u32,
+            cols: cols as u32,
+            batch: batch as u32,
+            w_buf: 0,
+            x_buf: 1,
+            out_buf: 2,
+        }],
+        DType::Q6K => vec![KirStmt::Q6kMulMvExt {
+            rows: rows as u32,
+            cols: cols as u32,
+            batch: batch as u32,
+            w_buf: 0,
+            x_buf: 1,
+            out_buf: 2,
+        }],
+        _ => vec![],
+    }
+}
+
+/// Tokens per row-TG in the old coop GEMM path (unused; ext replaces it).
 #[allow(dead_code)]
-fn matvec_gemm_tiles(batch: usize) -> usize {
-    batch.div_ceil(MATVEC_GEMM_TILE)
+fn matvec_small_gemm(batch: usize, _rows: usize) -> bool {
+    false && (2..=8).contains(&batch)
 }
 
 fn mul_mm_launch(rows: usize, batch: usize) -> KirLaunch {
@@ -837,20 +973,10 @@ fn emit_gemm_reduce_store(
     out_buf: u32,
     exact_rows: bool,
     epi: MatvecEpi,
-    tok_tile: u32,
     next: &mut u32,
 ) {
     let t = fresh(next);
-    let abs = fresh(next);
-    let mut body = vec![KirStmt::LetU32 {
-        id: abs,
-        expr: bin(
-            BinOp::Add,
-            bin(BinOp::Mul, uv(tok_tile), cu(MATVEC_GEMM_TILE as u32)),
-            fv(t),
-        ),
-    }];
-    let mut inner_t = Vec::new();
+    let mut body = Vec::new();
     for r in 0..nr {
         let row = if r == 0 {
             uv(first)
@@ -869,7 +995,7 @@ fn emit_gemm_reduce_store(
             out_buf,
             bin(
                 BinOp::Add,
-                bin(BinOp::Mul, uv(abs), cu(rows as u32)),
+                bin(BinOp::Mul, fv(t), cu(rows as u32)),
                 row.clone(),
             ),
             acc,
@@ -881,21 +1007,17 @@ fn emit_gemm_reduce_store(
             body: store_body,
         });
         if exact_rows {
-            inner_t.extend(inner);
+            body.extend(inner);
         } else {
-            inner_t.push(KirStmt::If {
+            body.push(KirStmt::If {
                 cond: gt(cu(rows as u32), row),
                 body: inner,
             });
         }
     }
-    body.push(KirStmt::If {
-        cond: gt(cu(batch as u32), uv(abs)),
-        body: inner_t,
-    });
     stmts.push(KirStmt::For {
         id: t,
-        n: MATVEC_GEMM_TILE,
+        n: batch,
         body,
     });
 }
@@ -1146,17 +1268,36 @@ fn apply_matvec_sched(
     mut sched: OptSchedule,
 ) -> OptSchedule {
     if matches!(weight_dtype, DType::Q4K | DType::Q6K) && cols % 256 == 0 {
-        // ggml mul_vec_q{4,6}_K: TG=64 (2 SG), 8 rows/TG (4 per SG).
-        sched.tg = 64;
-        sched.nr0 = 8;
-        sched.nsg = 2;
-        // Wide TG is faster on modest row counts (QKV, gate/up, o-proj, down).
-        // lm_head (vocab) regresses at nsg=4. Tiny PLE gate (256 rows) is only
-        // 16 TGs at nsg=4 — occupancy loss; keep ggml nsg=2 below 512 rows.
-        if weight_dtype == DType::Q4K && rows >= 512 && rows <= 32768 {
-            sched.nsg = 4;
-            sched.tg = 128;
-            sched.nr0 = 16;
+        let seeded = sched == OptSchedule::untuned() || sched == OptSchedule::q4k_default();
+        // Coop kernel invariant: the AST writes exactly `nsg*4` rows per TG
+        // (ggml KQ_NR0=4 per simdgroup) while the launch derives TG count from
+        // `nr0`. Canonicalize so any plan/candidate stays consistent — a
+        // mismatch under-covers (stale outputs) or over-covers (OOB stores).
+        if weight_dtype == DType::Q6K {
+            // Q6K coop lowering fixes 2 simdgroups internally (`let _ = sched`).
+            sched.nsg = 2;
+        }
+        sched.nsg = sched.nsg.clamp(1, 4);
+        // Legal Nr4-group ratios: 4 (classic) or 8 (two Nr4 bodies per
+        // superblock; doubles ILP for short-K). Anything else snaps to 4.
+        let ratio = (sched.nr0 / sched.nsg).clamp(4, 8);
+        sched.nr0 = sched.nsg * if ratio >= 8 { 8 } else { 4 };
+        // Explicit plans / BEAM candidates keep their nsg/unroll choice (the
+        // tuner searches it per shape+chip); only untuned seeds fall back to
+        // ggml-style shapes so a cold cache still lands on a known-good kernel.
+        if seeded {
+            // ggml mul_vec_q{4,6}_K: TG=64 (2 SG), 8 rows/TG (4 per SG).
+            sched.tg = 64;
+            sched.nr0 = 8;
+            sched.nsg = 2;
+            // Wide TG is faster on modest row counts (QKV, gate/up, o-proj, down).
+            // lm_head (vocab) regresses at nsg=4. Tiny PLE gate (256 rows) is only
+            // 16 TGs at nsg=4 — occupancy loss; keep ggml nsg=2 below 512 rows.
+            if weight_dtype == DType::Q4K && rows >= 512 && rows <= 32768 {
+                sched.nsg = 4;
+                sched.tg = 128;
+                sched.nr0 = 16;
+            }
         }
     }
     sched
@@ -1771,16 +1912,33 @@ fn lower_matvec_q4k_coop(
     batch: usize,
     next: &mut u32,
 ) -> Result<Vec<KirStmt>, CodegenError> {
-    let nsg = sched.nsg.max(1);
-    let tg = (nsg as u64) * 32;
-    // Force 4 rows/SG (ggml KQ_NR0) so nr4 y-amortized expand applies.
-    let nr = 4u32;
+    let mut nsg = sched.nsg.max(1);
+    // Rows per SG in groups of 4 (ggml KQ_NR0): ratio 4 = classic, ratio 8
+    // emits two Nr4 bodies per superblock — doubles independent FMA chains
+    // (short-K latency) and halves per-TG x traffic. Requires exact rows.
+    let mut groups = (sched.nr0 as usize / (nsg as usize * 4)).clamp(1, 2) as u32;
     let nb = (cols / 256) as u32;
-    let exact_rows = rows % ((nsg * nr) as usize) == 0;
+    let mut nr = 4u32 * groups;
+    let mut exact_rows = rows % ((nsg * nr) as usize) == 0;
+    if (!exact_rows && groups > 1) || batch > 1 {
+        // Partial tail or batched GEMM: single-group path only.
+        groups = 1;
+        nr = 4u32 * groups;
+        exact_rows = rows % ((nsg * nr) as usize) == 0;
+    }
+    // Small-N GEMM: keep ggml nsg=2. Wider nsg (4) + multi-token accs
+    // spills and loses the weight-stream win on mid-size FFN mats.
+    if matvec_small_gemm(batch, rows) {
+        nsg = 2;
+        exact_rows = rows % ((nsg * nr) as usize) == 0;
+    }
+    let tg = (nsg as u64) * 32;
     let n_tg = (rows.saturating_add((nsg * nr) as usize - 1) / (nsg * nr) as usize) as u32;
 
     // Device-x (oracle-style): stream device half x unless fused rms needs LOCAL x_hat.
-    let prefer_local = false;
+    // KSEARCH_Q4K_LOCAL_X=1 forces TG staging for A/B (tuner-selectable later).
+    let prefer_local = std::env::var("KSEARCH_Q4K_LOCAL_X").is_ok_and(|v| v != "0")
+        && rms.is_none();
     let (mut stmts, tg_x) = if rms.is_some() || prefer_local {
         let (s, tg) = stage_local_x(cols, x_buf, tg, DType::F16, rms, next)?;
         if rms.is_some() {
@@ -1811,8 +1969,8 @@ fn lower_matvec_q4k_coop(
         id: lane,
         expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(sg), cu(32))),
     });
-    // Prefill batch>8 uses KirStmt::Q4kMulMm, not this GEMV token-loop.
-    let gemm = false;
+    // Prefill batch>8 uses KirStmt::Q4kMulMm. batch 2..=8: one weight stream, N accs.
+    let gemm = matvec_small_gemm(batch, rows);
     let (tok, row_gid) = if gemm {
         (None, gid())
     } else {
@@ -1876,27 +2034,38 @@ fn lower_matvec_q4k_coop(
     });
     let mut body = Vec::new();
     if nr == 4 {
-        let nr4 = KirStmt::Q4kCoopNr4 {
-            w_buf: 0,
-            row0_base: uv(bases[0]),
-            cols: cols as u32,
-            ib: uv(ib),
-            b_from_tg: tg_x,
-            x_buf,
-            x_off: if gemm { cu(0) } else { x_off_e.clone() },
-            lane: uv(lane),
-            acc_ids: if gemm {
-                [0, 0, 0, 0]
-            } else {
-                [accs[0], accs[1], accs[2], accs[3]]
-            },
-            n_tok: if gemm { batch as u32 } else { 1 },
-            x_stride: if gemm { cols as u32 } else { 0 },
-            acc_th,
-        };
+        // One Nr4 body per 4-row group (groups>1 doubles ILP per superblock).
+        let mut nr4s = Vec::with_capacity(groups as usize);
+        for g in 0..groups {
+            let bi = (g * 4) as usize;
+            nr4s.push(KirStmt::Q4kCoopNr4 {
+                w_buf: 0,
+                row0_base: uv(bases[bi]),
+                cols: cols as u32,
+                ib: uv(ib),
+                b_from_tg: tg_x,
+                x_buf,
+                x_off: if gemm { cu(0) } else { x_off_e.clone() },
+                lane: uv(lane),
+                acc_ids: if gemm {
+                    [0, 0, 0, 0]
+                } else {
+                    [
+                        accs[bi],
+                        accs[bi + 1],
+                        accs[bi + 2],
+                        accs[bi + 3],
+                    ]
+                },
+                n_tok: if gemm { batch as u32 } else { 1 },
+                x_stride: if gemm { cols as u32 } else { 0 },
+                acc_th,
+            });
+        }
         if exact_rows {
-            body.push(nr4);
+            body.extend(nr4s);
         } else {
+            let nr4 = nr4s.into_iter().next().unwrap();
             let last = bin(BinOp::Add, uv(first), cu(3));
             body.push(KirStmt::If {
                 cond: gt(cu(rows as u32), last.clone()),
@@ -2022,6 +2191,12 @@ fn lower_matvec_q4k_coop(
             });
         }
     }
+    let sweep = std::env::var("KSEARCH_Q4K_SWEEP").is_ok_and(|v| v != "0")
+        && batch == 1
+        && tg_x.is_none()
+        && exact_rows
+        && groups == 1;
+    if !sweep {
     stmts.push(KirStmt::ForRange {
         id: ib,
         limit_off: cu(0),
@@ -2029,6 +2204,9 @@ fn lower_matvec_q4k_coop(
         step: cu(4),
         body,
     });
+    } else {
+        stmts.extend(body);
+    }
 
     if gemm {
         emit_gemm_reduce_store(
@@ -2042,7 +2220,6 @@ fn lower_matvec_q4k_coop(
             out_buf,
             exact_rows,
             epi,
-            0,
             next,
         );
     } else {
@@ -2149,8 +2326,8 @@ fn lower_matvec_q6k_coop(
         expr: bin(BinOp::Sub, lid(), bin(BinOp::Mul, uv(sg), cu(32))),
     });
     let n_tg = (rows.saturating_add((nsg * nr) as usize - 1) / (nsg * nr) as usize) as u32;
-    // Prefill batch>8 uses KirStmt::Q4kMulMm, not this GEMV token-loop.
-    let gemm = false;
+    // Prefill batch>8 uses KirStmt::Q4kMulMm. batch 2..=8: one weight stream, N accs.
+    let gemm = matvec_small_gemm(batch, rows);
     let (tok, row_gid) = if gemm {
         (None, gid())
     } else {
@@ -2432,7 +2609,6 @@ fn lower_matvec_q6k_coop(
             out_buf,
             exact_rows,
             epi,
-            0,
             next,
         );
     } else {
@@ -2892,6 +3068,10 @@ fn lower_matvec_gate_up_q4k_coop(
             });
         }
     }
+    let sweep = std::env::var("KSEARCH_Q4K_SWEEP").is_ok_and(|v| v != "0")
+        && tg_x.is_none()
+        && exact_rows;
+    if !sweep {
     stmts.push(KirStmt::ForRange {
         id: ib,
         limit_off: cu(0),
@@ -2899,6 +3079,9 @@ fn lower_matvec_gate_up_q4k_coop(
         step: cu(4),
         body,
     });
+    } else {
+        stmts.extend(body);
+    }
 
     for r in 0..nr {
         let row = if r == 0 {
@@ -4906,6 +5089,12 @@ fn lower_sdpa_online(
     next: &mut u32,
 ) -> Vec<KirStmt> {
     let _ = max_t;
+    // Shared-q: env force, or Eng `set_sdpa_shared_q_pref` for long attn_t.
+    if want_sdpa_shared_q(n_tok) {
+        return sdpa_shared::lower_sdpa_online_shared_q(
+            n_q, n_kv, hd, q_dt, kv_dt, tg, n_tok, next,
+        );
+    }
     // One TG per KV head; Q heads in the GQA group share the K/V tile (MQA: n_kv=1).
     // Max TILE that fits K+V float TG (2 * tile * hd * 4 ≤ 32KB): hd=256→8, hd=512→8.
     assert!(hd % 32 == 0, "sdpa hd must be multiple of 32");
@@ -6089,16 +6278,28 @@ fn lower_sdpa_mwg_reduce(
 
 fn lower_softcap_argmax(
     n: usize,
+    rows: usize,
     cap: f32,
     dt: DType,
     tg: u64,
     next: &mut u32,
 ) -> Vec<KirStmt> {
+    let _ = rows;
     let best_i = fresh(next);
     let best_v = fresh(next);
     let i = fresh(next);
     let val = fresh(next);
+    let row = fresh(next);
+    let base = fresh(next);
     vec![
+        KirStmt::LetU32 {
+            id: row,
+            expr: gid(),
+        },
+        KirStmt::LetU32 {
+            id: base,
+            expr: bin(BinOp::Mul, uv(row), cu(n as u32)),
+        },
         KirStmt::Let {
             id: best_v,
             expr: c(-1.0e30),
@@ -6124,7 +6325,11 @@ fn lower_softcap_argmax(
                         c(cap),
                         un(
                             UnaryOp::Tanh,
-                            bin(BinOp::Div, ld(0, uv(i), dt), c(cap)),
+                            bin(
+                                BinOp::Div,
+                                ld(0, bin(BinOp::Add, uv(base), uv(i)), dt),
+                                c(cap),
+                            ),
                         ),
                     ),
                 },
@@ -6150,7 +6355,7 @@ fn lower_softcap_argmax(
         },
         KirStmt::If {
             cond: eq(lid(), cu(0)),
-            body: vec![st(1, cu(0), v(best_i))],
+            body: vec![st(1, uv(row), v(best_i))],
         },
     ]
 }

@@ -1,0 +1,9 @@
+[package]
+name = "ksearch_tuner"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ksearch_ir.workspace = true
+serde.workspace = true
+serde_json.workspace = true

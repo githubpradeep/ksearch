@@ -7,6 +7,7 @@ members = [
     "crates/ksearch_gguf",
     "crates/ksearch_kernels",
     "crates/ksearch_gemma",
+    "crates/ksearch_tuner",
     "crates/ksearch_cli",
 ]
 default-members = ["crates/ksearch_cli"]
@@ -37,3 +38,4 @@ ksearch_metal = { path = "crates/ksearch_metal" }
 ksearch_gguf = { path = "crates/ksearch_gguf" }
 ksearch_kernels = { path = "crates/ksearch_kernels" }
 ksearch_gemma = { path = "crates/ksearch_gemma" }
+ksearch_tuner = { path = "crates/ksearch_tuner" }

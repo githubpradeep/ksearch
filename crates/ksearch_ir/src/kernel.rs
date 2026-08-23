@@ -247,9 +247,11 @@ pub enum FuseHint {
         up: TensorId,
     },
     /// Fused MLP gate/up matvecs + GELU*mul: `out[i] = gelu(dot(W_gate[i],x)) * dot(W_up[i],x)`.
+    /// `batch>1`: mul_mv_ext gate∥up+GeLU (MTP verify).
     MatvecGateUpGelu {
         rows: usize,
         cols: usize,
+        batch: usize,
         gate: TensorId,
         up: TensorId,
         x: TensorId,
@@ -301,10 +303,12 @@ pub enum FuseHint {
         residual: TensorId,
     },
     /// Fused Q/K/V matvecs sharing one LOCAL `x`: `Q=Wq@x`, `K=Wk@x`, `V=Wv@x` (3 outputs).
+    /// `batch>1` (MTP verify): one dispatch, three mul_mv_ext passes.
     MatvecQkv {
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
+        batch: usize,
         wq: TensorId,
         wk: TensorId,
         wv: TensorId,
@@ -383,6 +387,8 @@ pub enum FuseHint {
     },
     SoftcapArgmax {
         n: usize,
+        /// Independent rows (MTP verify batch). `1` for decode.
+        rows: usize,
         cap: f32,
         x: TensorId,
     },
@@ -630,6 +636,7 @@ pub enum KernelKind {
     MatvecGateUpGelu {
         rows: usize,
         cols: usize,
+        batch: usize,
         gate: TensorId,
         up: TensorId,
         x: TensorId,
@@ -686,6 +693,7 @@ pub enum KernelKind {
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
+        batch: usize,
         wq: TensorId,
         wk: TensorId,
         wv: TensorId,
@@ -738,6 +746,7 @@ pub enum KernelKind {
     },
     SoftcapArgmax {
         n: usize,
+        rows: usize,
         cap: f32,
         x: TensorId,
     },
@@ -997,6 +1006,35 @@ pub enum KirStmt {
         cols: u32,
         batch: u32,
         w_buf: u32,
+        x_buf: u32,
+        out_buf: u32,
+    },
+    /// Small-batch (MTP verify 2..=8) Q4_K ext matvec: dequant each weight row once,
+    /// dot all batch activations (llama.cpp `mul_mv_ext_q4x4`).
+    Q4kMulMvExt {
+        rows: u32,
+        cols: u32,
+        batch: u32,
+        w_buf: u32,
+        x_buf: u32,
+        out_buf: u32,
+    },
+    /// Small-batch Q6_K ext matvec (same tiling as Q4_K ext).
+    Q6kMulMvExt {
+        rows: u32,
+        cols: u32,
+        batch: u32,
+        w_buf: u32,
+        x_buf: u32,
+        out_buf: u32,
+    },
+    /// Small-batch Q4_K ext: dequant gate+up rows once, write `gelu(g·x)*(u·x)`.
+    Q4kMulMvExtGateUpGelu {
+        rows: u32,
+        cols: u32,
+        batch: u32,
+        gate_buf: u32,
+        up_buf: u32,
         x_buf: u32,
         out_buf: u32,
     },
