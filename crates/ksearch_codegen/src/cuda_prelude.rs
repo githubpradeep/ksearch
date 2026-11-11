@@ -30,6 +30,7 @@ pub const CUDA_PRELUDE: &str = r#"
 #if defined(__CUDACC__)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <stdint.h>
 /* `__device__` only. Call sites already say `KS_DEVICE inline`.
    `__forceinline__` is itself an inline specifier, and nvcc rejects
@@ -373,155 +374,391 @@ KS_DEVICE inline uint ks_simd_shuffle_xor(uint v, uint s) {
 
 /// Q4_K prefill GEMM, CUDA flavour.
 ///
-/// Same math and the same memory layout as the Metal `ksearch_q4k_mul_mm`
-/// (`C[n * M + m]`, `W` is `[M, K]` Q4_K, `X` is `[N, K]` F16), but instead of
-/// `simdgroup_matrix` MMA it uses a shared-memory tiled FMA micro-kernel: a
-/// 64x64 output tile per block, 256 threads, each thread owning a 4x4
-/// micro-tile. The tile sizes here MUST agree with [`CUDA_MUL_MM_BM`],
-/// [`CUDA_MUL_MM_BN`] and [`CUDA_MUL_MM_THREADS`], which the launcher uses to
-/// size the grid and the block; the shared tile footprint must agree with
-/// [`CUDA_MUL_MM_SMEM_BYTES`].
-///
-/// Tensor-core (`mma.sync`) is a separate optimisation step; this keeps the
-/// port correct and verifiable without a GPU.
+/// `C[n * M + m]`, `W` is `[M, K]` Q4_K, `X` is `[N, K]` F16. A 64×64 output
+/// block: each warp owns 16 rows and 32 columns and multiplies with
+/// `wmma::mma_sync` (`m16n16k16`). Every thread dequantizes 16 Q4_K weights
+/// (one scale, one vector load) into the shared `half` tile, and the
+/// activation tile is copied with `cp.async` so that copy overlaps the
+/// dequant. Two stages are in flight. Q4_K stays a load expand.
 pub const Q4K_MUL_MM_CUDA_HELPER: &str = r#"
 #define KS_MM_BM 64u
 #define KS_MM_BN 64u
-#define KS_MM_BK 32u
+#define KS_MM_BK 64u
+#define KS_MM_LD (KS_MM_BK + 8u)
+
+#ifndef KS_QLOAD_FN
+#define KS_QLOAD_FN
+typedef void (*ks_dequant16_fn)(device const uchar*, uint, half*);
+typedef float (*ks_qload1_fn)(device const uchar*, uint);
+#endif
+
+#ifndef KS_MM_GEMM_DEFINED
+#define KS_MM_GEMM_DEFINED
+KS_DEVICE void ks_dequant_q4k16(device const uchar* A, uint idx, half* dst);
+KS_DEVICE inline void ks_cp_async16(half* dst, device const half* src) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned smem = __cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(src));
+#else
+  for (int i = 0; i < 8; ++i) dst[i] = src[i];
+#endif
+}
+KS_DEVICE inline void ks_cp_commit() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_cp_wait() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+KS_DEVICE inline void ks_mm_fill(
+    device const uchar* W, device const half* X,
+    uint M, uint K, uint N, uint m0, uint n0, uint k0,
+    half* As, half* Bs, uint tid,
+    ks_dequant16_fn dequant, ks_qload1_fn load1) {
+  const uint bparts = KS_MM_BK / 8u;
+  const uint ncp = KS_MM_BN * bparts;
+  for (uint c = tid; c < ncp; c += blockDim.x) {
+    const uint ni = c / bparts;
+    const uint part = c - ni * bparts;
+    const uint n = n0 + ni;
+    half* dst = Bs + ni * KS_MM_LD + part * 8u;
+    if (n < N && k0 + KS_MM_BK <= K) {
+      ks_cp_async16(dst, X + n * K + k0 + part * 8u);
+    } else {
+      for (uint t = 0u; t < 8u; ++t) {
+        const uint k = k0 + part * 8u + t;
+        dst[t] = (n < N && k < K) ? X[n * K + k] : half(0.0f);
+      }
+    }
+  }
+  ks_cp_commit();
+  const uint ap = KS_MM_BK / 16u;
+  const uint nch = KS_MM_BM * ap;
+  const bool full = (k0 + KS_MM_BK) <= K;
+  for (uint c = tid; c < nch; c += blockDim.x) {
+    const uint row = c / ap;
+    const uint part = c - row * ap;
+    const uint m = m0 + row;
+    half* dst = As + row * KS_MM_LD + part * 16u;
+    if (m < M && full) {
+      ks_dequant_q4k16(W, m * K + k0 + part * 16u, dst);
+    } else {
+      for (uint t = 0u; t < 16u; ++t) {
+        const uint k = k0 + part * 16u + t;
+        dst[t] = (m < M && k < K) ? half(ksearch_load_q4k(W, m * K + k)) : half(0.0f);
+      }
+    }
+  }
+}
+
+/* 8 warps. Warp (warp_m, warp_n) owns 16 rows and 32 columns (two m16n16). */
+KS_DEVICE inline void ks_mm_gemm(
+    device const uchar* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem,
+    ks_dequant16_fn dequant, ks_qload1_fn load1) {
+  (void)sgitg;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_MM_BM;
+  const uint n0 = tgpig.x * KS_MM_BN;
+  const uint stage_h = (KS_MM_BM + KS_MM_BN) * KS_MM_LD;
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + stage_h;
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  const uint warp_m = warp & 3u;
+  const uint warp_n = warp >> 2;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag[2];
+#pragma unroll
+  for (int j = 0; j < 2; ++j) nvcuda::wmma::fill_fragment(cfrag[j], 0.0f);
+#endif
+  const uint nsteps = (K + KS_MM_BK - 1u) / KS_MM_BK;
+  uint stage = 0u;
+  if (nsteps > 0u) {
+    half* As = buf0;
+    half* Bs = As + KS_MM_BM * KS_MM_LD;
+    ks_mm_fill(W, X, M, K, N, m0, n0, 0u, As, Bs, tid, dequant, load1);
+    ks_cp_wait();
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = (stage == 0u) ? buf0 : buf1;
+    half* nxt = (stage == 0u) ? buf1 : buf0;
+    const uint next = step + 1u;
+    if (next < nsteps) {
+      ks_mm_fill(W, X, M, K, N, m0, n0, next * KS_MM_BK, nxt, nxt + KS_MM_BM * KS_MM_LD, tid, dequant, load1);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = As + KS_MM_BM * KS_MM_LD;
+#pragma unroll
+    for (int kstep = 0; kstep < (int)(KS_MM_BK / 16u); ++kstep) {
+      const uint kk = (uint)kstep * 16u;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b_frag;
+      nvcuda::wmma::load_matrix_sync(a_frag, As + (warp_m * 16u) * KS_MM_LD + kk, KS_MM_LD);
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const uint col = warp_n * 32u + (uint)j * 16u;
+        nvcuda::wmma::load_matrix_sync(b_frag, Bs + col * KS_MM_LD + kk, KS_MM_LD);
+        nvcuda::wmma::mma_sync(cfrag[j], a_frag, b_frag, cfrag[j]);
+      }
+    }
+#endif
+    if (next < nsteps) {
+      ks_cp_wait();
+      ks_block_barrier();
+      stage ^= 1u;
+    }
+  }
+#if defined(__CUDACC__)
+  ks_block_barrier();
+  float* mine = (float*)shmem + warp * 256u;
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    nvcuda::wmma::store_matrix_sync(mine, cfrag[j], 16, nvcuda::wmma::mem_row_major);
+    for (uint e = lane; e < 256u; e += 32u) {
+      const uint i = e >> 4;
+      const uint col = e & 15u;
+      const uint m = m0 + warp_m * 16u + i;
+      const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
+      if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
+    }
+  }
+#else
+  (void)C;
+  (void)tid;
+#endif
+}
+#endif
+
+KS_DEVICE void ks_dequant_q4k16(device const uchar* A, uint idx, half* dst) {
+  constexpr uint QK = 256u;
+  constexpr uint BPB = 144u;
+  device const uchar* blk = A + (idx / QK) * BPB;
+  float d = float(*(device const half*)blk);
+  float dmin = float(*(device const half*)(blk + 2));
+  device const uchar* scales = blk + 4;
+  device const uchar* qs = blk + 16;
+  const uint j = idx % QK;
+  const uint group = j / 64u;
+  const uint jl = j % 64u;
+  const uint is = group * 2u + (jl >= 32u ? 1u : 0u);
+  const uint qbase = group * 32u + (jl & 16u);
+  uchar sc, mn;
+  ksearch_get_scale_min_k4(is, scales, sc, mn);
+  const float scale = d * float(sc);
+  const float m = dmin * float(mn);
+  const bool hi = jl >= 32u;
+#pragma unroll
+  for (uint l = 0u; l < 16u; l += 4u) {
+    const uint bits = *(device const uint*)(qs + qbase + l);
+    float n0, n1, n2, n3;
+    if (!hi) {
+      n0 = float(bits & 0xFu);
+      n1 = float((bits >> 8) & 0xFu);
+      n2 = float((bits >> 16) & 0xFu);
+      n3 = float((bits >> 24) & 0xFu);
+    } else {
+      n0 = float((bits >> 4) & 0xFu);
+      n1 = float((bits >> 12) & 0xFu);
+      n2 = float((bits >> 20) & 0xFu);
+      n3 = float((bits >> 28) & 0xFu);
+    }
+    dst[l + 0u] = half(scale * n0 - m);
+    dst[l + 1u] = half(scale * n1 - m);
+    dst[l + 2u] = half(scale * n2 - m);
+    dst[l + 3u] = half(scale * n3 - m);
+  }
+}
 
 KS_DEVICE inline void ksearch_q4k_mul_mm(
     device const uchar* W, device const half* X, device half* C,
     uint M, uint K, uint N,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
-  (void)sgitg;
-  const uint tid = (uint)tiitg;
-  half* ws = (half*)shmem;
-  half* xs = (half*)(shmem + KS_MM_BM * KS_MM_BK * 2u);
-  const uint m0 = tgpig.y * KS_MM_BM;
-  const uint n0 = tgpig.x * KS_MM_BN;
-  const uint ty = tid / 16u;
-  const uint tx = tid % 16u;
-  float acc[4][4];
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-#pragma unroll
-    for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
-  }
-  for (uint k0 = 0u; k0 < K; k0 += KS_MM_BK) {
-      for (uint e = tid; e < KS_MM_BM * KS_MM_BK; e += blockDim.x) {
-      const uint mi = e / KS_MM_BK;
-      const uint kk = e % KS_MM_BK;
-      const uint m = m0 + mi;
-      ws[e] = (m < M) ? half(ksearch_load_q4k(W, m * K + (k0 + kk))) : half(0.0f);
-    }
-      for (uint e = tid; e < KS_MM_BN * KS_MM_BK; e += blockDim.x) {
-      const uint ni = e / KS_MM_BK;
-      const uint kk = e % KS_MM_BK;
-      const uint n = n0 + ni;
-      xs[e] = (n < N) ? X[n * K + (k0 + kk)] : half(0.0f);
-    }
-    ks_block_barrier();
-#pragma unroll
-    for (uint kk = 0u; kk < KS_MM_BK; kk++) {
-      float a[4];
-      float b[4];
-#pragma unroll
-      for (int i = 0; i < 4; i++) a[i] = (float)ws[(ty * 4u + (uint)i) * KS_MM_BK + kk];
-#pragma unroll
-      for (int j = 0; j < 4; j++) b[j] = (float)xs[(tx * 4u + (uint)j) * KS_MM_BK + kk];
-#pragma unroll
-      for (int i = 0; i < 4; i++) {
-#pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] += a[i] * b[j];
-      }
-    }
-    ks_block_barrier();
-  }
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-    const uint m = m0 + ty * 4u + (uint)i;
-    if (m >= M) continue;
-#pragma unroll
-    for (int j = 0; j < 4; j++) {
-      const uint n = n0 + tx * 4u + (uint)j;
-      if (n < N) C[n * M + m] = half(acc[i][j]);
-    }
-  }
+  ks_mm_gemm(W, X, C, M, K, N, tgpig, tiitg, sgitg, shmem, ks_dequant_q4k16, ksearch_load_q4k);
 }
 "#;
 
-/// Q6_K prefill GEMM, CUDA flavour (see [`Q4K_MUL_MM_CUDA_HELPER`]); only the
-/// weight dequantiser differs.
+/// Q6_K prefill GEMM, CUDA flavour (see [`Q4K_MUL_MM_CUDA_HELPER`]).
 pub const Q6K_MUL_MM_CUDA_HELPER: &str = r#"
 #define KS_MM_BM 64u
 #define KS_MM_BN 64u
-#define KS_MM_BK 32u
+#define KS_MM_BK 64u
+#define KS_MM_LD (KS_MM_BK + 8u)
+
+#ifndef KS_QLOAD_FN
+#define KS_QLOAD_FN
+typedef void (*ks_dequant16_fn)(device const uchar*, uint, half*);
+typedef float (*ks_qload1_fn)(device const uchar*, uint);
+#endif
+
+#ifndef KS_MM_GEMM_DEFINED
+#define KS_MM_GEMM_DEFINED
+KS_DEVICE inline void ks_cp_async16(half* dst, device const half* src) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned smem = __cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(src));
+#else
+  for (int i = 0; i < 8; ++i) dst[i] = src[i];
+#endif
+}
+KS_DEVICE inline void ks_cp_commit() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_cp_wait() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_mm_fill(
+    device const uchar* W, device const half* X,
+    uint M, uint K, uint N, uint m0, uint n0, uint k0,
+    half* As, half* Bs, uint tid,
+    ks_dequant16_fn dequant, ks_qload1_fn load1) {
+  const uint bparts = KS_MM_BK / 8u;
+  const uint ncp = KS_MM_BN * bparts;
+  for (uint c = tid; c < ncp; c += blockDim.x) {
+    const uint ni = c / bparts;
+    const uint part = c - ni * bparts;
+    const uint n = n0 + ni;
+    half* dst = Bs + ni * KS_MM_LD + part * 8u;
+    if (n < N && k0 + KS_MM_BK <= K) {
+      ks_cp_async16(dst, X + n * K + k0 + part * 8u);
+    } else {
+      for (uint t = 0u; t < 8u; ++t) {
+        const uint k = k0 + part * 8u + t;
+        dst[t] = (n < N && k < K) ? X[n * K + k] : half(0.0f);
+      }
+    }
+  }
+  ks_cp_commit();
+  const uint ap = KS_MM_BK / 16u;
+  const uint nch = KS_MM_BM * ap;
+  const bool full = (k0 + KS_MM_BK) <= K;
+  for (uint c = tid; c < nch; c += blockDim.x) {
+    const uint row = c / ap;
+    const uint part = c - row * ap;
+    const uint m = m0 + row;
+    half* dst = As + row * KS_MM_LD + part * 16u;
+    if (m < M && full) {
+      dequant(W, m * K + k0 + part * 16u, dst);
+    } else {
+      for (uint t = 0u; t < 16u; ++t) {
+        const uint k = k0 + part * 16u + t;
+        dst[t] = (m < M && k < K) ? half(load1(W, m * K + k)) : half(0.0f);
+      }
+    }
+  }
+}
+KS_DEVICE inline void ks_mm_gemm(
+    device const uchar* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem,
+    ks_dequant16_fn dequant, ks_qload1_fn load1) {
+  (void)sgitg;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_MM_BM;
+  const uint n0 = tgpig.x * KS_MM_BN;
+  const uint stage_h = (KS_MM_BM + KS_MM_BN) * KS_MM_LD;
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + stage_h;
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  const uint warp_m = warp & 3u;
+  const uint warp_n = warp >> 2;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag[2];
+#pragma unroll
+  for (int j = 0; j < 2; ++j) nvcuda::wmma::fill_fragment(cfrag[j], 0.0f);
+#endif
+  const uint nsteps = (K + KS_MM_BK - 1u) / KS_MM_BK;
+  uint stage = 0u;
+  if (nsteps > 0u) {
+    half* As = buf0;
+    half* Bs = As + KS_MM_BM * KS_MM_LD;
+    ks_mm_fill(W, X, M, K, N, m0, n0, 0u, As, Bs, tid, dequant, load1);
+    ks_cp_wait();
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = (stage == 0u) ? buf0 : buf1;
+    half* nxt = (stage == 0u) ? buf1 : buf0;
+    const uint next = step + 1u;
+    if (next < nsteps) {
+      ks_mm_fill(W, X, M, K, N, m0, n0, next * KS_MM_BK, nxt, nxt + KS_MM_BM * KS_MM_LD, tid, dequant, load1);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = As + KS_MM_BM * KS_MM_LD;
+#pragma unroll
+    for (int kstep = 0; kstep < (int)(KS_MM_BK / 16u); ++kstep) {
+      const uint kk = (uint)kstep * 16u;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a_frag;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b_frag;
+      nvcuda::wmma::load_matrix_sync(a_frag, As + (warp_m * 16u) * KS_MM_LD + kk, KS_MM_LD);
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const uint col = warp_n * 32u + (uint)j * 16u;
+        nvcuda::wmma::load_matrix_sync(b_frag, Bs + col * KS_MM_LD + kk, KS_MM_LD);
+        nvcuda::wmma::mma_sync(cfrag[j], a_frag, b_frag, cfrag[j]);
+      }
+    }
+#endif
+    if (next < nsteps) {
+      ks_cp_wait();
+      ks_block_barrier();
+      stage ^= 1u;
+    }
+  }
+#if defined(__CUDACC__)
+  ks_block_barrier();
+  float* mine = (float*)shmem + warp * 256u;
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    nvcuda::wmma::store_matrix_sync(mine, cfrag[j], 16, nvcuda::wmma::mem_row_major);
+    for (uint e = lane; e < 256u; e += 32u) {
+      const uint i = e >> 4;
+      const uint col = e & 15u;
+      const uint m = m0 + warp_m * 16u + i;
+      const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
+      if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
+    }
+  }
+#else
+  (void)C;
+  (void)tid;
+#endif
+}
+#endif
+
+KS_DEVICE inline void ks_dequant_q6k16(device const uchar* A, uint idx, half* dst) {
+#pragma unroll
+  for (uint l = 0u; l < 16u; ++l) dst[l] = half(ksearch_load_q6k(A, idx + l));
+}
 
 KS_DEVICE inline void ksearch_q6k_mul_mm(
     device const uchar* W, device const half* X, device half* C,
     uint M, uint K, uint N,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
-  (void)sgitg;
-  const uint tid = (uint)tiitg;
-  half* ws = (half*)shmem;
-  half* xs = (half*)(shmem + KS_MM_BM * KS_MM_BK * 2u);
-  const uint m0 = tgpig.y * KS_MM_BM;
-  const uint n0 = tgpig.x * KS_MM_BN;
-  const uint ty = tid / 16u;
-  const uint tx = tid % 16u;
-  float acc[4][4];
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-#pragma unroll
-    for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
-  }
-  for (uint k0 = 0u; k0 < K; k0 += KS_MM_BK) {
-      for (uint e = tid; e < KS_MM_BM * KS_MM_BK; e += blockDim.x) {
-      const uint mi = e / KS_MM_BK;
-      const uint kk = e % KS_MM_BK;
-      const uint m = m0 + mi;
-      ws[e] = (m < M) ? half(ksearch_load_q6k(W, m * K + (k0 + kk))) : half(0.0f);
-    }
-      for (uint e = tid; e < KS_MM_BN * KS_MM_BK; e += blockDim.x) {
-      const uint ni = e / KS_MM_BK;
-      const uint kk = e % KS_MM_BK;
-      const uint n = n0 + ni;
-      xs[e] = (n < N) ? X[n * K + (k0 + kk)] : half(0.0f);
-    }
-    ks_block_barrier();
-#pragma unroll
-    for (uint kk = 0u; kk < KS_MM_BK; kk++) {
-      float a[4];
-      float b[4];
-#pragma unroll
-      for (int i = 0; i < 4; i++) a[i] = (float)ws[(ty * 4u + (uint)i) * KS_MM_BK + kk];
-#pragma unroll
-      for (int j = 0; j < 4; j++) b[j] = (float)xs[(tx * 4u + (uint)j) * KS_MM_BK + kk];
-#pragma unroll
-      for (int i = 0; i < 4; i++) {
-#pragma unroll
-        for (int j = 0; j < 4; j++) acc[i][j] += a[i] * b[j];
-      }
-    }
-    ks_block_barrier();
-  }
-#pragma unroll
-  for (int i = 0; i < 4; i++) {
-    const uint m = m0 + ty * 4u + (uint)i;
-    if (m >= M) continue;
-#pragma unroll
-    for (int j = 0; j < 4; j++) {
-      const uint n = n0 + tx * 4u + (uint)j;
-      if (n < N) C[n * M + m] = half(acc[i][j]);
-    }
-  }
+  ks_mm_gemm(W, X, C, M, K, N, tgpig, tiitg, sgitg, shmem, ks_dequant_q6k16, ksearch_load_q6k);
 }
 "#;
 
-/// Byte size of the dynamic shared memory a CUDA `mul_mm` kernel needs
-/// (`BM * BK * sizeof(half)` for the weight tile plus the same again for the
-/// activation tile).
-pub const CUDA_MUL_MM_SMEM_BYTES: u64 = CUDA_MUL_MM_BM as u64 * 32 * 2 * 2;
+/// Dynamic shared memory for a CUDA `mul_mm` block: two stages, each a
+/// `BM × BK` half weight tile plus a `BN × BK` half activation tile.
+pub const CUDA_MUL_MM_BM: usize = 64;
+pub const CUDA_MUL_MM_BN: usize = 64;
+pub const CUDA_MUL_MM_BK: usize = 64;
+pub const CUDA_MUL_MM_SMEM_BYTES: u64 =
+    2 * (CUDA_MUL_MM_BM as u64 + CUDA_MUL_MM_BN as u64) * (CUDA_MUL_MM_BK as u64 + 8) * 2;
 
 /// Threads per block for a CUDA `mul_mm` kernel.
 pub const CUDA_MUL_MM_THREADS: u64 = 256;
@@ -531,8 +768,3 @@ pub const CUDA_MUL_MM_THREADS: u64 = 256;
 /// the `simd_shuffle_*` reductions in the `*_mul_mv_ext` helpers line up with
 /// CUDA warp lanes).
 pub const CUDA_MUL_MM_TW: u64 = 32;
-
-/// Tile sizes used by the CUDA `mul_mm` kernels: grid =
-/// `(ceil(N / BN), ceil(M / BM))`.
-pub const CUDA_MUL_MM_BN: usize = 64;
-pub const CUDA_MUL_MM_BM: usize = 64;

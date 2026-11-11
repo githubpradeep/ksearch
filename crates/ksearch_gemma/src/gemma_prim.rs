@@ -11,7 +11,10 @@ use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
 use ksearch_kernels::Eng;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
+
+static PREFILL_PROF_SEEN: AtomicU32 = AtomicU32::new(0);
 
 const PREFILL_CHUNK: usize = 256;
 /// id_last + drafts in one verify forward (metal-llm-server `MAX_MTP_VERIFY_SEQ`).
@@ -1715,6 +1718,18 @@ impl GemmaPrimModel {
             vp_embed = vp_t0.elapsed().as_secs_f64() * 1e3;
         }
 
+        // First large prefill pays for nvcc. Profile the next one, which is
+        // steady-state GPU time, and leave later repeats unsynchronized.
+        let pprof = std::env::var_os("KSEARCH_PREFILL_PROF").is_some()
+            && t >= 32
+            && PREFILL_PROF_SEEN.fetch_add(1, Ordering::Relaxed) == 1;
+        let mut ms_qkv = 0.0f64;
+        let mut ms_attn = 0.0f64;
+        let mut ms_o = 0.0f64;
+        let mut ms_ffn = 0.0f64;
+        let mut ms_ple = 0.0f64;
+        let mut tick = Instant::now();
+
         let h = self.cfg.hidden;
         let eps = self.cfg.rms_eps;
         let n_layers = self.cfg.n_layers;
@@ -1731,6 +1746,10 @@ impl GemmaPrimModel {
         } else {
             None
         };
+        if pprof {
+            self.ctx.synchronize()?;
+            tick = Instant::now();
+        }
         for layer in 0..n_layers {
             let (q_rows, kv_rows, o_in, ffn_inter, hd) = {
                 let lw = &self.layers[layer];
@@ -1787,6 +1806,11 @@ impl GemmaPrimModel {
                     self.tmp_q.clone(),
                     t,
                 )?;
+            }
+            if pprof {
+                self.ctx.synchronize()?;
+                ms_qkv += tick.elapsed().as_secs_f64() * 1e3;
+                tick = Instant::now();
             }
 
             if owns_kv {
@@ -1854,6 +1878,11 @@ impl GemmaPrimModel {
                 &self.tmp_attn_mwg,
                 &self.tmp_o,
             )?;
+            if pprof {
+                self.ctx.synchronize()?;
+                ms_attn += tick.elapsed().as_secs_f64() * 1e3;
+                tick = Instant::now();
+            }
 
             self.matvec_w_batch(
                 h,
@@ -1871,6 +1900,11 @@ impl GemmaPrimModel {
                     vp_attn = ts.elapsed().as_secs_f64() * 1e3 * n_layers as f64;
                 }
                 // Start MLP timing after first-layer attn sample.
+            }
+            if pprof {
+                self.ctx.synchronize()?;
+                ms_o += tick.elapsed().as_secs_f64() * 1e3;
+                tick = Instant::now();
             }
 
             let gate_name = format!("{pref}ffn_gate.weight");
@@ -1953,6 +1987,11 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x,
             )?;
+            if pprof {
+                self.ctx.synchronize()?;
+                ms_ffn += tick.elapsed().as_secs_f64() * 1e3;
+                tick = Instant::now();
+            }
 
             let gate_name = format!("{pref}inp_gate.weight");
             self.ensure_weight(&gate_name)?;
@@ -1996,6 +2035,16 @@ impl GemmaPrimModel {
                 &self.x,
                 &self.x,
             )?;
+            if pprof {
+                self.ctx.synchronize()?;
+                ms_ple += tick.elapsed().as_secs_f64() * 1e3;
+                tick = Instant::now();
+            }
+        }
+        if pprof {
+            eprintln!(
+                "[prefill-prof] t={t} qkv={ms_qkv:.1} attn={ms_attn:.1} o={ms_o:.1} ffn={ms_ffn:.1} ple={ms_ple:.1} ms"
+            );
         }
         if vprof {
             self.ctx.synchronize()?;

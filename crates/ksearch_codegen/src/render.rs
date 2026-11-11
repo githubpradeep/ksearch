@@ -1626,7 +1626,7 @@ pub fn render_for(
         src.push_str(Q4K_LOAD_HELPER);
         src.push_str(Q4K_SWEEP_HELPER);
         if body_has_mul_mm_q4(&kir.body) {
-            // Metal: simdgroup_matrix MMA. CUDA: tiled FMA micro-kernel.
+            // Metal: simdgroup_matrix MMA. CUDA: wmma m16n8k16 on the dequantized tile.
             src.push_str(if cuda {
                 crate::cuda_prelude::Q4K_MUL_MM_CUDA_HELPER
             } else {

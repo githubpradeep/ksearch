@@ -583,6 +583,17 @@ fn bench_fixed(gguf: PathBuf, max_seq: usize, pp: usize, tg: usize, repeat: usiz
     let prompt = vec![100u32; pp + 1];
     eprintln!("path: Thesis A GemmaPrim (fixed pp={pp} tg={tg} repeat={repeat})");
     let mut model = GemmaPrimModel::load(&gguf, max_seq)?;
+    let hi_ids = encode_user_prompt(&gguf, "Hi")?;
+    let hi = model.generate_timed(&hi_ids, 16, false, true)?;
+    let hi_text = model
+        .vocab
+        .as_ref()
+        .map(|v| v.decode(&hi.tokens, true))
+        .unwrap_or_default();
+    println!("check: {:?}", hi_text.trim());
+    if !(hi_text.contains("Hi!") && hi_text.contains("help")) {
+        bail!("prefill check failed: {hi_text:?}");
+    }
     eprintln!("warmup (not timed)");
     let warm = model.generate_timed(&prompt, tg, false, false)?;
     eprintln!(

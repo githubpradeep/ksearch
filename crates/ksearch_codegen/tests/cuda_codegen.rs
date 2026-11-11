@@ -196,6 +196,10 @@ fn cuda_mul_mm_uses_cuda_helper() {
         !cuda.source.contains("ksearch_q4k_dequant16"),
         "CUDA pulled in the Metal MMA staging helper"
     );
+    assert!(
+        cuda.source.contains("mma_sync"),
+        "CUDA mul_mm must multiply on tensor cores"
+    );
 
     let metal = render_msl(&cases()[3], OptSchedule::default()).expect("render metal");
     assert!(
@@ -225,10 +229,10 @@ fn cuda_mul_mm_launch_is_rederived() {
             nsg,
             smem,
         } => {
-            // rows = 64, batch = 64 -> one 64x64 tile, 256 threads, 8 KiB.
+            // rows = 64, batch = 64 -> one 64×64 block, padded stride.
             assert_eq!((tg_x, tg_y), (1, 1));
             assert_eq!((tw, nsg), (256, 1));
-            assert_eq!(smem, 8192);
+            assert_eq!(smem, 36864);
         }
         other => panic!("unexpected launch {other:?}"),
     }
