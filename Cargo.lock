@@ -649,6 +649,8 @@ dependencies = [
  "clap",
  "futures-util",
  "ksearch_codegen",
+ "ksearch_compute",
+ "ksearch_cuda",
  "ksearch_gemma",
  "ksearch_gguf",
  "ksearch_ir",
@@ -673,16 +675,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "ksearch_compute"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ksearch_codegen",
+ "ksearch_cuda",
+ "ksearch_ir",
+ "ksearch_metal",
+ "metal",
+]
+
+[[package]]
+name = "ksearch_cuda"
+version = "0.1.0"
+dependencies = [
+ "ksearch_codegen",
+ "ksearch_ir",
+ "thiserror",
+]
+
+[[package]]
 name = "ksearch_gemma"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "ksearch_codegen",
+ "ksearch_compute",
  "ksearch_gguf",
  "ksearch_ir",
  "ksearch_kernels",
- "ksearch_metal",
- "metal",
  "serde_json",
 ]
 
@@ -708,10 +730,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ksearch_codegen",
+ "ksearch_compute",
  "ksearch_gguf",
  "ksearch_ir",
- "ksearch_metal",
- "metal",
 ]
 
 [[package]]

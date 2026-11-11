@@ -1,0 +1,13 @@
+[package]
+name = "ksearch_cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ksearch_codegen = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ksearch_ir = { workspace = true }

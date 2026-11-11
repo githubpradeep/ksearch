@@ -12,7 +12,7 @@ pub use kv_pool::{KvPool, KvSlot, SlotId};
 use anyhow::{anyhow, Result};
 use ksearch_gguf::Gguf;
 use ksearch_ir::q40_nbytes;
-use metal::Buffer;
+use ksearch_compute::Buffer;
 
 #[derive(Clone)]
 pub struct GemmaConfig {

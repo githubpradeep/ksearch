@@ -28,17 +28,12 @@ pub fn load_plan(kind: &str, dims: &[usize], chip: &str) -> Option<OptSchedule> 
 
 pub fn save_plan(kind: &str, dims: &[usize], chip: &str, schedule: OptSchedule, ms: f64) {
     let key = plan_key(kind, dims, chip);
-    save_beam_cache(
-        &key,
-        &BeamCacheEntry {
-            schedule,
-            ms,
-        },
-    );
+    save_beam_cache(&key, &BeamCacheEntry { schedule, ms });
 }
 
 pub fn plan_cache_dir() -> std::path::PathBuf {
-    beam_cache_dir().parent().map(|p| p.join("plan")).unwrap_or_else(|| {
-        beam_cache_dir()
-    })
+    beam_cache_dir()
+        .parent()
+        .map(|p| p.join("plan"))
+        .unwrap_or_else(|| beam_cache_dir())
 }

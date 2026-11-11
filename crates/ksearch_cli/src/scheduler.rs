@@ -103,7 +103,7 @@ pub fn spawn_scheduler(
                 continue;
             }
             let events = req.events.clone();
-            match admit(&mut pool, req) {
+            match admit(&model, &mut pool, req) {
                 Ok(a) => active.push(a),
                 Err(e) => {
                     let _ = events.send(StreamEvent::Error(format!("admit failed: {e}")));
@@ -132,9 +132,11 @@ pub fn spawn_scheduler(
     }
 }
 
-fn admit(pool: &mut KvPool, req: InferenceRequest) -> Result<Active> {
+fn admit(model: &GemmaPrimModel, pool: &mut KvPool, req: InferenceRequest) -> Result<Active> {
     let slot = pool.alloc()?;
-    pool.clear_slot(slot)?;
+    // The pool holds device buffers, not the context, so zeroing goes through
+    // the model's backend context.
+    model.clear_kv_slot(pool, slot)?;
     let mut stop = req.stop;
     for s in BUILTIN_STOPS {
         if !stop.iter().any(|x| x == s) {
@@ -245,9 +247,9 @@ fn prefill_round(
     {
         return Ok(());
     }
-    let decoding = active.iter().any(|a| {
-        !a.finished && matches!(a.phase, Phase::Decode { .. })
-    });
+    let decoding = active
+        .iter()
+        .any(|a| !a.finished && matches!(a.phase, Phase::Decode { .. }));
     let mut budget = cfg.prefill_tokens_per_tick.max(cfg.prefill_chunk);
     let mut idx = *next_idx % n;
     for _ in 0..n {
@@ -270,11 +272,7 @@ fn prefill_round(
         }
         model.bind_slot(pool, req.slot)?;
         // Fairness vs decode: small chunks when mixed; otherwise eat the budget.
-        let cap = if decoding {
-            cfg.prefill_chunk
-        } else {
-            budget
-        };
+        let cap = if decoding { cfg.prefill_chunk } else { budget };
         let take = budget.min(cap).min(prefill_end - cursor);
         let t0 = Instant::now();
         let slice = &req.prompt_ids[cursor..cursor + take];

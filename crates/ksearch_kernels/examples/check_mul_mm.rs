@@ -1,10 +1,10 @@
 //! Compare Q4_K matvec_batch (small-N GEMM for batch 2..=8, mul_mm for batch>8)
 //! against serial decode GEMV.
 use anyhow::Result;
+use ksearch_compute::{Buffer, Context};
 use ksearch_gguf::{dequant_type_to_f32, f16_to_f32, f32_to_f16, ggml_type, quantize_f32_to_q4k};
 use ksearch_ir::DType;
 use ksearch_kernels::Eng;
-use ksearch_metal::MetalContext;
 
 fn f16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
@@ -16,7 +16,7 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn read_f16(ctx: &MetalContext, buf: &metal::Buffer, n: usize) -> Vec<f32> {
+fn read_f16(ctx: &Context, buf: &Buffer, n: usize) -> Vec<f32> {
     ctx.synchronize().ok();
     ctx.read_u16(buf, n)
         .into_iter()
@@ -45,7 +45,7 @@ fn stats(name: &str, a: &[f32], b: &[f32]) {
     );
 }
 
-fn check(ctx: &MetalContext, eng: &mut Eng, rows: usize, cols: usize, batch: usize) -> Result<()> {
+fn check(ctx: &Context, eng: &mut Eng, rows: usize, cols: usize, batch: usize) -> Result<()> {
     let mut w = vec![0f32; rows * cols];
     let mut x = vec![0f32; batch * cols];
     for r in 0..rows {
@@ -123,16 +123,13 @@ fn rand_f16(n: usize, seed: u32) -> Vec<u8> {
     f16_bytes(&v)
 }
 
-fn write_meta(buf: &metal::Buffer, tlen: u32, start: u32, win: u32) {
-    let ptr = buf.contents() as *mut f32;
-    unsafe {
-        *ptr = tlen as f32;
-        *ptr.add(1) = start as f32;
-        *ptr.add(2) = win as f32;
-    }
+fn write_meta(ctx: &Context, buf: &Buffer, tlen: u32, start: u32, win: u32) {
+    // [tlen, start, window] in f32 at element offset 0 (the model's per-layer
+    // attention metadata layout).
+    ctx.write_f32_at(buf, 0, &[tlen as f32, start as f32, win as f32]);
 }
 
-fn check_qkv(ctx: &MetalContext, eng: &mut Eng, n_q: usize, n_kv: usize, hd: usize, n_tok: usize) -> Result<()> {
+fn check_qkv(ctx: &Context, eng: &mut Eng, n_q: usize, n_kv: usize, hd: usize, n_tok: usize) -> Result<()> {
     let eps = 1e-6f32;
     let qn = n_tok * n_q * hd;
     let kn = n_tok * n_kv * hd;
@@ -176,19 +173,19 @@ fn check_qkv(ctx: &MetalContext, eng: &mut Eng, n_q: usize, n_kv: usize, hd: usi
     println!("qkv n_q={n_q} n_kv={n_kv} hd={hd} n_tok={n_tok}");
     stats("Q batch vs serial", &qb, &qs);
 
-    let kb = unsafe { std::slice::from_raw_parts(kk_b.contents() as *const u8, kv_bytes) };
-    let ks = unsafe { std::slice::from_raw_parts(kk_s.contents() as *const u8, kv_bytes) };
-    let ndiff = kb.iter().zip(ks).filter(|(a, b)| a != b).count();
+    let kb = ctx.read_bytes(&kk_b, 0, kv_bytes);
+    let ks = ctx.read_bytes(&kk_s, 0, kv_bytes);
+    let ndiff = kb.iter().zip(&ks).filter(|(a, b)| a != b).count();
     println!("  K Q40 bytes differ={ndiff}/{kv_bytes}");
-    let vb = unsafe { std::slice::from_raw_parts(kv_b.contents() as *const u8, kv_bytes) };
-    let vs = unsafe { std::slice::from_raw_parts(kv_s.contents() as *const u8, kv_bytes) };
-    let ndiff = vb.iter().zip(vs).filter(|(a, b)| a != b).count();
+    let vb = ctx.read_bytes(&kv_b, 0, kv_bytes);
+    let vs = ctx.read_bytes(&kv_s, 0, kv_bytes);
+    let ndiff = vb.iter().zip(&vs).filter(|(a, b)| a != b).count();
     println!("  V Q40 bytes differ={ndiff}/{kv_bytes}");
     Ok(())
 }
 
 fn check_sdpa(
-    ctx: &MetalContext,
+    ctx: &Context,
     eng: &mut Eng,
     n_q: usize,
     hd: usize,
@@ -206,7 +203,7 @@ fn check_sdpa(
     let bv = ctx.buffer_empty_bytes(ksearch_ir::q40_nbytes(max_t, hd));
     eng.quantize_q40(ctx, kn, &bk_f, &bk, 0)?;
     eng.quantize_q40(ctx, kn, &bv_f, &bv, 0)?;
-    let meta = ctx.device.new_buffer(32, metal::MTLResourceOptions::StorageModeShared);
+    let meta = ctx.buffer_empty_bytes(32);
     let tmp = ctx.buffer_empty_f32(n_tok * n_q * Eng::SDPA_MWG_NWG * (hd + 2));
     let o_b = ctx.buffer_empty_f16(qn);
     let o_s = ctx.buffer_empty_f16(qn);
@@ -214,7 +211,7 @@ fn check_sdpa(
     let o1 = ctx.buffer_empty_f16(n_q * hd);
 
     ctx.synchronize()?;
-    write_meta(&meta, (pos0 + 1) as u32, 0, win);
+    write_meta(&ctx, &meta, (pos0 + 1) as u32, 0, win);
     let last_tlen = (pos0 + n_tok) as u32;
     eng.sdpa_hybrid_kv_batch(
         ctx, n_q, 1, n_tok, hd, max_t, last_tlen.min(win), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o_b,
@@ -225,7 +222,7 @@ fn check_sdpa(
         let tlen = abs.min(win);
         let start = abs - tlen;
         ctx.synchronize()?;
-        write_meta(&meta, tlen, start, 0);
+        write_meta(&ctx, &meta, tlen, start, 0);
         eng.copy_slice(ctx, n_q * hd, &bq, t * n_q * hd, &q1, 0)?;
         eng.sdpa_hybrid_kv(
             ctx, n_q, 1, hd, max_t, tlen, DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1,
@@ -249,7 +246,7 @@ fn check_sdpa(
 
 /// Needle at KV pos 0: K[0]=Q, V[0]=1, other V=0. O should stay ~1 if early keys survive.
 fn check_needle(
-    ctx: &MetalContext,
+    ctx: &Context,
     eng: &mut Eng,
     n_q: usize,
     hd: usize,
@@ -274,10 +271,8 @@ fn check_needle(
     let bv = ctx.buffer_empty_bytes(ksearch_ir::q40_nbytes(tlen, hd));
     eng.quantize_q40(ctx, kn, &bk_f, &bk, 0)?;
     eng.quantize_q40(ctx, kn, &bv_f, &bv, 0)?;
-    let meta = ctx
-        .device
-        .new_buffer(32, metal::MTLResourceOptions::StorageModeShared);
-    write_meta(&meta, tlen as u32, 0, tlen as u32);
+    let meta = ctx.buffer_empty_bytes(32);
+    write_meta(&ctx, &meta, tlen as u32, 0, tlen as u32);
     let tmp = ctx.buffer_empty_f32(n_q * Eng::SDPA_MWG_NWG * (hd + 2));
     let o = ctx.buffer_empty_f16(qn);
     eng.sdpa_hybrid_kv(
@@ -295,7 +290,7 @@ fn check_needle(
 }
 
 fn main() -> Result<()> {
-    let ctx = MetalContext::new()?;
+    let ctx = Context::new()?;
     let mut eng = Eng::new();
     println!("device={}", ctx.device_name());
     // Small-N GEMM (MTP verify): must match serial GEMV.

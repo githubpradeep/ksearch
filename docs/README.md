@@ -17,12 +17,13 @@ You do **not** need to have written a compiler or GPU kernels before. Start at *
 | 1 | [01-mental-model.md](./01-mental-model.md) | Draw the compiler pipeline and map each box to a crate |
 | 2 | [02-graph-ir.md](./02-graph-ir.md) | Write `rmsnorm` as primitives + a `FuseHint` |
 | 3 | [03-schedule-and-kernel-ir.md](./03-schedule-and-kernel-ir.md) | Turn `SumReduce(MulBroadcastRow(W, x))` into a matvec AST |
-| 4 | [04-render-and-metal.md](./04-render-and-metal.md) | Walk an AST node to MSL and launch it |
+| 4 | [04-render-and-metal.md](./04-render-and-metal.md) | Walk an AST node to MSL / CUDA and launch it |
 | 5 | [05-beam-and-plans.md](./05-beam-and-plans.md) | Say what BEAM searches (tilings) and what it does not |
 | 6 | [06-quant.md](./06-quant.md) | Explain dequant-at-load vs eager CPU dequant |
 | 7 | [07-gemma-runtime.md](./07-gemma-runtime.md) | Trace one decode token; know E2B MQA vs E4B GQA KV layout |
 | 8 | [08-implement-from-scratch.md](./08-implement-from-scratch.md) | Rebuild the stack in stages, with checkpoints |
 | 9 | [09-tuner.md](./09-tuner.md) | Explain the cost model, the bandit loop, and why log(ms) trees |
+| 10 | [10-cuda.md](./10-cuda.md) | Pick a backend and read the CUDA target for H100 / RTX 40-50 |
 
 Read 0a–0c until the pictures are boring. Then DESIGN.md once. Then 01–09. Come back to FINDINGS.md when you wonder “why not just copy llama.cpp kernels?”
 
@@ -47,11 +48,14 @@ Suggested loop for each chapter:
 | Scheduler (CALL boundaries) | `crates/ksearch_codegen/src/schedule.rs` |
 | Pattern checks (no catalog Ops) | `crates/ksearch_codegen/src/rewrite.rs` |
 | KernelKind → AST | `crates/ksearch_codegen/src/lower.rs` |
-| AST → MSL | `crates/ksearch_codegen/src/render.rs` |
+| AST → MSL / CUDA | `crates/ksearch_codegen/src/render.rs` |
+| CUDA dialect shim | `crates/ksearch_codegen/src/cuda_prelude.rs` |
 | BEAM + disk cache | `crates/ksearch_codegen/src/beam.rs`, `plan_cache.rs` |
 | Cost model + guided search | `crates/ksearch_tuner/src/` (`gbdt.rs`, `model.rs`, `search.rs`) |
-| `lower_to_metal` entry | `crates/ksearch_codegen/src/lib.rs` |
+| `lower_to_metal` / `lower_to_cuda` entry | `crates/ksearch_codegen/src/lib.rs` |
 | Metal device / launch | `crates/ksearch_metal/src/lib.rs` |
+| CUDA device / launch | `crates/ksearch_cuda/src/lib.rs`, `launch.rs` |
+| Backend facade (`Context`) | `crates/ksearch_compute/src/lib.rs` |
 | Runtime that builds Graphs | `crates/ksearch_kernels/src/lib.rs` (`Eng`) |
 | Gemma 4 forward | `crates/ksearch_gemma/src/gemma_prim.rs` |
 | GGUF mmap | `crates/ksearch_gguf/src/gguf_impl.rs` |

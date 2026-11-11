@@ -5,13 +5,10 @@ use crate::mtp::MtpDraft;
 use crate::sample::sample_softcap_min_p;
 use crate::{GemmaConfig, GenerateStats, KvPool, LayerMeta, LayerNorms, SlotId};
 use anyhow::{anyhow, bail, Result};
-use ksearch_gguf::{
-    dequant_row_to_f32, f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf,
-};
+use ksearch_compute::{Buffer, Context};
+use ksearch_gguf::{dequant_row_to_f32, f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
 use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
 use ksearch_kernels::Eng;
-use ksearch_metal::MetalContext;
-use metal::Buffer;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
@@ -100,7 +97,7 @@ pub struct GemmaPrimModel {
     mtp_hseed: Option<Buffer>,
     mtp_verify_logits: Option<Buffer>,
     mtp_verify_argmax: Option<Buffer>,
-    ctx: MetalContext,
+    ctx: Context,
     /// Tied lm_head / embed (Q4_K packed when GGUF type is Q4_K, else F16).
     token_embd: WeightBuf,
     output_norm: Buffer,
@@ -166,8 +163,8 @@ impl GemmaPrimModel {
             cfg.n_layers, cfg.hidden, cfg.n_heads, cfg.n_kv, cfg.vocab
         );
 
-        let ctx = MetalContext::new()?;
-        eprintln!("Metal: {}", ctx.device_name());
+        let ctx = Context::new()?;
+        eprintln!("GPU: {} ({})", ctx.device_name(), ctx.backend().as_str());
 
         let embd_name = "token_embd.weight";
         let token_embd = if g.tensor_type(embd_name) == ggml_type::Q4_K {
@@ -232,8 +229,7 @@ impl GemmaPrimModel {
         let mut meta = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
             meta.push(
-                ctx.device
-                    .new_buffer(32, metal::MTLResourceOptions::StorageModeShared),
+                ctx.buffer_empty_bytes(32),
             );
         }
         let rope_swa = {
@@ -665,12 +661,8 @@ impl GemmaPrimModel {
 
     fn write_meta_win(&self, layer: usize, tlen: u32, start: u32, window: u32) {
         // f32: integers stay exact through max_seq (F16 ULP is 2+ past 2048).
-        let ptr = self.meta[layer].contents() as *mut f32;
-        unsafe {
-            *ptr = tlen as f32;
-            *ptr.add(1) = start as f32;
-            *ptr.add(2) = window as f32;
-        }
+        self.ctx
+            .write_f32_at(&self.meta[layer], 0, &[tlen as f32, start as f32, window as f32]);
     }
 
 
@@ -1331,7 +1323,7 @@ impl GemmaPrimModel {
                     // One sync so the printed segments reflect real GPU time.
                     let _ = self.ctx.read_f32(&dst, 1)[0] as u32;
                 }
-                let (dispatches, enqueue_s) = ksearch_metal::take_telemetry();
+                let (dispatches, enqueue_s) = ksearch_compute::take_telemetry();
                 if gphase {
                     let ph = self.ctx.resolve_phase_times_ms();
                     let gpu_busy: f64 = ph.iter().sum();
@@ -2094,6 +2086,12 @@ impl GemmaPrimModel {
     }
 
     /// F32 KV pool for multi-stream decode (P5 serving contract).
+    /// Zero a slot's KV packs (see [`KvPool::clear_slot`]); the pool has no
+    /// context of its own, so the model lends its own.
+    pub fn clear_kv_slot(&self, pool: &KvPool, slot: SlotId) -> Result<()> {
+        pool.clear_slot(&self.ctx, slot)
+    }
+
     pub fn make_kv_pool(&self, max_batch: usize) -> Result<KvPool> {
         let n_kv_layers = self.cfg.n_kv_owners();
         let hd = self.cfg.head_dim_full.max(self.cfg.head_dim_swa);
@@ -2107,10 +2105,7 @@ impl GemmaPrimModel {
         self.sample_temperature = 0.0;
         self.ctx.synchronize().ok();
         for b in self.kv_k.iter().chain(self.kv_v.iter()) {
-            let n = b.length() as usize;
-            unsafe {
-                std::ptr::write_bytes(b.contents() as *mut u8, 0, n);
-            }
+            self.ctx.zero(b);
         }
     }
 
@@ -2220,6 +2215,7 @@ impl GemmaPrimModel {
         mut id_last: u32,
         n_new: usize,
         verbose: bool,
+        eos_stop: bool,
         out: &mut Vec<u32>,
     ) -> Result<()> {
         let max_draft = mtp_draft_steps();
@@ -2276,7 +2272,7 @@ impl GemmaPrimModel {
                         .unwrap_or_default();
                     eprintln!("  token[{}] = {tok} {piece:?}", out.len() - 1);
                 }
-                if tok == 1 || tok == 106 {
+                if eos_stop && (tok == 1 || tok == 106) {
                     return Ok(());
                 }
             }
@@ -2298,6 +2294,7 @@ impl GemmaPrimModel {
         prompt_tokens: &[u32],
         n_new: usize,
         verbose: bool,
+        eos_stop: bool,
     ) -> Result<GenerateStats> {
         self.reset();
         if prompt_tokens.is_empty() {
@@ -2327,9 +2324,9 @@ impl GemmaPrimModel {
                     .unwrap_or_default();
                 eprintln!("  token[0] = {next} {piece:?}");
             }
-            if next != 1 && next != 106 && out.len() < n_new {
+            if (!eos_stop || (next != 1 && next != 106)) && out.len() < n_new {
                 self.mtp_copy_hseed(0)?;
-                self.generate_mtp(next, n_new, verbose, &mut out)?;
+                self.generate_mtp(next, n_new, verbose, eos_stop, &mut out)?;
             }
         } else if gpu_pipe {
             self.ctx.synchronize()?;
@@ -2359,7 +2356,7 @@ impl GemmaPrimModel {
                             step_t0.elapsed().as_secs_f64() * 1e3
                         );
                     }
-                    if next == 1 || next == 106 {
+                    if eos_stop && (next == 1 || next == 106) {
                         stopped = true;
                         break;
                     }
@@ -2398,7 +2395,7 @@ impl GemmaPrimModel {
                         step_t0.elapsed().as_secs_f64() * 1e3
                     );
                 }
-                if next == 1 || next == 106 {
+                if eos_stop && (next == 1 || next == 106) {
                     break;
                 }
             }
@@ -2424,7 +2421,7 @@ impl GemmaPrimModel {
     }
 
     pub fn generate(&mut self, prompt_tokens: &[u32], n_new: usize) -> Result<Vec<u32>> {
-        Ok(self.generate_timed(prompt_tokens, n_new, true)?.tokens)
+        Ok(self.generate_timed(prompt_tokens, n_new, true, true)?.tokens)
     }
 }
 

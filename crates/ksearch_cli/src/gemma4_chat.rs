@@ -105,7 +105,11 @@ fn json_value_to_gemma4(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_string(),
         Value::Array(items) => {
-            let inner = items.iter().map(json_value_to_gemma4).collect::<Vec<_>>().join(",");
+            let inner = items
+                .iter()
+                .map(json_value_to_gemma4)
+                .collect::<Vec<_>>()
+                .join(",");
             format!("[{inner}]")
         }
         Value::Object(map) => {
@@ -181,7 +185,8 @@ fn render_tool_declarations(tools: &[Tool]) -> String {
 }
 
 fn render_assistant_tool_call(tc: &ToolCall) -> String {
-    let args = serde_json::from_str::<Value>(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let args = serde_json::from_str::<Value>(&tc.function.arguments)
+        .unwrap_or_else(|_| serde_json::json!({}));
     format!(
         "{NATIVE_TOOL_CALL_PREFIX}{}{}{NATIVE_TOOL_CALL_SUFFIX}",
         tc.function.name,
@@ -328,7 +333,10 @@ fn infer_tool_call_from_context(
         return None;
     }
     if names.iter().any(|n| n == "bash") && user_wants_directory_listing(messages) {
-        return Some(make_tool_call("bash", serde_json::json!({ "command": "ls -F" })));
+        return Some(make_tool_call(
+            "bash",
+            serde_json::json!({ "command": "ls -F" }),
+        ));
     }
     if names.iter().any(|n| n == "read") && user_message_implies_read(messages) {
         if let Some(path) = last_user_content(messages).and_then(extract_at_file_path) {
@@ -623,7 +631,11 @@ fn fill_default_tool_args(name: &str, arguments: &str) -> (String, String) {
             || trimmed == "{}"
             || serde_json::from_str::<Value>(trimmed)
                 .ok()
-                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.trim().is_empty()))
+                .and_then(|v| {
+                    v.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.trim().is_empty())
+                })
                 .unwrap_or(false);
         if missing {
             return (name.to_string(), r#"{"command":"ls -F"}"#.to_string());
@@ -658,7 +670,10 @@ fn normalize_tool_call(name: &str, arguments: &str, allowed: &[String]) -> (Stri
     if lower.contains("edit") && allowed.iter().any(|n| n == "edit") {
         return fill_default_tool_args("edit", arguments);
     }
-    if (lower.contains("bash") || lower.contains("shell") || lower.contains("exec") || lower.contains("run"))
+    if (lower.contains("bash")
+        || lower.contains("shell")
+        || lower.contains("exec")
+        || lower.contains("run"))
         && allowed.iter().any(|n| n == "bash")
     {
         return fill_default_tool_args("bash", arguments);
@@ -807,7 +822,6 @@ fn split_channel_markup(text: &str) -> (String, String) {
                 if !segment.is_empty() {
                     if after_explicit_thought {
                         content_parts.push(segment.to_string());
-                        after_explicit_thought = false;
                     } else {
                         reasoning_parts.push(segment.to_string());
                     }
@@ -884,7 +898,10 @@ fn split_channel_markup(text: &str) -> (String, String) {
         break;
     }
 
-    (join_visible_parts(&reasoning_parts), join_visible_parts(&content_parts))
+    (
+        join_visible_parts(&reasoning_parts),
+        join_visible_parts(&content_parts),
+    )
 }
 
 fn strip_native_tool_calls(text: &mut String) {
@@ -924,9 +941,7 @@ fn find_paragraph_answer_start(text: &str) -> Option<usize> {
             let start = i + 2;
             let rest = &text[start..];
             let para = rest.lines().next().unwrap_or("").trim();
-            if !para.is_empty()
-                && !PLANNING_PREFIXES.iter().any(|p| para.starts_with(p))
-            {
+            if !para.is_empty() && !PLANNING_PREFIXES.iter().any(|p| para.starts_with(p)) {
                 best = Some(start);
             }
             i = start;
@@ -1036,7 +1051,11 @@ pub fn apply_chat_template(
         if msg.role == "user" {
             ends_in_open_model_turn = false;
         }
-        let mapped = if msg.role == "assistant" { "model" } else { "user" };
+        let mapped = if msg.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
         prompt.push_str(TURN_START);
         prompt.push_str(mapped);
         prompt.push('\n');
@@ -1097,7 +1116,8 @@ fn generation_priming_suffix(
 ) -> &'static str {
     // Match metal-llm-server: only prime native tool-call markup when the
     // client explicitly requires a tool (`tool_choice=required`).
-    if tool_choice_is_required(tool_choice) && should_force_tool_call(messages, tools, tool_choice) {
+    if tool_choice_is_required(tool_choice) && should_force_tool_call(messages, tools, tool_choice)
+    {
         NATIVE_TOOL_CALL_TRIGGER
     } else {
         ""
@@ -1236,10 +1256,7 @@ json{
 The type today: string",
   "newText": "Keep max_age_cieiling a JSON string ("89"), not integer 89."
 }],path:"demos/max_age_cieiling_proposal.md"}"#;
-        let calls = parse_native_tool_calls(
-            text,
-            Some(&["read".to_string(), "edit".to_string()]),
-        );
+        let calls = parse_native_tool_calls(text, Some(&["read".to_string(), "edit".to_string()]));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "edit");
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
@@ -1252,10 +1269,7 @@ The type today: string",
             .as_str()
             .unwrap()
             .contains(r#""eligible": true"#));
-        assert!(edits[0]["newText"]
-            .as_str()
-            .unwrap()
-            .contains(r#"("89")"#));
+        assert!(edits[0]["newText"].as_str().unwrap().contains(r#"("89")"#));
 
         let messages = vec![
             ChatMessage {

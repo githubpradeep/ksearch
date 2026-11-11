@@ -1,8 +1,8 @@
 use anyhow::Result;
+use ksearch_compute::{Buffer, Context};
 use ksearch_gguf::{f32_to_f16, quantize_f32_to_q4k};
 use ksearch_ir::DType;
 use ksearch_kernels::Eng;
-use ksearch_metal::MetalContext;
 use std::time::Instant;
 
 fn f16_bytes(v: &[f32]) -> Vec<u8> {
@@ -17,13 +17,14 @@ fn rand_f16(n: usize, seed: u32) -> Vec<u8> {
     }
     f16_bytes(&v)
 }
-fn write_meta(buf: &metal::Buffer, tlen: u32, start: u32, win: u32) {
-    let ptr = buf.contents() as *mut f32;
-    unsafe { *ptr = tlen as f32; *ptr.add(1) = start as f32; *ptr.add(2) = win as f32; }
+fn write_meta(ctx: &Context, buf: &Buffer, tlen: u32, start: u32, win: u32) {
+    // [tlen, start, window] in f32 at element offset 0 (the model's per-layer
+    // attention metadata layout).
+    ctx.write_f32_at(buf, 0, &[tlen as f32, start as f32, win as f32]);
 }
 
 fn main() -> Result<()> {
-    let ctx = MetalContext::new()?;
+    let ctx = Context::new()?;
     let mut eng = Eng::new();
     let n_q = 8usize;
     let hd = 256usize;
@@ -39,12 +40,12 @@ fn main() -> Result<()> {
     let bv = ctx.buffer_empty_bytes(ksearch_ir::q40_nbytes(max_t, hd));
     eng.quantize_q40(&ctx, kn, &bk_f, &bk, 0)?;
     eng.quantize_q40(&ctx, kn, &bv_f, &bv, 0)?;
-    let meta = ctx.device.new_buffer(32, metal::MTLResourceOptions::StorageModeShared);
+    let meta = ctx.buffer_empty_bytes(32);
     let tmp = ctx.buffer_empty_f32(n_tok * n_q * Eng::SDPA_MWG_NWG * (hd + 2));
     let o = ctx.buffer_empty_f16(qn);
     let q1 = ctx.buffer_empty_f16(n_q * hd);
     let o1 = ctx.buffer_empty_f16(n_q * hd);
-    write_meta(&meta, (pos0 + 1) as u32, 0, max_t as u32);
+    write_meta(&ctx, &meta, (pos0 + 1) as u32, 0, max_t as u32);
     let last = (pos0 + n_tok) as u32;
     // warmup
     for _ in 0..5 {
@@ -79,7 +80,7 @@ fn main() -> Result<()> {
     for _ in 0..5 {
         for t in 0..n_tok {
             let abs = (pos0 + t + 1) as u32;
-            write_meta(&meta, abs.min(max_t as u32), abs.saturating_sub(max_t as u32), 0);
+            write_meta(&ctx, &meta, abs.min(max_t as u32), abs.saturating_sub(max_t as u32), 0);
             eng3.copy_slice(&ctx, n_q*hd, &bq, t*n_q*hd, &q1, 0)?;
             eng3.sdpa_hybrid_kv(&ctx, n_q, 1, hd, max_t, abs.min(max_t as u32), DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1)?;
         }
@@ -89,7 +90,7 @@ fn main() -> Result<()> {
     for _ in 0..n {
         for t in 0..n_tok {
             let abs = (pos0 + t + 1) as u32;
-            write_meta(&meta, abs.min(max_t as u32), abs.saturating_sub(max_t as u32), 0);
+            write_meta(&ctx, &meta, abs.min(max_t as u32), abs.saturating_sub(max_t as u32), 0);
             eng3.copy_slice(&ctx, n_q*hd, &bq, t*n_q*hd, &q1, 0)?;
             eng3.sdpa_hybrid_kv(&ctx, n_q, 1, hd, max_t, abs.min(max_t as u32), DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1)?;
         }

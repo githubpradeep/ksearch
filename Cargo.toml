@@ -4,6 +4,8 @@ members = [
     "crates/ksearch_ir",
     "crates/ksearch_codegen",
     "crates/ksearch_metal",
+    "crates/ksearch_cuda",
+    "crates/ksearch_compute",
     "crates/ksearch_gguf",
     "crates/ksearch_kernels",
     "crates/ksearch_gemma",
@@ -35,7 +37,9 @@ futures-util = "0.3"
 ksearch_ir = { path = "crates/ksearch_ir" }
 ksearch_codegen = { path = "crates/ksearch_codegen" }
 ksearch_metal = { path = "crates/ksearch_metal" }
+ksearch_cuda = { path = "crates/ksearch_cuda" }
+ksearch_compute = { path = "crates/ksearch_compute", default-features = false }
 ksearch_gguf = { path = "crates/ksearch_gguf" }
-ksearch_kernels = { path = "crates/ksearch_kernels" }
-ksearch_gemma = { path = "crates/ksearch_gemma" }
+ksearch_kernels = { path = "crates/ksearch_kernels", default-features = false }
+ksearch_gemma = { path = "crates/ksearch_gemma", default-features = false }
 ksearch_tuner = { path = "crates/ksearch_tuner" }

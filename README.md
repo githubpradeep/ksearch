@@ -82,6 +82,68 @@ cargo run -p ksearch_cli --release -- matvec --rows 4096 --cols 4096 --beam
 
 `bench` expects a `"Hi"` reply that contains `Hi!` and `help`.
 
+## CUDA (NVIDIA) backend
+
+The same Kernel IR also lowers to CUDA C++ (`Target::Cuda`) for H100/A100 and
+RTX 40/50-series boxes. Codegen, the kernel zoo and the launch mapping are
+shared; only the emitted dialect and the runtime differ.
+
+```bash
+# Inspect the backend: device, sm_XX, and grid/block/shared-memory per kernel
+cargo run -p ksearch_cli --release -- cuda
+
+# Write every generated kernel out, and compile it for the local GPU
+cargo run -p ksearch_cli --release -- cuda --out /tmp/cu --compile
+
+# Run a real matvec on the GPU and check it against the CPU reference
+cargo run -p ksearch_cli --release -- matvec --backend cuda --rows 4096 --cols 4096
+cargo run -p ksearch_cli --release -- matvec --backend cuda --rows 4096 --cols 4096 --dtype q4k --beam
+```
+
+| Metal | CUDA |
+|-------|------|
+| `kernel void`, `[[buffer(n)]]` | `KS_KERNEL void`, plain pointers in `in0..inN, out` order |
+| `[[thread_position_in_grid]]` | `blockIdx * blockDim + threadIdx` prologue |
+| `threadgroup` / `simdgroup_*` | `__shared__`, `__shfl_*_sync`, `__syncthreads()` |
+| `simdgroup_matrix` MMA GEMM | shared-memory tiled FMA GEMM (`mul_mm`, bounds-checked) |
+| `xcrun metal` | `nvcc --cubin -arch=sm_XX` |
+
+`ksearch_cuda` opens `libcuda` with `dlopen` (the workspace still builds with no
+toolkit installed), compiles generated source to a cubin for the detected
+compute capability, and launches through the driver API. Without an NVIDIA GPU,
+`CudaContext::new()` returns an error and the CUDA tests skip.
+
+The model loops (`generate` / `bench` / `serve`) are backend-agnostic: they open
+the GPU through `ksearch_compute::Context`, which picks CUDA on an NVIDIA host
+(H100 `sm_90`, RTX 40/50-series up to `sm_120`) and Metal on Apple GPUs. Pass
+`--backend cuda` (or `KSEARCH_BACKEND=cuda`) to pin one explicitly.
+
+On an NVIDIA-only box, build without the Metal dependency (`Metal.framework` does
+not exist on Linux/Windows):
+
+```bash
+cargo build --release -p ksearch_cli --no-default-features --features cuda
+cargo run  --release -p ksearch_cli -- generate --backend cuda --gguf model.gguf --prompt "Hi"
+```
+
+Verify without an NVIDIA GPU (rendering, dialect, launch mapping, `nvcc` `-arch`):
+
+```bash
+cargo test --workspace                              # everything that can run headless
+cargo test -p ksearch_codegen --test cuda_codegen   # dialect + host C++ parse
+cargo test -p ksearch_cuda                          # launch mapping + nvcc targeting
+cargo run -p ksearch_cli --release -- cuda --out /tmp/cu   # write the .cu zoo
+```
+
+Verify on a CUDA box (adds the driver round-trips):
+
+```bash
+cargo test -p ksearch_cuda -- --nocapture           # skips the GPU tests here
+cargo run -p ksearch_cli --release -- cuda --compile
+cargo run -p ksearch_cli --release -- matvec --backend cuda --rows 4096 --cols 4096 --dtype q4k
+cargo run -p ksearch_cli --release -- generate --backend cuda --prompt "Hi" --n-predict 8
+```
+
 ## Useful flags and env
 
 | CLI | Meaning |
@@ -90,21 +152,27 @@ cargo run -p ksearch_cli --release -- matvec --rows 4096 --cols 4096 --beam
 | `--max-seq` | KV length to allocate (serve default 16k; model ctx can be larger) |
 | `--slots` | Concurrent sequences for `serve` |
 | `--n-predict` | Max new tokens for `generate` |
+| `--backend` | GPU backend: `matvec` takes `metal` (default) / `cuda`; `generate`, `bench` and `serve` take `auto` (default) / `metal` / `cuda` |
 
 | Env | Effect |
 |-----|--------|
+| `KSEARCH_BACKEND` | `metal` or `cuda`: pin the backend for every command ([docs/10-cuda.md](docs/10-cuda.md)) |
+| `KSEARCH_CUDA_DEVICE` | CUDA device ordinal (default `0`) |
+| `KSEARCH_TG` | Threads per block for flat CUDA kernels (default 256) |
+| `KSEARCH_NVCC` | `nvcc` binary to use instead of the one on `PATH` |
 | `KSEARCH_SKIP_BEAM` | Skip BEAM warmup (faster first load, slower/untuned matvecs) |
 | `KSEARCH_BEAM_FORCE` | Ignore cached plans and search again |
 | `KSEARCH_BEAM_CACHE` | Plan cache dir (default `~/.cache/ksearch/beam`) |
 | `KSEARCH_PROFILE` | Per-section GPU timings |
-| `KSEARCH_CHIP` | Plan-cache chip key (default: Metal device name) |
+| `KSEARCH_CHIP` | Plan-cache chip key (default: device name) |
 | `KSEARCH_TUNER=1` | Guided autotuning: a cost model trained on your own kernel timings picks which tilings to measure ([docs/09-tuner.md](docs/09-tuner.md)) |
 
 ## How it works (short)
 
 ```
 GGUF → Graph (primitives + schedule hints)
-    → Kernel IR AST → MSL → Metal
+    → Kernel IR AST → MSL   → Metal
+                    → CUDA  → libcuda (H100 / RTX 40-50)
     → prefill / decode with Q4_0 KV cache
 ```
 

@@ -1,11 +1,10 @@
 //! Microbench Q4K/Q6K gate_up_gelu and plain matvec on Metal.
 use anyhow::Result;
-use ksearch_codegen::lower_to_metal_chip;
+use ksearch_compute::{Buffer, Context};
 use ksearch_ir::{DType, Graph, Shape};
-use ksearch_metal::MetalContext;
 
 fn time_kernel(
-    ctx: &MetalContext,
+    ctx: &Context,
     name: &str,
     rows: usize,
     cols: usize,
@@ -18,12 +17,12 @@ fn time_kernel(
         let wu = g.input(Shape(vec![rows, cols]), wd);
         let x = g.input(Shape(vec![cols]), DType::F16);
         let out = g.matvec_gate_up_gelu(wg, wu, x)?;
-        (lower_to_metal_chip(&g, out, &ctx.device_name())?, 3)
+        (ctx.lower(&g, out)?, 3)
     } else {
         let w = g.input(Shape(vec![rows, cols]), wd);
         let x = g.input(Shape(vec![cols]), DType::F16);
         let out = g.matvec_prim(w, x)?;
-        (lower_to_metal_chip(&g, out, &ctx.device_name())?, 2)
+        (ctx.lower(&g, out)?, 2)
     };
     println!("{name}: launch={:?}", k.launch);
     let pipe = ctx.compile(&k)?;
@@ -42,7 +41,7 @@ fn time_kernel(
         ksearch_codegen::LaunchHint::RowsParallelSg { nsg, .. } => nsg * 32,
         _ => 64,
     };
-    let inputs: Vec<&metal::Buffer> = if dual {
+    let inputs: Vec<&Buffer> = if dual {
         vec![&w0, &w1, &bx]
     } else {
         vec![&w0, &bx]
@@ -65,7 +64,7 @@ fn time_kernel(
 }
 
 fn main() -> Result<()> {
-    let ctx = MetalContext::new()?;
+    let ctx = Context::new()?;
     println!("device={}", ctx.device_name());
     // MLP gate/up
     time_kernel(&ctx, "gate_up 6144x1536", 6144, 1536, true, DType::Q4K)?;

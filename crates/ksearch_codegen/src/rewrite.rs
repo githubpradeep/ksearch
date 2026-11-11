@@ -76,8 +76,7 @@ pub fn matvec_weight_dtype(graph: &Graph, out: TensorId) -> Result<Option<DType>
     if let Some(ksearch_ir::FuseHint::RmsNormMatvec { w_mat, .. }) = graph.fuse_hint(out) {
         return Ok(Some(graph.shape_dtype(*w_mat)?.1));
     }
-    if let Some(ksearch_ir::FuseHint::RmsNormMatvecGateUpGelu { gate, .. }) = graph.fuse_hint(out)
-    {
+    if let Some(ksearch_ir::FuseHint::RmsNormMatvecGateUpGelu { gate, .. }) = graph.fuse_hint(out) {
         return Ok(Some(graph.shape_dtype(*gate)?.1));
     }
     if let Some(ksearch_ir::FuseHint::RmsNormMatvecQkv { wq, .. }) = graph.fuse_hint(out) {

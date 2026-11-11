@@ -3,12 +3,18 @@ name = "ksearch_gemma"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["metal", "cuda"]
+## Metal backend (Apple GPUs).
+metal = ["ksearch_compute/metal", "ksearch_kernels/metal"]
+## CUDA backend (NVIDIA GPUs: H100, A100, RTX 40/50-series).
+cuda = ["ksearch_compute/cuda", "ksearch_kernels/cuda"]
+
 [dependencies]
 anyhow.workspace = true
-metal.workspace = true
 ksearch_gguf = { path = "../ksearch_gguf" }
 ksearch_ir.workspace = true
-ksearch_metal.workspace = true
+ksearch_compute.workspace = true
 ksearch_codegen.workspace = true
-ksearch_kernels = { path = "../ksearch_kernels" }
+ksearch_kernels = { path = "../ksearch_kernels", default-features = false }
 serde_json.workspace = true

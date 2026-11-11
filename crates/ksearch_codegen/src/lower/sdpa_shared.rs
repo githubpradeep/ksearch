@@ -1,9 +1,7 @@
 //! Small-batch SDPA: one TG per KV head; K/V tiles shared across query tokens.
 //! Thesis A: online softmax + TG tiles from AST — not a hand flash_attn paste.
 
-use super::{
-    bin, c, cu, fresh, fv, gid, gt, ld, lid, st, tg_load, th_load, th_store, un, uv, v,
-};
+use super::{bin, c, cu, fresh, fv, gid, gt, ld, lid, st, tg_load, th_load, th_store, un, uv, v};
 use ksearch_ir::{BinOp, DType, KirExpr, KirStmt, UnaryOp};
 
 /// `n_tok` in 2..=8. Launch grid must be `n_kv` (not `n_tok * n_kv`).
@@ -26,7 +24,10 @@ pub(crate) fn lower_sdpa_online_shared_q(
     let n_groups = n_q / n_kv;
     let n_kv_u = n_kv as u32;
     let tile = (32768 / (2 * hd * 4)).min(8).max(1);
-    assert!(2 * tile * hd * 4 <= 32768, "SDPA K+V tile exceeds TG budget");
+    assert!(
+        2 * tile * hd * 4 <= 32768,
+        "SDPA K+V tile exceeds TG budget"
+    );
     let n_own = hd / 32;
     let k_tg = 0u32;
     let v_tg = 1u32;
@@ -87,14 +88,8 @@ pub(crate) fn lower_sdpa_online_shared_q(
             id: o_th,
             n: n_tok * n_own,
         },
-        KirStmt::ThreadDeclF32 {
-            id: m_th,
-            n: n_tok,
-        },
-        KirStmt::ThreadDeclF32 {
-            id: l_th,
-            n: n_tok,
-        },
+        KirStmt::ThreadDeclF32 { id: m_th, n: n_tok },
+        KirStmt::ThreadDeclF32 { id: l_th, n: n_tok },
         KirStmt::LetU32 {
             id: kv_head,
             expr: gid(),
@@ -211,10 +206,7 @@ pub(crate) fn lower_sdpa_online_shared_q(
         let d = d_load[r];
         let off4 = |base: KirExpr| bin(BinOp::Add, base, bin(BinOp::Mul, uv(d), cu(4)));
         let load_body = vec![
-            KirStmt::LetU32 {
-                id: d,
-                expr: lid(),
-            },
+            KirStmt::LetU32 { id: d, expr: lid() },
             KirStmt::ForRange {
                 id: d,
                 limit_off: cu(0),

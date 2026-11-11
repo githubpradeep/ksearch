@@ -1,0 +1,25 @@
+[package]
+name = "ksearch_compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["metal", "cuda"]
+## Metal backend (Apple GPUs).
+metal = ["dep:ksearch_metal", "dep:metal"]
+## CUDA backend (NVIDIA GPUs: H100, A100, RTX 40/50-series).
+cuda = ["dep:ksearch_cuda"]
+
+[dependencies]
+ksearch_codegen = { workspace = true }
+ksearch_ir = { workspace = true }
+anyhow = { workspace = true }
+
+ksearch_metal = { workspace = true, optional = true }
+metal = { workspace = true, optional = true }
+ksearch_cuda = { workspace = true, optional = true }
+
+[dev-dependencies]
+ksearch_ir = { workspace = true }

@@ -7,15 +7,24 @@ edition.workspace = true
 name = "ksearch"
 path = "src/main.rs"
 
+[features]
+default = ["metal", "cuda"]
+## Metal backend (Apple GPUs) and the Metal-only R&D commands.
+metal = ["dep:ksearch_metal", "ksearch_compute/metal", "ksearch_gemma/metal"]
+## CUDA backend (NVIDIA GPUs: H100, A100, RTX 40/50-series).
+cuda = ["ksearch_compute/cuda", "ksearch_gemma/cuda"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
 ksearch_ir.workspace = true
 ksearch_codegen.workspace = true
+ksearch_compute.workspace = true
 ksearch_tuner.workspace = true
-ksearch_metal.workspace = true
+ksearch_metal = { workspace = true, optional = true }
+ksearch_cuda.workspace = true
 ksearch_gguf.workspace = true
-ksearch_gemma.workspace = true
+ksearch_gemma = { workspace = true, default-features = false }
 tokio.workspace = true
 axum.workspace = true
 serde.workspace = true

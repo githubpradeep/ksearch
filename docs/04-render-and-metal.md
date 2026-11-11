@@ -1,6 +1,6 @@
-# 4. Renderer and Metal runtime
+# 4. Renderer, Metal and CUDA runtimes
 
-Lowering produced an AST. This chapter prints it as Metal Shading Language and runs it.
+Lowering produced an AST. This chapter prints it as Metal Shading Language or CUDA C++ and runs it.
 
 Files:
 
@@ -86,6 +86,64 @@ Stores go the other way: ALU is float, `out` may be `half` (`half(val)`).
 | `If` | `if (cond) { ... }` |
 
 If you add a `KirStmt` and forget to render it, you get a compile error in Rust (`non-exhaustive match`). That is the safety rail: new GPU behavior must be explicit in both AST and printer.
+
+## CUDA target
+
+`render_cuda(kir, sched) -> KernelSource` is the same walker with `Target::Cuda`:
+
+- `crates/ksearch_codegen/src/render.rs` — `render_cuda`, `cuda_launch`, `cuda_signature`
+- `crates/ksearch_codegen/src/cuda_prelude.rs` — dialect shim + CUDA-native helpers
+- `crates/ksearch_cuda/src/lib.rs` — `CudaContext` (driver API), `launch.rs` (grid/block/smem)
+
+There is **one** emitter. It prints an MSL-flavoured dialect and the CUDA target
+prefixes `cuda_prelude::CUDA_PRELUDE`, which maps that dialect onto CUDA C++:
+
+| emitted (shared) | Metal | CUDA |
+|------------------|-------|------|
+| `kernel void` | `kernel void` | `extern "C" __global__ void` |
+| `device const T* in0 [[buffer(0)]]` | argument buffer index | plain `const T* in0` |
+| `[[thread_position_in_grid]]` | `gid` | `blockIdx.x * blockDim.x + threadIdx.x` |
+| `[[threadgroup_position_in_grid]]` | `gid` (row) | `blockIdx.x` (row), `blockIdx.y` (batch) |
+| `simd_sum` / `simd_shuffle_*` | `simd_*` | warp `__shfl_*_sync` butterfly |
+| `threadgroup float tg0[N]` | `threadgroup` | `__shared__ __align__(16)` via `KS_SMEM` |
+| `threadgroup_barrier` | `mem_flags::mem_threadgroup` | `__syncthreads()` |
+
+Only two things are genuinely CUDA-specific rather than a spelling:
+
+1. **`mul_mm` prefill GEMM.** Metal uses `simdgroup_matrix` MMA; CUDA has no
+   portable equivalent in C++ without tensor-core intrinsics, so
+   `Q4K_MUL_MM_CUDA_HELPER` is a `64x64x32` shared-memory tiled FMA micro-kernel
+   (one thread per `4x4` micro-tile, bounds-checked stores). `cuda_launch`
+   re-derives `tg_x`/`tg_y`/`smem` from the statement's `(rows, batch)`.
+2. **The signature.** `cuda_signature` regenerates the parameter list, because
+   CUDA binds positionally: `in0..inN-1` then `out`, and the index space comes
+   from launch builtins rather than attributes.
+
+Everything else — buffer counts, argument order, index space — is identical to
+Metal, so a kernel lowered for one backend is launchable on the other.
+
+When `__CUDACC__` is undefined the prelude defines host stubs for the CUDA
+builtins, so `clang++ -x c++ -fsyntax-only` parses the whole translation unit.
+That is how CI validates generated kernels without a GPU (see
+`crates/ksearch_codegen/tests/cuda_codegen.rs`), and `ksearch cuda --compile`
+does the real `nvcc` check on a CUDA machine.
+
+### Launch mapping
+
+`ksearch_cuda::launch::launch_config(hint, tg_size) -> LaunchConfig` is the only
+place a `LaunchHint` becomes numbers:
+
+| `LaunchHint` | grid | block | smem |
+|--------------|------|-------|------|
+| `Elementwise { n }` | `ceil(n / tg)` | `tg` (≤1024) | 0 |
+| `Rows { rows }` | `ceil(rows / tg)` | `tg` (≤1024) | 0 |
+| `RowsParallel` | `rows` | `tg` | 0 |
+| `RowsParallelSg` | `rows` | `(32, nsg)` | 0 |
+| `RowsParallel2D` | `(rows, batch)` | `tg` | 0 |
+| `MulMm` | `(tg_x, tg_y)` | `(tw, nsg)` | `smem` |
+
+`(32, nsg)` is what makes the warp mapping work: `threadIdx.x` is the lane
+(`tiisg`), `threadIdx.y` the simdgroup (`sgitg`).
 
 ## Metal runtime (`MetalContext`)
 

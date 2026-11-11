@@ -29,7 +29,11 @@ pub fn is_primitive_region(graph: &Graph, out: TensorId) -> Result<bool, Codegen
     ))
 }
 
-fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<ScheduledKernel, CodegenError> {
+fn sk_from_hint(
+    graph: &Graph,
+    out: TensorId,
+    hint: &FuseHint,
+) -> Result<ScheduledKernel, CodegenError> {
     Ok(match hint {
         FuseHint::RmsNorm { n, eps, x, w } => ScheduledKernel {
             name: format!("k_rmsnorm_{}", out.0),
@@ -186,7 +190,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 w: *w,
             },
         },
-            FuseHint::RmsNormPerHeadQkvQ40 {
+        FuseHint::RmsNormPerHeadQkvQ40 {
             n_q,
             n_kv,
             hd,
@@ -312,13 +316,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 },
             }
         }
-        FuseHint::RmsNormRows {
-            n,
-            rows,
-            eps,
-            x,
-            w,
-        } => ScheduledKernel {
+        FuseHint::RmsNormRows { n, rows, eps, x, w } => ScheduledKernel {
             name: format!("k_rms_rows_{}", out.0),
             inputs: vec![*x, *w],
             output: out,
@@ -784,12 +782,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
                 kv_dtype: *kv_dtype,
             },
         },
-        FuseHint::SdpaMwgReduce {
-            n_q,
-            hd,
-            nwg,
-            tmp,
-        } => ScheduledKernel {
+        FuseHint::SdpaMwgReduce { n_q, hd, nwg, tmp } => ScheduledKernel {
             name: format!("k_sdpa_mwg_reduce_{}", out.0),
             inputs: vec![*tmp],
             output: out,
@@ -804,10 +797,7 @@ fn sk_from_hint(graph: &Graph, out: TensorId, hint: &FuseHint) -> Result<Schedul
             name: format!("k_q40_{}", out.0),
             inputs: vec![*src],
             output: out,
-            kind: KernelKind::QuantizeQ40 {
-                n: *n,
-                src: *src,
-            },
+            kind: KernelKind::QuantizeQ40 { n: *n, src: *src },
         },
         FuseHint::SoftcapArgmax { n, rows, cap, x } => ScheduledKernel {
             name: format!("k_sca_r{rows}_{}", out.0),
@@ -834,9 +824,7 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
     let node = graph.node(out)?;
     let sk = match &node.op {
         Op::Call { .. } => {
-            return Err(CodegenError::Msg(
-                "schedule: Call without FuseHint".into(),
-            ));
+            return Err(CodegenError::Msg("schedule: Call without FuseHint".into()));
         }
         Op::ScaleConst { x, scale } => {
             let n = graph.shape_dtype(out)?.0.numel();
@@ -845,10 +833,7 @@ pub fn schedule(graph: &Graph, out: TensorId) -> Result<Vec<ScheduledKernel>, Co
                 Op::Add { .. } | Op::Mul { .. } => {
                     let mut inputs = Vec::new();
                     let inner = build_elem_expr(graph, *x, &mut inputs)?;
-                    (
-                        ElemExpr::Scale(Box::new(inner), *scale),
-                        inputs,
-                    )
+                    (ElemExpr::Scale(Box::new(inner), *scale), inputs)
                 }
                 _ => (
                     ElemExpr::Scale(Box::new(ElemExpr::Load(0)), *scale),

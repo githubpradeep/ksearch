@@ -2,10 +2,14 @@
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use ksearch_codegen::{beam_search_matvec, lower_to_metal, lower_with_schedule, CodegenError};
+#[cfg(feature = "metal")]
+use ksearch_codegen::{
+    beam_search_matvec, lower_to_metal, lower_with_schedule, CodegenError, Target,
+};
 use ksearch_gemma::GemmaPrimModel;
 use ksearch_gguf::{build_tokenizer_from_gguf, encode_prompt, gemma4_chat_prompt, Gguf};
 use ksearch_ir::{DType, Graph, OptSchedule, Shape};
+#[cfg(feature = "metal")]
 use ksearch_metal::MetalContext;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +47,9 @@ enum Cmd {
         /// Verify every unique candidate kernel against the CPU reference.
         #[arg(long, default_value_t = false)]
         verify_all: bool,
+        /// `metal` (default) or `cuda` (NVIDIA driver + nvcc required).
+        #[arg(long, default_value = "metal")]
+        backend: String,
     },
     /// Load Gemma4 GGUF and generate (prints decoded text).
     Generate {
@@ -61,6 +68,9 @@ enum Cmd {
         n_predict: usize,
         #[arg(long, default_value_t = 512)]
         max_seq: usize,
+        /// GPU backend: `auto` (default), `metal`, or `cuda` (H100 / RTX 50-series).
+        #[arg(long, default_value = "auto")]
+        backend: String,
     },
     /// Regression bench: Hi gate + essay decode/prefill tok/s.
     Bench {
@@ -72,6 +82,18 @@ enum Cmd {
         n_predict_essay: usize,
         #[arg(long, default_value_t = 1024)]
         max_seq: usize,
+        /// Fixed prefill length. With `--tg`, this is the bench (llama-bench `-p`), not the Hi sample.
+        #[arg(long)]
+        pp: Option<usize>,
+        /// Fixed decode length. With `--pp`, generate this many tokens and do not stop on end-of-turn.
+        #[arg(long)]
+        tg: Option<usize>,
+        /// Timed repeats after one discarded warmup. Used with `--pp` and `--tg`.
+        #[arg(long, default_value_t = 3)]
+        repeat: usize,
+        /// GPU backend: `auto` (default), `metal`, or `cuda` (H100 / RTX 50-series).
+        #[arg(long, default_value = "auto")]
+        backend: String,
     },
     /// OpenAI-compatible HTTP server (`/v1/chat/completions`).
     Serve {
@@ -85,6 +107,9 @@ enum Cmd {
         /// Concurrent KV slots (llama.cpp `--parallel`).
         #[arg(long, default_value_t = 4)]
         slots: usize,
+        /// GPU backend: `auto` (default), `metal`, or `cuda` (H100 / RTX 50-series).
+        #[arg(long, default_value = "auto")]
+        backend: String,
     },
     /// Head-to-head MSL variants for the Q4K coop GEMV (codegen R&D).
     Q4kFragBench {
@@ -92,6 +117,21 @@ enum Cmd {
         rows: usize,
         #[arg(long, default_value_t = 1536)]
         cols: usize,
+    },
+    /// CUDA backend: render the kernel zoo, and compile it with `nvcc` when asked.
+    Cuda {
+        /// Directory to write the generated `.cu` sources into.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Compile every kernel with `nvcc` (needs a CUDA device to pick `sm_XX`).
+        #[arg(long, default_value_t = false)]
+        compile: bool,
+        /// CUDA device ordinal used for `--compile`.
+        #[arg(long, default_value_t = 0)]
+        device: usize,
+        /// Block size for the flat (elementwise / per-row) launch hints.
+        #[arg(long, default_value_t = 256)]
+        tg_size: u64,
     },
     /// Train/eval the learned cost model on collected kernel timings.
     Tune {
@@ -121,6 +161,32 @@ fn expand_home(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Resolve `--backend` for the model commands (generate / bench / serve).
+///
+/// `auto` keeps the host default (`KSEARCH_BACKEND`, else Metal on Apple hosts
+/// and CUDA everywhere else — so an H100 or RTX 5090 box runs CUDA without any
+/// flag). An explicit spelling is exported as `KSEARCH_BACKEND`, which is what
+/// `ksearch_compute::Context::new` consults when the model opens its GPU.
+fn select_backend(sel: &str) -> Result<()> {
+    if sel.eq_ignore_ascii_case("auto") {
+        return Ok(());
+    }
+    let backend = ksearch_compute::Backend::parse(sel).ok_or_else(|| {
+        anyhow::anyhow!("--backend must be `auto`, `metal` or `cuda` (got `{sel}`)")
+    })?;
+    // Fail fast when the binary was built without the requested backend.
+    #[cfg(not(feature = "metal"))]
+    if backend == ksearch_compute::Backend::Metal {
+        bail!("this build has no Metal backend: rebuild with `--features metal`");
+    }
+    #[cfg(not(feature = "cuda"))]
+    if backend == ksearch_compute::Backend::Cuda {
+        bail!("this build has no CUDA backend: rebuild with `--features cuda`");
+    }
+    std::env::set_var("KSEARCH_BACKEND", backend.as_str());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -131,7 +197,12 @@ fn main() -> Result<()> {
             beam,
             dtype,
             verify_all,
-        } => matvec(rows, cols, beam, dtype.as_deref(), verify_all),
+            backend,
+        } => match backend.as_str() {
+            "metal" => matvec(rows, cols, beam, dtype.as_deref(), verify_all),
+            "cuda" => matvec_cuda(rows, cols, beam, dtype.as_deref(), verify_all),
+            other => bail!("--backend must be `metal` or `cuda` (got `{other}`)"),
+        },
         Cmd::Generate {
             gguf,
             prompt,
@@ -139,19 +210,40 @@ fn main() -> Result<()> {
             mtp,
             n_predict,
             max_seq,
-        } => generate(gguf, prompt, tokens, n_predict, max_seq, mtp),
+            backend,
+        } => {
+            select_backend(&backend)?;
+            generate(gguf, prompt, tokens, n_predict, max_seq, mtp)
+        }
         Cmd::Bench {
             gguf,
             n_predict_hi,
             n_predict_essay,
             max_seq,
-        } => bench(expand_home(&gguf), n_predict_hi, n_predict_essay, max_seq),
+            pp,
+            tg,
+            repeat,
+            backend,
+        } => {
+            select_backend(&backend)?;
+            bench(
+                expand_home(&gguf),
+                n_predict_hi,
+                n_predict_essay,
+                max_seq,
+                pp,
+                tg,
+                repeat,
+            )
+        }
         Cmd::Serve {
             gguf,
             port,
             max_seq,
             slots,
+            backend,
         } => {
+            select_backend(&backend)?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -163,6 +255,12 @@ fn main() -> Result<()> {
             }))
         }
         Cmd::Q4kFragBench { rows, cols } => q4k_frag_bench(rows, cols),
+        Cmd::Cuda {
+            out,
+            compile,
+            device,
+            tg_size,
+        } => cuda(out, compile, device, tg_size),
         Cmd::Tune {
             chip,
             min_group,
@@ -225,7 +323,8 @@ fn tune_train_eval(chip: Option<&str>, min_group: usize) -> Result<()> {
                 }
             }
         }
-        let fit = |data: &[ksearch_tuner::Sample]| CostModel::train(data, c, &GbdtConfig::default());
+        let fit =
+            |data: &[ksearch_tuner::Sample]| CostModel::train(data, c, &GbdtConfig::default());
 
         if holdout.len() >= 30 && train.len() >= 64 {
             let m = fit(&train);
@@ -252,13 +351,22 @@ fn tune_train_eval(chip: Option<&str>, min_group: usize) -> Result<()> {
             for g in worst.iter().take(5) {
                 println!(
                     "    {} {}x{}: n={} ρ={:.3} top1={} regret={:.2}%",
-                    g.kind, g.rows, g.cols, g.n, g.spearman, g.top1_hit, 100.0 * g.regret
+                    g.kind,
+                    g.rows,
+                    g.cols,
+                    g.n,
+                    g.spearman,
+                    g.top1_hit,
+                    100.0 * g.regret
                 );
             }
         } else {
             let m = fit(&samples);
             let ev = evaluate(&m, &samples, min_group);
-            println!("\nchip {c}: {} samples (in-sample, too few for holdout)", samples.len());
+            println!(
+                "\nchip {c}: {} samples (in-sample, too few for holdout)",
+                samples.len()
+            );
             println!(
                 "  groups≥{min_group}: {}  mean spearman {:.3}  top1 {:.1}%  mean regret {:.2}%",
                 ev.n_groups,
@@ -278,9 +386,15 @@ fn tune_train_eval(chip: Option<&str>, min_group: usize) -> Result<()> {
 /// Time every candidate once (ground truth), then replay the guided policy
 /// against those measurements: how close does budgeted search get to
 /// exhaustive search on this shape, right now?
+#[cfg(not(feature = "metal"))]
+fn tune_live(_rows: usize, _cols: usize) -> Result<()> {
+    bail!("`tune-live` needs the Metal backend: rebuild with `--features metal`")
+}
+
+#[cfg(feature = "metal")]
 fn tune_live(rows: usize, cols: usize) -> Result<()> {
     use ksearch_codegen::{beam_matvec_candidates, MetalKernelSource};
-    use ksearch_tuner::{GuidedSearch, SearchCtx, Sched, TunerConfig};
+    use ksearch_tuner::{GuidedSearch, Sched, SearchCtx, TunerConfig};
     use std::collections::HashSet;
     use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -408,14 +522,25 @@ fn encode_user_prompt(gguf: &Path, text: &str) -> Result<Vec<u32>> {
     encode_prompt(&tok, &chat, true).map_err(|e| anyhow::anyhow!(e))
 }
 
-fn bench(gguf: PathBuf, n_predict_hi: usize, n_predict_essay: usize, max_seq: usize) -> Result<()> {
+fn bench(
+    gguf: PathBuf,
+    n_predict_hi: usize,
+    n_predict_essay: usize,
+    max_seq: usize,
+    pp: Option<usize>,
+    tg: Option<usize>,
+    repeat: usize,
+) -> Result<()> {
     eprintln!("bench gguf={}", gguf.display());
+    if let (Some(pp), Some(tg)) = (pp, tg) {
+        return bench_fixed(gguf, max_seq, pp, tg, repeat);
+    }
     let hi_ids = encode_user_prompt(&gguf, "Hi")?;
     let essay_ids = encode_user_prompt(&gguf, ESSAY_PROMPT)?;
 
     eprintln!("path: Thesis A GemmaPrim (tinygrad-shaped IR)");
     let mut model = GemmaPrimModel::load(&gguf, max_seq)?;
-    let hi = model.generate_timed(&hi_ids, n_predict_hi, false)?;
+    let hi = model.generate_timed(&hi_ids, n_predict_hi, false, true)?;
     let hi_text = model
         .vocab
         .as_ref()
@@ -430,7 +555,7 @@ fn bench(gguf: PathBuf, n_predict_hi: usize, n_predict_essay: usize, max_seq: us
         hi_text.trim()
     );
 
-    let essay = model.generate_timed(&essay_ids, n_predict_essay, false)?;
+    let essay = model.generate_timed(&essay_ids, n_predict_essay, false, true)?;
     println!(
         "essay:  prefill={:.1} tok/s  decode={:.1} tok/s  tokens={}",
         essay.prefill_tok_s(),
@@ -442,6 +567,72 @@ fn bench(gguf: PathBuf, n_predict_hi: usize, n_predict_essay: usize, max_seq: us
         bail!("Hi gate failed: {hi_text:?}");
     }
     Ok(())
+}
+
+/// llama-bench shape: one discarded warmup, then `repeat` runs of exactly `pp`
+/// prefill tokens and `tg` decode tokens. End-of-turn does not cut the run short.
+fn bench_fixed(gguf: PathBuf, max_seq: usize, pp: usize, tg: usize, repeat: usize) -> Result<()> {
+    if pp == 0 || tg == 0 {
+        bail!("--pp and --tg must be > 0");
+    }
+    if pp + tg > max_seq {
+        bail!("--max-seq {max_seq} is smaller than --pp {pp} + --tg {tg}");
+    }
+    let repeat = repeat.max(1);
+    // prefill_chunk times every token except the last, which is the first decode step.
+    let prompt = vec![100u32; pp + 1];
+    eprintln!("path: Thesis A GemmaPrim (fixed pp={pp} tg={tg} repeat={repeat})");
+    let mut model = GemmaPrimModel::load(&gguf, max_seq)?;
+    eprintln!("warmup (not timed)");
+    let warm = model.generate_timed(&prompt, tg, false, false)?;
+    eprintln!(
+        "warmup prefill={} decode={}",
+        warm.prefill_tokens,
+        warm.tokens.len()
+    );
+
+    let mut pp_rates = Vec::with_capacity(repeat);
+    let mut tg_rates = Vec::with_capacity(repeat);
+    for i in 0..repeat {
+        let stats = model.generate_timed(&prompt, tg, false, false)?;
+        if stats.prefill_tokens != pp || stats.tokens.len() != tg {
+            bail!(
+                "run {i} measured prefill={} decode={}, wanted {pp}/{tg}",
+                stats.prefill_tokens,
+                stats.tokens.len()
+            );
+        }
+        pp_rates.push(stats.prefill_tok_s());
+        tg_rates.push(stats.decode_tok_s());
+        println!(
+            "pp{pp}  {:.2} tok/s   tg{tg}  {:.2} tok/s",
+            pp_rates[i], tg_rates[i]
+        );
+    }
+    println!(
+        "pp{pp}  {:.2} ± {:.2} tok/s",
+        mean(&pp_rates),
+        stdev(&pp_rates)
+    );
+    println!(
+        "tg{tg}  {:.2} ± {:.2} tok/s",
+        mean(&tg_rates),
+        stdev(&tg_rates)
+    );
+    Ok(())
+}
+
+fn mean(xs: &[f64]) -> f64 {
+    xs.iter().sum::<f64>() / xs.len() as f64
+}
+
+fn stdev(xs: &[f64]) -> f64 {
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let m = mean(xs);
+    let v = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (xs.len() - 1) as f64;
+    v.sqrt()
 }
 
 fn generate(
@@ -490,6 +681,12 @@ fn generate(
     Ok(())
 }
 
+#[cfg(not(feature = "metal"))]
+fn elem_add(_n: usize) -> Result<()> {
+    bail!("`elem-add` needs the Metal backend: rebuild with `--features metal`")
+}
+
+#[cfg(feature = "metal")]
 fn elem_add(n: usize) -> Result<()> {
     let mut g = Graph::new();
     let a = g.input(Shape(vec![n]), DType::F32);
@@ -533,7 +730,25 @@ fn elem_add(n: usize) -> Result<()> {
     Ok(())
 }
 
-fn matvec(rows: usize, cols: usize, beam: bool, dtype: Option<&str>, verify_all: bool) -> Result<()> {
+#[cfg(not(feature = "metal"))]
+fn matvec(
+    _rows: usize,
+    _cols: usize,
+    _beam: bool,
+    _dtype: Option<&str>,
+    _verify_all: bool,
+) -> Result<()> {
+    bail!("`matvec --backend metal` needs the Metal backend: rebuild with `--features metal`")
+}
+
+#[cfg(feature = "metal")]
+fn matvec(
+    rows: usize,
+    cols: usize,
+    beam: bool,
+    dtype: Option<&str>,
+    verify_all: bool,
+) -> Result<()> {
     let q4k = matches!(dtype, Some("q4k" | "Q4K"));
     if q4k && cols % 256 != 0 {
         anyhow::bail!("--dtype q4k needs cols % 256 == 0");
@@ -552,41 +767,7 @@ fn matvec(rows: usize, cols: usize, beam: bool, dtype: Option<&str>, verify_all:
         if q4k { "Q4K" } else { "F16" }
     );
 
-    let mut va = vec![0f32; rows * cols];
-    let mut vx = vec![0f32; cols];
-    for i in 0..rows * cols {
-        va[i] = ((i * 17) % 100) as f32 * 0.01;
-    }
-    for i in 0..cols {
-        vx[i] = ((i * 13) % 50) as f32 * 0.02;
-    }
-
-    // CPU reference: for Q4K the GPU multiplies dequantized weights, so the
-    // reference must dequantize identically (f16 x/y rounding is then the
-    // only error source and stays tiny at these sizes).
-    let expect: Vec<f32> = if q4k {
-        let packed = ksearch_gguf::quantize_f32_to_q4k(&va);
-        let deq = ksearch_gguf::dequant_type_to_f32(ksearch_gguf::ggml_type::Q4_K, &packed, rows * cols);
-        let mut e = vec![0f32; rows];
-        for r in 0..rows {
-            let mut s = 0.0f32;
-            for c in 0..cols {
-                s += deq[r * cols + c] * vx[c];
-            }
-            e[r] = s;
-        }
-        e
-    } else {
-        let mut e = vec![0f32; rows];
-        for r in 0..rows {
-            let mut s = 0.0f32;
-            for c in 0..cols {
-                s += va[r * cols + c] * vx[c];
-            }
-            e[r] = s;
-        }
-        e
-    };
+    let (va, vx, expect) = matvec_inputs(rows, cols, q4k);
 
     let f16_bytes = |vals: &[f32]| -> Vec<u8> {
         vals.iter()
@@ -669,7 +850,11 @@ fn matvec(rows: usize, cols: usize, beam: bool, dtype: Option<&str>, verify_all:
         return Ok(());
     }
 
-    let plan_kind = if q4k { "matvec_q4k_v2" } else { "matvec_f16_nr" };
+    let plan_kind = if q4k {
+        "matvec_q4k_v2"
+    } else {
+        "matvec_f16_nr"
+    };
     let (best_kernel, best_ms, label) = if beam {
         let untuned = lower_with_schedule(&g, y, OptSchedule::untuned())?;
         let base_ms = time_one(&untuned)?;
@@ -687,7 +872,7 @@ fn matvec(rows: usize, cols: usize, beam: bool, dtype: Option<&str>, verify_all:
             let _ =
                 std::fs::remove_file(ksearch_codegen::beam_cache_dir().join(format!("{key}.txt")));
         }
-        let result = beam_search_matvec(&g, y, &chip, time_one)?;
+        let result = beam_search_matvec(&g, y, &chip, Target::Metal, time_one)?;
         let gflops = (2.0 * rows as f64 * cols as f64) / (result.ms * 1e6);
         let src = if result.from_cache { "cache" } else { "search" };
         println!(
@@ -722,7 +907,10 @@ fn matvec(rows: usize, cols: usize, beam: bool, dtype: Option<&str>, verify_all:
 
     let pipe = ctx.compile(&best_kernel)?;
     if std::env::var_os("KSEARCH_DUMP_MSL").is_some() {
-        println!("=== generated MSL ({}) ===\n{}", best_kernel.name, best_kernel.source);
+        println!(
+            "=== generated MSL ({}) ===\n{}",
+            best_kernel.name, best_kernel.source
+        );
     }
     let _ = ctx.run(
         &pipe,
@@ -752,6 +940,241 @@ fn matvec(rows: usize, cols: usize, beam: bool, dtype: Option<&str>, verify_all:
     Ok(())
 }
 
+/// Deterministic matvec inputs and the CPU reference, shared by the Metal and
+/// CUDA gates.
+///
+/// For Q4K the GPU multiplies *dequantized* weights, so the reference
+/// dequantizes identically and f16 rounding is the only error source.
+fn matvec_inputs(rows: usize, cols: usize, q4k: bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut va = vec![0f32; rows * cols];
+    let mut vx = vec![0f32; cols];
+    for (i, v) in va.iter_mut().enumerate() {
+        *v = ((i * 17) % 100) as f32 * 0.01;
+    }
+    for (i, v) in vx.iter_mut().enumerate() {
+        *v = ((i * 13) % 50) as f32 * 0.02;
+    }
+
+    let expect: Vec<f32> = if q4k {
+        let packed = ksearch_gguf::quantize_f32_to_q4k(&va);
+        let deq =
+            ksearch_gguf::dequant_type_to_f32(ksearch_gguf::ggml_type::Q4_K, &packed, rows * cols);
+        (0..rows)
+            .map(|r| (0..cols).map(|c| deq[r * cols + c] * vx[c]).sum())
+            .collect()
+    } else {
+        (0..rows)
+            .map(|r| (0..cols).map(|c| va[r * cols + c] * vx[c]).sum())
+            .collect()
+    };
+    (va, vx, expect)
+}
+
+/// `matvec --backend cuda`: the same graph, lowered to CUDA and run through the
+/// driver API, checked against the CPU reference.
+///
+/// This is the on-device gate for H100 / RTX 40-50-series: it exercises the
+/// whole CUDA path (codegen → `nvcc --cubin` for the local `sm_XX` → driver
+/// launch) and reports GFLOP/s.
+fn matvec_cuda(
+    rows: usize,
+    cols: usize,
+    beam: bool,
+    dtype: Option<&str>,
+    verify_all: bool,
+) -> Result<()> {
+    use ksearch_codegen::{lower_to_cuda_chip, lower_with_schedule_target, Target};
+    use ksearch_cuda::{launch_config, CudaContext, KernelArgs};
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    let q4k = matches!(dtype, Some("q4k" | "Q4K"));
+    if q4k && !cols.is_multiple_of(256) {
+        bail!("--dtype q4k needs cols % 256 == 0");
+    }
+    let w_dtype = if q4k { DType::Q4K } else { DType::F16 };
+    let mut g = Graph::new();
+    let a = g.input(Shape(vec![rows, cols]), w_dtype);
+    let x = g.input(Shape(vec![cols]), DType::F16);
+    let ax = g.mul_broadcast_row(a, x)?;
+    let y = g.sum_reduce(ax, 1)?;
+
+    let mut ctx = CudaContext::with_options(0, 256).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let chip = ctx.info().name.clone();
+    println!("CUDA device: {chip} ({})", ctx.info().sm_arch());
+    println!(
+        "nvcc: {}",
+        ctx.nvcc()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".into())
+    );
+    println!(
+        "path: Graph → schedule → Kernel IR → CUDA ({})",
+        if q4k { "Q4K" } else { "F16" }
+    );
+
+    let (va, vx, expect) = matvec_inputs(rows, cols, q4k);
+    let f16_bytes = |vals: &[f32]| -> Vec<u8> {
+        vals.iter()
+            .flat_map(|&v| ksearch_gguf::f32_to_f16(v).to_le_bytes())
+            .collect()
+    };
+    let wbytes = if q4k {
+        ksearch_gguf::quantize_f32_to_q4k(&va)
+    } else {
+        f16_bytes(&va)
+    };
+    let ba = ctx
+        .alloc(wbytes.len())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bx = ctx
+        .alloc(vx.len() * 2)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let by = ctx.alloc(rows * 2).map_err(|e| anyhow::anyhow!("{e}"))?;
+    ctx.copy_to(&ba, &wbytes)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ctx.copy_to(&bx, &f16_bytes(&vx))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // One launch per kernel; `synchronize` gives the wall time of the whole
+    // dispatch, which is what matters for a single matvec.
+    let time_one = |ctx: &CudaContext,
+                    f: ksearch_cuda::Kernel,
+                    kernel: &ksearch_codegen::KernelSource|
+     -> Result<f64> {
+        let launch = || -> Result<()> {
+            let mut args = KernelArgs::new();
+            args.ptr(ba.as_ptr());
+            args.ptr(bx.as_ptr());
+            args.ptr(by.as_ptr());
+            ctx.launch(f, &kernel.launch, &mut args)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        };
+        launch()?;
+        ctx.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            launch()?;
+            ctx.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(best)
+    };
+
+    let check = |ctx: &CudaContext,
+                 f: ksearch_cuda::Kernel,
+                 kernel: &ksearch_codegen::KernelSource|
+     -> Result<f32> {
+        let mut args = KernelArgs::new();
+        args.ptr(ba.as_ptr());
+        args.ptr(bx.as_ptr());
+        args.ptr(by.as_ptr());
+        ctx.launch(f, &kernel.launch, &mut args)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        ctx.synchronize().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut raw = vec![0u8; rows * 2];
+        ctx.copy_from(&by, &mut raw)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let max_err = raw
+            .chunks_exact(2)
+            .zip(expect.iter())
+            .map(|(c, e)| {
+                let got = ksearch_gguf::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                (e - got).abs()
+            })
+            .fold(0f32, f32::max);
+        Ok(max_err)
+    };
+
+    // F16 accumulate vs F32 CPU ref — error grows ~linearly with K.
+    let tol = 0.05f32 * (cols as f32 / 256.0).max(1.0);
+    let gflops = |ms: f64| (2.0 * rows as f64 * cols as f64) / (ms * 1e6);
+
+    let scheds: Vec<OptSchedule> = if beam {
+        std::iter::once(OptSchedule::untuned())
+            .chain(match w_dtype {
+                DType::Q4K => ksearch_codegen::beam_matvec_q4k_candidates(),
+                _ => ksearch_codegen::beam_matvec_candidates(),
+            })
+            .collect()
+    } else {
+        vec![OptSchedule::untuned()]
+    };
+
+    fn source_hash(src: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        h.finish()
+    }
+
+    let mut seen = HashSet::new();
+    let mut best: Option<(f64, String, f32)> = None;
+    let mut n_ok = 0usize;
+    let mut worst = 0f32;
+    for sched in scheds {
+        let kernel = if beam {
+            lower_with_schedule_target(&g, y, sched, Target::Cuda)?
+        } else {
+            lower_to_cuda_chip(&g, y, &chip)?
+        };
+        if !seen.insert(source_hash(&kernel.source)) {
+            continue;
+        }
+        let f = ctx
+            .load(&kernel)
+            .map_err(|e| anyhow::anyhow!("nvcc/load failed: {e}"))?;
+        let err = check(&ctx, f, &kernel)?;
+        worst = worst.max(err);
+        if verify_all && err > tol {
+            bail!(
+                "CPU/GPU mismatch (tg={} vec={} nsg={}): max|err|={err:.3e} > tol={tol:.3}",
+                sched.tg,
+                sched.vec,
+                sched.nsg
+            );
+        }
+        n_ok += 1;
+
+        let ms = time_one(&ctx, f, &kernel)?;
+        let cfg = launch_config(&kernel.launch, 256);
+        let label = format!(
+            "tg={} vec={} unroll={} nsg={} nr0={}",
+            sched.tg, sched.vec, sched.unroll, sched.nsg, sched.nr0
+        );
+        println!(
+            "{label}  grid=({},{},{}) block=({},{},{}) smem={}  {ms:.3} ms  {:.1} GFLOP/s  max|err|={err:.3e}",
+            cfg.grid.0,
+            cfg.grid.1,
+            cfg.grid.2,
+            cfg.block.0,
+            cfg.block.1,
+            cfg.block.2,
+            cfg.smem,
+            gflops(ms)
+        );
+        if best.as_ref().is_none_or(|(bms, _, _)| ms < *bms) {
+            best = Some((ms, label, err));
+        }
+    }
+
+    if verify_all {
+        println!("verify-all: {n_ok} unique kernels OK (worst max|err|={worst:.3e})");
+    }
+    let (ms, label, err) = best.ok_or_else(|| anyhow::anyhow!("no CUDA kernel produced"))?;
+    println!(
+        "best ({label})  {ms:.3} ms  {:.1} GFLOP/s  max|err|={err:.3e}",
+        gflops(ms)
+    );
+    if err > tol {
+        bail!("CPU/GPU mismatch (tol={tol:.3})");
+    }
+    println!("OK");
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
 fn kernel_tg(kernel: &ksearch_codegen::MetalKernelSource) -> u64 {
     match &kernel.launch {
         ksearch_codegen::LaunchHint::RowsParallel { tg, .. } => *tg,
@@ -766,6 +1189,7 @@ fn kernel_tg(kernel: &ksearch_codegen::MetalKernelSource) -> u64 {
 // gets ported back into the renderer's Load(Q4K) expand.
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "metal")]
 const FRAG_HELPERS: &str = r#"#include <metal_stdlib>
 using namespace metal;
 inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
@@ -837,6 +1261,7 @@ inline float ksearch_bench_dot32(device const uchar* blk, uint j, device const h
 }
 "#;
 
+#[cfg(feature = "metal")]
 const KERNEL_ROWLANE: &str = r#"
 kernel void k_bench(
   device const uchar* w [[buffer(0)]],
@@ -860,6 +1285,7 @@ kernel void k_bench(
 }
 "#;
 
+#[cfg(feature = "metal")]
 const KERNEL_COALESCED: &str = r#"
 kernel void k_bench(
   device const uchar* w [[buffer(0)]],
@@ -896,6 +1322,7 @@ kernel void k_bench(
 }
 "#;
 
+#[cfg(feature = "metal")]
 const KERNEL_LOADPROBE: &str = r#"
 kernel void k_bench(
   device const uchar* w [[buffer(0)]],
@@ -919,6 +1346,7 @@ kernel void k_bench(
 
 // Verbatim llama.cpp mul_vec_q4_K_f32_impl recipe (reference/metal-llm-server
 // ggml_mul_mv_q4.metal), adapted: baked dims, half activations, half dst.
+#[cfg(feature = "metal")]
 const KERNEL_GGMLKQ: &str = r##"
 kernel void k_bench(
   device const uchar* w [[buffer(0)]],
@@ -1002,9 +1430,9 @@ kernel void k_bench(
 }
 "##;
 
-
 // Saturating DRAM read probe: many threads, 4 independent 16B loads in
 // flight per thread per iteration. Establishes the machine's real ceiling.
+#[cfg(feature = "metal")]
 const KERNEL_BWPROBE: &str = r#"
 kernel void k_bench(
   device const uchar* w [[buffer(0)]],
@@ -1028,8 +1456,8 @@ kernel void k_bench(
 }
 "#;
 
-
 // Split-K partial reduce: one thread per row sums KS f32 partials.
+#[cfg(feature = "metal")]
 const KERNEL_SPLITREDUCE: &str = r#"
 kernel void k_bench(
   device const float* partial [[buffer(0)]],
@@ -1046,8 +1474,8 @@ kernel void k_bench(
 }
 "#;
 
-
 // Empty kernel: measures dispatch+sync round-trip floor.
+#[cfg(feature = "metal")]
 const KERNEL_EMPTY: &str = r#"
 kernel void k_bench(
   device const uchar* w [[buffer(0)]],
@@ -1059,6 +1487,12 @@ kernel void k_bench(
 }
 "#;
 
+#[cfg(not(feature = "metal"))]
+fn q4k_frag_bench(_rows: usize, _cols: usize) -> Result<()> {
+    bail!("`q4k-frag-bench` needs the Metal backend: rebuild with `--features metal`")
+}
+
+#[cfg(feature = "metal")]
 fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
     use ksearch_codegen::{LaunchHint, MetalKernelSource};
     if cols % 256 != 0 || rows % 16 != 0 {
@@ -1115,7 +1549,8 @@ fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
     let variants: Vec<(String, MetalKernelSource)> = vec![
         (
             "coalesced".into(),
-            mk(subst(KERNEL_COALESCED, 4),
+            mk(
+                subst(KERNEL_COALESCED, 4),
                 LaunchHint::RowsParallelSg {
                     rows: rows / 16,
                     nsg: 4,
@@ -1129,10 +1564,7 @@ fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
                     .replace("@ROWS@", &rows.to_string())
                     .replace("@COLS@", &cols.to_string())
                     .replace("@NTG@", "256"),
-                LaunchHint::RowsParallel {
-                    rows: 256,
-                    tg: 256,
-                },
+                LaunchHint::RowsParallel { rows: 256, tg: 256 },
             ),
         ),
         (
@@ -1189,7 +1621,8 @@ fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
         ),
         (
             "rowlane".into(),
-            mk(subst(KERNEL_ROWLANE, 0),
+            mk(
+                subst(KERNEL_ROWLANE, 0),
                 LaunchHint::RowsParallel {
                     rows: rows.div_ceil(128),
                     tg: 128,
@@ -1224,17 +1657,13 @@ fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
             .replace("@ROWS@", &scrub_rows.to_string())
             .replace("@COLS@", "256")
             .replace("@NTG@", "512"),
-        LaunchHint::RowsParallel {
-            rows: 512,
-            tg: 256,
-        },
+        LaunchHint::RowsParallel { rows: 512, tg: 256 },
     );
     let scrub_pipe = ctx.compile(&scrub_src)?;
-    let do_scrub =
-        |by: &ksearch_metal::BufferAlias| -> Result<()> {
-            ctx.run(&scrub_pipe, &scrub_src, &[&scrub_buf, &bx], by, 256)?;
-            Ok(())
-        };
+    let do_scrub = |by: &ksearch_metal::BufferAlias| -> Result<()> {
+        ctx.run(&scrub_pipe, &scrub_src, &[&scrub_buf, &bx], by, 256)?;
+        Ok(())
+    };
 
     let time_src = |src: &MetalKernelSource, scrub: bool| -> Result<(f64, f32)> {
         let pipe = ctx.compile(src)?;
@@ -1289,7 +1718,10 @@ fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
                 "const int nb = @COLS@u/256u;\n  const int rtgc = {rtg}u;\n  const int part = gid / rtgc;\n  const int r0g = gid % rtgc;\n  const int per = (nb + {ks} - 1) / {ks};\n  const int ib_lo = part * per;\n  const int ib_hi = min(ib_lo + per, nb);"
             ),
         );
-        src = src.replace("for (int ib = ix; ib < nb; ib += 4)", "for (int ib = ib_lo + ix; ib < ib_hi; ib += 4)");
+        src = src.replace(
+            "for (int ib = ix; ib < nb; ib += 4)",
+            "for (int ib = ib_lo + ix; ib < ib_hi; ib += 4)",
+        );
         src = src.replace(
             "device half* out [[buffer(2)]],",
             "device float* partial [[buffer(2)]],",
@@ -1459,12 +1891,88 @@ fn q4k_frag_bench(rows: usize, cols: usize) -> Result<()> {
             Some((ms, _)) => format!("{:7.3} ms {:5.1}", ms, mb / ms),
             None => "—".to_string(),
         };
+        println!("{:^17} {:^18} {:^18}", r.name, fmt(&r.warm), fmt(&r.cold));
+    }
+    Ok(())
+}
+
+/// `ksearch cuda` — inspect / validate the CUDA backend without a GPU.
+///
+/// Renders every kernel in [`ksearch_codegen::smoke`] for the CUDA target and
+/// prints the grid/block/shared-memory configuration the runtime would use.
+/// With `--compile` each source is additionally passed through `nvcc --cubin`
+/// for the compute capability of the device in the machine, which is the
+/// end-to-end check on an H100 / RTX 50-series box.
+fn cuda(out: Option<PathBuf>, compile: bool, device: usize, tg_size: u64) -> Result<()> {
+    use ksearch_codegen::smoke;
+    use ksearch_codegen::{render_cuda, OptSchedule};
+    use ksearch_cuda::{launch_config, CudaContext};
+
+    let ctx = match CudaContext::with_options(device, tg_size) {
+        Ok(ctx) => {
+            let i = ctx.info();
+            println!(
+                "CUDA device {device}: {} ({}, {} threads/block max, {} KiB shared max)",
+                i.name,
+                i.sm_arch(),
+                i.max_threads_per_block,
+                i.max_shared_per_block / 1024
+            );
+            match ctx.nvcc() {
+                Some(p) => println!("nvcc: {}", p.display()),
+                None => println!("nvcc: not found (install the CUDA toolkit to compile)"),
+            }
+            Some(ctx)
+        }
+        Err(e) => {
+            println!("CUDA device {device}: unavailable ({e})");
+            None
+        }
+    };
+
+    if compile && ctx.is_none() {
+        bail!("--compile needs a CUDA device so nvcc can target its compute capability");
+    }
+
+    let mut failures = 0usize;
+    for k in smoke::smoke_kernels() {
+        let src = render_cuda(&k, OptSchedule::default())?;
+        let cfg = launch_config(&src.launch, tg_size);
         println!(
-            "{:^17} {:^18} {:^18}",
-            r.name,
-            fmt(&r.warm),
-            fmt(&r.cold)
+            "{:<16} grid=({},{},{}) block=({},{},{}) smem={}  in={} out={}  {} bytes",
+            src.name,
+            cfg.grid.0,
+            cfg.grid.1,
+            cfg.grid.2,
+            cfg.block.0,
+            cfg.block.1,
+            cfg.block.2,
+            cfg.smem,
+            src.n_inputs,
+            src.n_outputs,
+            src.source.len()
         );
+        if let Some(dir) = &out {
+            std::fs::create_dir_all(dir)?;
+            let path = dir.join(format!("{}.cu", src.name));
+            std::fs::write(&path, &src.source)?;
+            println!("  wrote {}", path.display());
+        }
+        if let Some(ctx) = &ctx {
+            if compile {
+                match ctx.compile(&src.source, &src.name) {
+                    Ok(cubin) => println!("  nvcc: ok ({} bytes cubin)", cubin.len()),
+                    Err(e) => {
+                        failures += 1;
+                        eprintln!("  nvcc: FAILED\n{e}");
+                    }
+                }
+            }
+        }
+    }
+
+    if failures > 0 {
+        bail!("{failures} kernel(s) failed to compile");
     }
     Ok(())
 }

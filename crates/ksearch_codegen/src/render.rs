@@ -1,15 +1,15 @@
 //! Generic MSL renderer: Kernel IR AST → Metal. No named hand kernels.
 
 use crate::{CodegenError, LaunchHint, MetalKernelSource};
-use ksearch_ir::{BinOp, DType, KirExpr, KirLaunch, KirStmt, KernelIr, OptSchedule, UnaryOp};
+use ksearch_ir::{BinOp, DType, KernelIr, KirExpr, KirLaunch, KirStmt, OptSchedule, UnaryOp};
 
 /// Generic Q4_K Load / VecMulSum expand (not a named matvec kernel).
 const Q4K_LOAD_HELPER: &str = r#"
-inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
+KS_DEVICE inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
   if (j < 4u) { d = q[j] & 63u; m = q[j + 4u] & 63u; }
   else { d = (q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u); m = (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u); }
 }
-inline float ksearch_q4k_at(device const uchar* blk, float d, float dmin, uint j) {
+KS_DEVICE inline float ksearch_q4k_at(device const uchar* blk, float d, float dmin, uint j) {
   device const uchar* scales = blk + 4;
   device const uchar* qs = blk + 16;
   uint is = (j / 64u) * 2u;
@@ -24,7 +24,7 @@ inline float ksearch_q4k_at(device const uchar* blk, float d, float dmin, uint j
     return d * float(sc) * float(qs[qoff + (jl - 32u)] >> 4u) - dmin * float(mn);
   }
 }
-inline float ksearch_load_q4k(device const uchar* A, uint idx) {
+KS_DEVICE inline float ksearch_load_q4k(device const uchar* A, uint idx) {
   constexpr uint QK = 256u;
   constexpr uint BPB = 144u;
   device const uchar* blk = A + (idx / QK) * BPB;
@@ -33,7 +33,7 @@ inline float ksearch_load_q4k(device const uchar* A, uint idx) {
   return ksearch_q4k_at(blk, d, dmin, idx % QK);
 }
 // Shared super-block metadata for consecutive idx..idx+3 (vec Load expand).
-inline float4 ksearch_load_q4k4(device const uchar* A, uint idx) {
+KS_DEVICE inline float4 ksearch_load_q4k4(device const uchar* A, uint idx) {
   constexpr uint QK = 256u;
   constexpr uint BPB = 144u;
   uint b0 = idx / QK;
@@ -50,7 +50,7 @@ inline float4 ksearch_load_q4k4(device const uchar* A, uint idx) {
                 ksearch_q4k_at(blk, d, dmin, j + 2u),
                 ksearch_q4k_at(blk, d, dmin, j + 3u));
 }
-inline float2 ksearch_load_q4k2(device const uchar* A, uint idx) {
+KS_DEVICE inline float2 ksearch_load_q4k2(device const uchar* A, uint idx) {
   constexpr uint QK = 256u;
   constexpr uint BPB = 144u;
   uint b0 = idx / QK;
@@ -64,7 +64,7 @@ inline float2 ksearch_load_q4k2(device const uchar* A, uint idx) {
   return float2(ksearch_q4k_at(blk, d, dmin, j), ksearch_q4k_at(blk, d, dmin, j + 1u));
 }
 // One 6-bit scale/min governs 32 weights — vectorized nibble unpack + float4 dots.
-inline float ksearch_dot_q4k32(device const uchar* A, uint widx, threadgroup const float* x, uint xidx) {
+KS_DEVICE inline float ksearch_dot_q4k32(device const uchar* A, uint widx, threadgroup const float* x, uint xidx) {
   constexpr uint QK = 256u;
   constexpr uint BPB = 144u;
   device const uchar* blk = A + (widx / QK) * BPB;
@@ -130,7 +130,7 @@ inline float ksearch_dot_q4k32(device const uchar* A, uint widx, threadgroup con
   return acc4.x + acc4.y + acc4.z + acc4.w;
 }
 // Full Q4_K super-block (256 weights) — one d/dmin load, 8 scale groups.
-inline float ksearch_dot_q4k256(device const uchar* A, uint widx, threadgroup const float* x, uint xidx) {
+KS_DEVICE inline float ksearch_dot_q4k256(device const uchar* A, uint widx, threadgroup const float* x, uint xidx) {
   constexpr uint BPB = 144u;
   device const uchar* blk = A + (widx / 256u) * BPB;
   float d = float(*(device const half*)(blk + 0));
@@ -159,14 +159,14 @@ inline float ksearch_dot_q4k256(device const uchar* A, uint widx, threadgroup co
   }
   return acc;
 }
-inline float ksearch_dot_q4k32_dev(device const uchar* A, uint widx, device const half* x, uint xidx) {
+KS_DEVICE inline float ksearch_dot_q4k32_dev(device const uchar* A, uint widx, device const half* x, uint xidx) {
   float acc = 0.0f;
   for (uint l = 0u; l < 32u; l++) {
     acc += ksearch_load_q4k(A, widx + l) * float(x[xidx + l]);
   }
   return acc;
 }
-inline float ksearch_dot_q4k256_dev(device const uchar* A, uint widx, device const half* x, uint xidx) {
+KS_DEVICE inline float ksearch_dot_q4k256_dev(device const uchar* A, uint widx, device const half* x, uint xidx) {
   float acc = 0.0f;
   for (uint l = 0u; l < 256u; l++) {
     acc += ksearch_load_q4k(A, widx + l) * float(x[xidx + l]);
@@ -174,7 +174,7 @@ inline float ksearch_dot_q4k256_dev(device const uchar* A, uint widx, device con
   return acc;
 }
 // ggml-style simdgroup lane partial for one Q4_K superblock (mul_vec_q4_K layout).
-inline float ksearch_q4k_coop_frag(
+KS_DEVICE inline float ksearch_q4k_coop_frag(
     device const uchar* A, uint row_base, uint cols, uint ib,
     threadgroup const float* x, uint lane) {
   constexpr uint QK = 256u;
@@ -228,7 +228,7 @@ inline float ksearch_q4k_coop_frag(
                  sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
 }
 // One y-load; accumulate 4 rows for both gate and up weight streams.
-inline void ksearch_q4k_coop_frag_nr4_dual(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4_dual(
     device const uchar* Ag, device const uchar* Au,
     uint row0_base, uint cols, uint ib,
     threadgroup const float* x, uint lane,
@@ -319,7 +319,7 @@ inline void ksearch_q4k_coop_frag_nr4_dual(
   *g0 += sumg[0]; *g1 += sumg[1]; *g2 += sumg[2]; *g3 += sumg[3];
   *u0 += sumu[0]; *u1 += sumu[1]; *u2 += sumu[2]; *u3 += sumu[3];
 }
-inline void ksearch_q4k_coop_frag_nr4(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4(
     device const uchar* A, uint row0_base, uint cols, uint ib,
     threadgroup const float* x, uint lane,
     thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
@@ -384,7 +384,7 @@ inline void ksearch_q4k_coop_frag_nr4(
 
 
 // Device-half y variants (no TG staging — oracle mul_vec streams device activations).
-inline void ksearch_q4k_load_y_dev(device const half* y4, thread float* yl, thread float* yh, thread float4* sumy) {
+KS_DEVICE inline void ksearch_q4k_load_y_dev(device const half* y4, thread float* yl, thread float* yh, thread float4* sumy) {
   float4 yl0 = float4(*(device const half4*)(y4 + 0u));
   float4 yl1 = float4(*(device const half4*)(y4 + 4u));
   float4 yl2 = float4(*(device const half4*)(y4 + 32u));
@@ -407,7 +407,7 @@ inline void ksearch_q4k_load_y_dev(device const half* y4, thread float* yl, thre
       yh0[0] + yh0[1] + yh0[2] + yh0[3] + yh1[0] + yh1[1] + yh1[2] + yh1[3],
       yh2[0] + yh2[1] + yh2[2] + yh2[3] + yh3[0] + yh3[1] + yh3[2] + yh3[3]);
 }
-inline float ksearch_q4k_coop_frag_dev(
+KS_DEVICE inline float ksearch_q4k_coop_frag_dev(
     device const uchar* A, uint row_base, uint cols, uint ib,
     device const half* x, uint lane) {
   constexpr uint QK = 256u;
@@ -456,7 +456,7 @@ inline float ksearch_q4k_coop_frag_dev(
          dd[1] * (sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
                   sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
 }
-inline void ksearch_q4k_coop_frag_nr4_dev(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4_dev(
     device const uchar* A, uint row0_base, uint cols, uint ib,
     device const half* x, uint lane,
     thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
@@ -515,7 +515,7 @@ inline void ksearch_q4k_coop_frag_nr4_dev(
   }
   *a0 += sumf[0]; *a1 += sumf[1]; *a2 += sumf[2]; *a3 += sumf[3];
 }
-inline void ksearch_q4k_coop_frag_nr4_dual_dev(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4_dual_dev(
     device const uchar* Ag, device const uchar* Au,
     uint row0_base, uint cols, uint ib,
     device const half* x, uint lane,
@@ -609,7 +609,7 @@ inline void ksearch_q4k_coop_frag_nr4_dual_dev(
 
 
 
-inline void ksearch_q4k_coop_frag_nr4_mm(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4_mm(
     device const uchar* A, uint row0_base, uint cols, uint ib,
     device const half* x, uint x_stride, uint n_tok, uint lane,
     thread float* acc) {
@@ -694,7 +694,7 @@ const Q4K_SWEEP_HELPER: &str = r#"
 // mul_vec_q4_K_f32_impl structure so the whole K sweep lives in one
 // inlinable frame. Requires exact rows (guards stay in the caller otherwise)
 // and single-token dispatch. Emitting site drops the enclosing ForRange.
-inline void ksearch_q4k_coop_frag_nr4_dev_sweep(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4_dev_sweep(
     device const uchar* A, uint row0_base, uint cols,
     device const half* x, uint lane,
     thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
@@ -703,7 +703,7 @@ inline void ksearch_q4k_coop_frag_nr4_dev_sweep(
     ksearch_q4k_coop_frag_nr4_dev(A, row0_base, cols, ib, x, lane, a0, a1, a2, a3);
   }
 }
-inline void ksearch_q4k_coop_frag_nr4_dual_dev_sweep(
+KS_DEVICE inline void ksearch_q4k_coop_frag_nr4_dual_dev_sweep(
     device const uchar* Ag, device const uchar* Au, uint row0_base, uint cols,
     device const half* x, uint lane,
     thread float* g0, thread float* g1, thread float* g2, thread float* g3,
@@ -717,7 +717,7 @@ inline void ksearch_q4k_coop_frag_nr4_dual_dev_sweep(
 "#;
 
 const K4_SCALE_MIN_HELPER: &str = r#"
-inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
+KS_DEVICE inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar& d, thread uchar& m) {
   if (j < 4u) { d = q[j] & 63u; m = q[j + 4u] & 63u; }
   else { d = (q[j + 4u] & 0x0Fu) | ((q[j - 4u] >> 6u) << 4u); m = (q[j + 4u] >> 4u) | ((q[j] >> 6u) << 4u); }
 }
@@ -725,7 +725,7 @@ inline void ksearch_get_scale_min_k4(uint j, device const uchar* q, thread uchar
 
 /// Generic Q5_K Load expand (same pattern as Q4_K; dequant-at-load to float).
 const Q5K_LOAD_HELPER: &str = r#"
-inline float ksearch_load_q5k(device const uchar* A, uint idx) {
+KS_DEVICE inline float ksearch_load_q5k(device const uchar* A, uint idx) {
   constexpr uint QK = 256u;
   constexpr uint BPB = 176u;
   device const uchar* blk = A + (idx / QK) * BPB;
@@ -758,7 +758,7 @@ inline float ksearch_load_q5k(device const uchar* A, uint idx) {
 /// Generic Q6_K Load / coop expand (not a named matvec kernel).
 const Q6K_LOAD_HELPER: &str = r#"
 // --- Q6_K Load expand + ggml mul_vec_q6_K-shaped coop ---
-inline float ksearch_load_q6k(device const uchar* A, uint idx) {
+KS_DEVICE inline float ksearch_load_q6k(device const uchar* A, uint idx) {
   constexpr uint QK = 256u;
   constexpr uint BPB = 210u;
   device const uchar* blk = A + (idx / QK) * BPB;
@@ -786,7 +786,7 @@ inline float ksearch_load_q6k(device const uchar* A, uint idx) {
     return d * float(sc[is + 6]) * float(q);
   }
 }
-inline float ksearch_q6k_coop_frag_regs(
+KS_DEVICE inline float ksearch_q6k_coop_frag_regs(
     device const uchar* A, uint row_base, uint cols, uint ib,
     thread float* yl, uint lane) {
   constexpr uint QK = 256u;
@@ -819,7 +819,7 @@ inline float ksearch_q6k_coop_frag_regs(
   }
   return d * (sums[0] * float(sc[0]) + sums[1] * float(sc[2]) + sums[2] * float(sc[4]) + sums[3] * float(sc[6]));
 }
-inline void ksearch_q6k_load_y_dev(device const half* y, thread float* yl) {
+KS_DEVICE inline void ksearch_q6k_load_y_dev(device const half* y, thread float* yl) {
   float4 ya = float4(*(device const half4*)(y + 0u));
   float4 yb = float4(*(device const half4*)(y + 32u));
   float4 yc = float4(*(device const half4*)(y + 64u));
@@ -832,7 +832,7 @@ inline void ksearch_q6k_load_y_dev(device const half* y, thread float* yl) {
     yl[4u * l + 3u] = yd[l];
   }
 }
-inline float ksearch_q6k_coop_frag(
+KS_DEVICE inline float ksearch_q6k_coop_frag(
     device const uchar* A, uint row_base, uint cols, uint ib,
     threadgroup const float* x, uint x_off, uint lane) {
   constexpr uint QK = 256u;
@@ -851,7 +851,7 @@ inline float ksearch_q6k_coop_frag(
   }
   return ksearch_q6k_coop_frag_regs(A, row_base, cols, ib, yl, lane);
 }
-inline float ksearch_q6k_coop_frag_dev(
+KS_DEVICE inline float ksearch_q6k_coop_frag_dev(
     device const uchar* A, uint row_base, uint cols, uint ib,
     device const half* x, uint lane) {
   constexpr uint QK = 256u;
@@ -865,7 +865,7 @@ inline float ksearch_q6k_coop_frag_dev(
   ksearch_q6k_load_y_dev(y, yl);
   return ksearch_q6k_coop_frag_regs(A, row_base, cols, ib, yl, lane);
 }
-inline void ksearch_q6k_coop_frag_nr4(
+KS_DEVICE inline void ksearch_q6k_coop_frag_nr4(
     device const uchar* A, uint row0_base, uint cols, uint ib,
     threadgroup const float* x, uint x_off, uint lane,
     thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
@@ -915,7 +915,7 @@ inline void ksearch_q6k_coop_frag_nr4(
   }
   *a0 += sumf[0]; *a1 += sumf[1]; *a2 += sumf[2]; *a3 += sumf[3];
 }
-inline void ksearch_q6k_coop_frag_nr4_dev(
+KS_DEVICE inline void ksearch_q6k_coop_frag_nr4_dev(
     device const uchar* A, uint row0_base, uint cols, uint ib,
     device const half* x, uint lane,
     thread float* a0, thread float* a1, thread float* a2, thread float* a3) {
@@ -960,7 +960,7 @@ inline void ksearch_q6k_coop_frag_nr4_dev(
   }
   *a0 += sumf[0]; *a1 += sumf[1]; *a2 += sumf[2]; *a3 += sumf[3];
 }
-inline void ksearch_q6k_coop_frag_nr4_mm(
+KS_DEVICE inline void ksearch_q6k_coop_frag_nr4_mm(
     device const uchar* A, uint row0_base, uint cols, uint ib,
     device const half* x, uint x_stride, uint n_tok, uint lane,
     thread float* acc) {
@@ -1028,19 +1028,19 @@ inline void ksearch_q6k_coop_frag_nr4_mm(
 const Q40_LOAD_HELPER: &str = r#"
 constant uint Q40_QK = 32u;
 constant uint Q40_BS = 18u;
-inline float ksearch_q40_at(device const uchar* blk, float d, uint j) {
+KS_DEVICE inline float ksearch_q40_at(device const uchar* blk, float d, uint j) {
   uchar q = blk[2u + (j & 15u)];
   int qv = (j < 16u) ? int(q & 0x0Fu) - 8 : int(q >> 4u) - 8;
   return float(qv) * d;
 }
-inline float ksearch_load_q40(device const uchar* A, uint idx) {
+KS_DEVICE inline float ksearch_load_q40(device const uchar* A, uint idx) {
   uint block = idx / Q40_QK;
   uint j = idx % Q40_QK;
   device const uchar* blk = A + block * Q40_BS;
   float d = float(*(device const half*)blk);
   return ksearch_q40_at(blk, d, j);
 }
-inline float4 ksearch_load_q404(device const uchar* A, uint idx) {
+KS_DEVICE inline float4 ksearch_load_q404(device const uchar* A, uint idx) {
   uint block = idx / Q40_QK;
   uint j = idx % Q40_QK;
   device const uchar* blk = A + block * Q40_BS;
@@ -1050,7 +1050,7 @@ inline float4 ksearch_load_q404(device const uchar* A, uint idx) {
                 ksearch_q40_at(blk, d, j + 2u),
                 ksearch_q40_at(blk, d, j + 3u));
 }
-inline void ksearch_pack_q40(
+KS_DEVICE inline void ksearch_pack_q40(
     device uchar* out, uint block, device const half* src, uint src_elem) {
   float vals[32];
   float max_abs = 0.0f;
@@ -1069,7 +1069,7 @@ inline void ksearch_pack_q40(
     blk[2u + i] = uchar(q_lo | (q_hi << 4));
   }
 }
-inline void ksearch_pack_q40_th(
+KS_DEVICE inline void ksearch_pack_q40_th(
     device uchar* out, uint block, thread const float* src, uint src_off) {
   float vals[32];
   float max_abs = 0.0f;
@@ -1089,7 +1089,7 @@ inline void ksearch_pack_q40_th(
     blk[2u + i] = uchar(q_lo | (q_hi << 4));
   }
 }
-inline void ksearch_dequant_q40_to_tg(
+KS_DEVICE inline void ksearch_dequant_q40_to_tg(
     threadgroup float* dst, device const uchar* A, uint src_elem) {
   uint block = src_elem / Q40_QK;
   device const uchar* blk = A + block * Q40_BS;
@@ -1104,14 +1104,14 @@ inline void ksearch_dequant_q40_to_tg(
 /// Tile numbers match ggml mul_mm (NR0=64, NR1=32, NK=32, 4 simdgroups).
 const Q4K_MUL_MM_HELPER: &str = r#"
 #define KSEARCH_FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-inline uchar2 ksearch_q4k_scale_min_k(int j, int k, device const uchar* q) {
+KS_DEVICE inline uchar2 ksearch_q4k_scale_min_k(int j, int k, device const uchar* q) {
   return j < 4
       ? uchar2{uchar(q[j + k] & 63), uchar(q[j + 4 + k] & 63)}
       : uchar2{
             uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xC0) >> 2)),
             uchar((q[j + 4 + k] >> 4) | ((q[j + k] & 0xC0) >> 2))};
 }
-inline void ksearch_q4k_dequant16(device const uchar* blk, short il, thread half temp_a[16]) {
+KS_DEVICE inline void ksearch_q4k_dequant16(device const uchar* blk, short il, thread half temp_a[16]) {
   device const uchar* q = blk + 16;
   short is = (il / 4) * 2;
   q = q + (il / 4) * 32 + 16 * (il & 1);
@@ -1126,7 +1126,7 @@ inline void ksearch_q4k_dequant16(device const uchar* blk, short il, thread half
     temp_a[i] = half(dl * float(q[i] & mask) - ml);
   }
 }
-inline void ksearch_q4k_mul_mm(
+KS_DEVICE inline void ksearch_q4k_mul_mm(
     device const uchar* W, device const half* X, device half* C,
     uint M, uint K, uint N,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
@@ -1228,14 +1228,14 @@ inline void ksearch_q4k_mul_mm(
 /// row once, dot all activation rows. Acc is only `float sumf[r1ptg]` (no spill).
 /// Activations stay F16 (converted at load); outputs written F16.
 const Q4K_MUL_MV_EXT_HELPER: &str = r#"
-inline uchar2 ksearch_q4k_ext_sc(int j, int k, device const uchar* q) {
+KS_DEVICE inline uchar2 ksearch_q4k_ext_sc(int j, int k, device const uchar* q) {
   return j < 4
       ? uchar2{uchar(q[j + k] & 63), uchar(q[j + 4 + k] & 63)}
       : uchar2{
             uchar((q[j + 4 + k] & 0xF) | ((q[j - 4 + k] & 0xC0) >> 2)),
             uchar((q[j + 4 + k] >> 4) | ((q[j + k] & 0xC0) >> 2))};
 }
-inline void ksearch_q4k_dequant_f4x4(device const uchar* blk, short il, thread float4x4& reg) {
+KS_DEVICE inline void ksearch_q4k_dequant_f4x4(device const uchar* blk, short il, thread float4x4& reg) {
   device const uchar* q = blk + 16;
   short is = (il / 4) * 2;
   q = q + (il / 4) * 32 + 16 * (il & 1);
@@ -1250,7 +1250,7 @@ inline void ksearch_q4k_dequant_f4x4(device const uchar* blk, short il, thread f
     reg[i / 4][i % 4] = dl * float(q[i] & mask) - ml;
   }
 }
-inline void ksearch_q4k_mul_mv_ext(
+KS_DEVICE inline void ksearch_q4k_mul_mv_ext(
     device const uchar* W, device const half* X, device half* Y,
     uint M, uint K, uint N, uint r1ptg, uint nsg,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* /*shmem*/) {
@@ -1297,7 +1297,7 @@ inline void ksearch_q4k_mul_mv_ext(
     }
   }
 }
-inline void ksearch_q4k_mul_mv_ext_gate_up_gelu(
+KS_DEVICE inline void ksearch_q4k_mul_mv_ext_gate_up_gelu(
     device const uchar* Wg, device const uchar* Wu, device const half* X, device half* Y,
     uint M, uint K, uint N, uint r1ptg, uint nsg,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* /*shmem*/) {
@@ -1363,7 +1363,7 @@ inline void ksearch_q4k_mul_mv_ext_gate_up_gelu(
 
 /// Q6_K variant of mul_mv_ext (same grid / r1ptg tiling).
 const Q6K_MUL_MV_EXT_HELPER: &str = r#"
-inline void ksearch_q6k_dequant_f4x4(device const uchar* blk, short il, thread float4x4& reg) {
+KS_DEVICE inline void ksearch_q6k_dequant_f4x4(device const uchar* blk, short il, thread float4x4& reg) {
   const half d_all = *(device const half*)(blk + 208);
   device const uint16_t* ql = (device const uint16_t*)(blk);
   device const uint16_t* qh = (device const uint16_t*)(blk + 128);
@@ -1392,7 +1392,7 @@ inline void ksearch_q6k_dequant_f4x4(device const uchar* blk, short il, thread f
     reg[i][3] = dl3 * float(q & 0xFF000000u) - ml;
   }
 }
-inline void ksearch_q6k_mul_mv_ext(
+KS_DEVICE inline void ksearch_q6k_mul_mv_ext(
     device const uchar* W, device const half* X, device half* Y,
     uint M, uint K, uint N, uint r1ptg, uint nsg,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* /*shmem*/) {
@@ -1442,7 +1442,7 @@ inline void ksearch_q6k_mul_mv_ext(
 "#;
 
 const Q6K_MUL_MM_HELPER: &str = r#"
-inline void ksearch_q6k_mul_mm(
+KS_DEVICE inline void ksearch_q6k_mul_mm(
     device const uchar* W, device const half* X, device half* C,
     uint M, uint K, uint N,
     uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
@@ -1539,15 +1539,99 @@ inline void ksearch_q6k_mul_mm(
 }
 "#;
 
-pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSource, CodegenError> {
+/// GPU backend a kernel is lowered for.
+///
+/// The emitter writes a single MSL-flavoured dialect for both targets.
+/// [`Target::Metal`] emits it verbatim (`#include <metal_stdlib>`, `kernel void`,
+/// `[[buffer(n)]]` attributes); [`Target::Cuda`] prefixes the shim from
+/// [`crate::cuda_prelude`], which maps the MSL spellings onto CUDA C++,
+/// regenerates the kernel signature from CUDA launch builtins, and swaps the
+/// `simdgroup_matrix` `mul_mm` helpers for CUDA-native tiled ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Metal,
+    Cuda,
+}
+
+impl Target {
+    /// Kernel entry-point qualifier.
+    fn kernel_kw(self) -> &'static str {
+        match self {
+            Target::Metal => "kernel",
+            Target::Cuda => "KS_KERNEL",
+        }
+    }
+}
+
+/// Lower a Kernel IR to Metal.
+pub fn render_msl(kir: &KernelIr, sched: OptSchedule) -> Result<MetalKernelSource, CodegenError> {
+    render_for(kir, sched, Target::Metal)
+}
+
+/// Lower a Kernel IR to CUDA C++ (see [`Target::Cuda`]).
+pub fn render_cuda(kir: &KernelIr, sched: OptSchedule) -> Result<MetalKernelSource, CodegenError> {
+    render_for(kir, sched, Target::Cuda)
+}
+
+/// Drop MSL address-space qualifiers from a CUDA translation unit.
+///
+/// Whole identifiers only, so `__device__`, `threadIdx` and `__syncthreads`
+/// stay intact. A macro named `device` cannot be used for this: nvcc expands
+/// it inside the `__device__` keyword.
+fn strip_msl_qualifiers(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '_' || c.is_ascii_alphabetic() {
+            let start = i;
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if d == '_' || d.is_ascii_alphanumeric() {
+                    chars.next();
+                    end = j + d.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            match &src[start..end] {
+                "device" | "threadgroup" | "thread" | "precise" => {}
+                "constant" => out.push_str("constexpr"),
+                other => out.push_str(other),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Lower a Kernel IR for an explicit [`Target`].
+pub fn render_for(
+    kir: &KernelIr,
+    _sched: OptSchedule,
+    target: Target,
+) -> Result<MetalKernelSource, CodegenError> {
+    let cuda = target == Target::Cuda;
     // Q4_K is a Load dtype like F16: generic expand to float (tinygrad ggml_data_to_tensor ops).
     // No named matvec_q4k kernel template — only dtype expansion on Load / VecMulSum.
-    let mut src = String::from("#include <metal_stdlib>\nusing namespace metal;\n\n");
+    let mut src = String::new();
+    if cuda {
+        src.push_str(crate::cuda_prelude::CUDA_PRELUDE);
+    } else {
+        src.push_str(
+            "#include <metal_stdlib>\nusing namespace metal;\n#define KS_SMEM threadgroup\n#define KS_DEVICE\n\n",
+        );
+    }
     if body_needs_q4(&kir.body) {
         src.push_str(Q4K_LOAD_HELPER);
         src.push_str(Q4K_SWEEP_HELPER);
         if body_has_mul_mm_q4(&kir.body) {
-            src.push_str(Q4K_MUL_MM_HELPER);
+            // Metal: simdgroup_matrix MMA. CUDA: tiled FMA micro-kernel.
+            src.push_str(if cuda {
+                crate::cuda_prelude::Q4K_MUL_MM_CUDA_HELPER
+            } else {
+                Q4K_MUL_MM_HELPER
+            });
         }
         if body_has_mul_mv_ext_q4(&kir.body) {
             src.push_str(Q4K_MUL_MV_EXT_HELPER);
@@ -1562,7 +1646,11 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
     if body_needs_q6(&kir.body) {
         src.push_str(Q6K_LOAD_HELPER);
         if body_has_mul_mm_q6(&kir.body) {
-            src.push_str(Q6K_MUL_MM_HELPER);
+            src.push_str(if cuda {
+                crate::cuda_prelude::Q6K_MUL_MM_CUDA_HELPER
+            } else {
+                Q6K_MUL_MM_HELPER
+            });
         }
         if body_has_mul_mv_ext_q6(&kir.body) {
             src.push_str(Q6K_MUL_MV_EXT_HELPER);
@@ -1585,9 +1673,7 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
             let p = buffer_params(kir);
             (
                 format!("{p}  uint gid [[thread_position_in_grid]]"),
-                LaunchHint::Elementwise {
-                    n: (*rows).max(1),
-                },
+                LaunchHint::Elementwise { n: (*rows).max(1) },
                 format!("  if (gid >= {}u) return;\n", (*rows).max(1)),
             )
         }
@@ -1643,14 +1729,32 @@ pub fn render_msl(kir: &KernelIr, _sched: OptSchedule) -> Result<MetalKernelSour
             )
         }
     };
+    // CUDA binds buffers positionally and takes the index space from launch
+    // builtins, so its signature and prologue are regenerated; the `mul_mm`
+    // micro-kernel also re-derives grid/block/shared-memory from the shape.
+    let launch = if cuda {
+        cuda_launch(launch, &kir.body)
+    } else {
+        launch
+    };
+    let (params, guard) = if cuda {
+        cuda_signature(kir)
+    } else {
+        (params, guard)
+    };
     let body = emit_stmts(&kir.body, 1, n_in, kir.n_outputs as u32, kir.out_dtype)?;
+    let kw = target.kernel_kw();
     src.push_str(&format!(
-        "kernel void {name}(\n{params}\n) {{\n{guard}{body}}}\n",
+        "{kw} void {name}(\n{params}\n) {{\n{guard}{body}}}\n",
+        kw = kw,
         name = kir.name,
         params = params,
         guard = guard,
         body = body,
     ));
+    if cuda {
+        src = strip_msl_qualifiers(&src);
+    }
     Ok(MetalKernelSource {
         name: kir.name.clone(),
         source: src,
@@ -1668,9 +1772,7 @@ fn buffer_params(kir: &KernelIr) -> String {
     let mut p = String::new();
     for i in 0..kir.n_inputs {
         let ty = in_dt[i].msl();
-        p.push_str(&format!(
-            "  device const {ty}* in{i} [[buffer({i})]],\n"
-        ));
+        p.push_str(&format!("  device const {ty}* in{i} [[buffer({i})]],\n"));
     }
     let n_out = kir.n_outputs.max(1);
     let out_dt = infer_out_dtypes(kir);
@@ -1690,6 +1792,125 @@ fn buffer_params(kir: &KernelIr) -> String {
         }
     }
     p
+}
+
+/// Grid/block/shared-memory size for a CUDA kernel.
+///
+/// Elementwise and per-row kernels keep the Metal mapping (one thread per
+/// element, one block per row, `(32, nsg)` blocks for the ggml-style layouts).
+/// `mul_mm` is the exception: the Metal variant is a `simdgroup_matrix` GEMM
+/// launched as `(32, 4)` threadgroups over `ceil(N/32) x ceil(M/64)` tiles,
+/// while the CUDA helper owns a `CUDA_MUL_MM_BM x CUDA_MUL_MM_BN` output tile
+/// with one thread per 4x4 micro-tile, so `tg_x`/`tg_y`/`tw`/`nsg`/`smem` are
+/// re-derived from the problem shape carried by the statement.
+fn cuda_launch(hint: LaunchHint, body: &[KirStmt]) -> LaunchHint {
+    match hint {
+        LaunchHint::MulMm { .. } => match mul_mm_dims(body) {
+            Some((rows, batch)) => LaunchHint::MulMm {
+                tg_x: (batch as u64)
+                    .div_ceil(crate::cuda_prelude::CUDA_MUL_MM_BN as u64)
+                    .max(1),
+                tg_y: (rows as u64)
+                    .div_ceil(crate::cuda_prelude::CUDA_MUL_MM_BM as u64)
+                    .max(1),
+                tw: crate::cuda_prelude::CUDA_MUL_MM_THREADS,
+                nsg: 1,
+                smem: crate::cuda_prelude::CUDA_MUL_MM_SMEM_BYTES.max(1),
+            },
+            None => hint,
+        },
+        other => other,
+    }
+}
+
+/// `(rows, batch)` of the `mul_mm` GEMM in `body`, if there is one.
+fn mul_mm_dims(body: &[KirStmt]) -> Option<(u32, u32)> {
+    for s in body {
+        match s {
+            KirStmt::Q4kMulMm { rows, batch, .. } | KirStmt::Q6kMulMm { rows, batch, .. } => {
+                return Some((*rows, *batch));
+            }
+            KirStmt::For { body, .. }
+            | KirStmt::If { body, .. }
+            | KirStmt::ForRange { body, .. } => {
+                if let Some(d) = mul_mm_dims(body) {
+                    return Some(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// CUDA kernel signature and leading declaration block.
+///
+/// CUDA binds kernel arguments positionally (no `[[buffer(n)]]`) and exposes the
+/// index space through `blockIdx`/`threadIdx`/`blockDim` instead of per-kernel
+/// index attributes, so the parameter list and the declarations the body relies
+/// on (`gid`, `lid`, `tiisg`, `sgitg`, `tgpig`, `tiitg`, `shmem`) are rebuilt
+/// here. Buffers are passed as plain pointers: CUDA's generic address space
+/// resolves global vs shared at runtime, which is what MSL's `device` /
+/// `threadgroup` qualifiers select statically.
+fn cuda_signature(kir: &KernelIr) -> (String, String) {
+    let mut in_dt = vec![kir.out_dtype; kir.n_inputs];
+    infer_load_dtypes(&kir.body, &mut in_dt);
+    let mut ps: Vec<String> = Vec::new();
+    for i in 0..kir.n_inputs {
+        ps.push(format!("const {}* in{i}", in_dt[i].msl()));
+    }
+    let n_out = kir.n_outputs.max(1);
+    let out_dt = infer_out_dtypes(kir);
+    if n_out == 1 {
+        ps.push(format!("{}* out", out_dt[0].msl()));
+    } else {
+        for o in 0..n_out {
+            ps.push(format!("{}* out{o}", out_dt[o].msl()));
+        }
+    }
+    // No trailing comma: nvcc rejects it (Metal tolerates it).
+    let p = ps
+        .iter()
+        .map(|s| format!("  {s}"))
+        .collect::<Vec<_>>()
+        .join(",\n")
+        + "\n";
+    let guard = match &kir.launch {
+        KirLaunch::Elementwise { n } => {
+            let n = (*n).max(1);
+            format!(
+                "  const uint gid = blockIdx.x * blockDim.x + threadIdx.x;\n  if (gid >= {n}u) return;\n"
+            )
+        }
+        KirLaunch::Rows { rows } => {
+            let rows = (*rows).max(1);
+            format!(
+                "  const uint gid = blockIdx.x * blockDim.x + threadIdx.x;\n  if (gid >= {rows}u) return;\n"
+            )
+        }
+        KirLaunch::RowsParallel { rows, .. } => {
+            let rows = (*rows).max(1);
+            format!(
+                "  const uint gid = blockIdx.x;\n  const uint lid = threadIdx.x;\n  if (gid >= {rows}u) return;\n"
+            )
+        }
+        KirLaunch::RowsParallelSg { rows, .. } => {
+            let rows = (*rows).max(1);
+            // Block is `(32, nsg)`, so warp lanes are `threadIdx.x` and the
+            // simd-group index is `threadIdx.y` — same flat order as Metal.
+            format!(
+                "  const uint gid = blockIdx.x;\n  const uint tiisg = threadIdx.x;\n  const uint sgitg = threadIdx.y;\n  const uint lid = sgitg * 32u + tiisg;\n  if (gid >= {rows}u) return;\n"
+            )
+        }
+        KirLaunch::MulMm { .. } => String::from(
+            "  const uint2 tgpig = uint2(blockIdx.x, blockIdx.y);\n  \
+             const ushort tiitg = ushort(threadIdx.y * blockDim.x + threadIdx.x);\n  \
+             const ushort sgitg = ushort(threadIdx.y);\n  \
+             extern __shared__ char ks_smem[];\n  \
+             char* shmem = ks_smem;\n",
+        ),
+    };
+    (p, guard)
 }
 
 fn infer_out_dtypes(kir: &KernelIr) -> Vec<DType> {
@@ -1722,10 +1943,14 @@ fn infer_out_dtypes(kir: &KernelIr) -> Vec<DType> {
 fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
     for s in stmts {
         match s {
-            KirStmt::For { body, .. } | KirStmt::If { body, .. } | KirStmt::ForRange { body, .. } => {
+            KirStmt::For { body, .. }
+            | KirStmt::If { body, .. }
+            | KirStmt::ForRange { body, .. } => {
                 infer_load_dtypes(body, in_dt);
             }
-            KirStmt::Let { expr, .. } | KirStmt::LetU32 { expr, .. } | KirStmt::Assign { expr, .. } => {
+            KirStmt::Let { expr, .. }
+            | KirStmt::LetU32 { expr, .. }
+            | KirStmt::Assign { expr, .. } => {
                 infer_load_expr(expr, in_dt);
             }
             KirStmt::Store { idx, val, .. }
@@ -1798,12 +2023,7 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
                 infer_load_expr(ib, in_dt);
                 infer_load_expr(lane, in_dt);
             }
-            KirStmt::Q4kMulMm {
-                w_buf, x_buf, ..
-            }
-            | KirStmt::Q4kMulMvExt {
-                w_buf, x_buf, ..
-            } => {
+            KirStmt::Q4kMulMm { w_buf, x_buf, .. } | KirStmt::Q4kMulMvExt { w_buf, x_buf, .. } => {
                 if (*w_buf as usize) < in_dt.len() {
                     in_dt[*w_buf as usize] = DType::Q4K;
                 }
@@ -1827,12 +2047,7 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
                     in_dt[*x_buf as usize] = DType::F16;
                 }
             }
-            KirStmt::Q6kMulMm {
-                w_buf, x_buf, ..
-            }
-            | KirStmt::Q6kMulMvExt {
-                w_buf, x_buf, ..
-            } => {
+            KirStmt::Q6kMulMm { w_buf, x_buf, .. } | KirStmt::Q6kMulMvExt { w_buf, x_buf, .. } => {
                 if (*w_buf as usize) < in_dt.len() {
                     in_dt[*w_buf as usize] = DType::Q6K;
                 }
@@ -1914,7 +2129,9 @@ fn infer_load_expr(e: &KirExpr, in_dt: &mut [DType]) {
             infer_load_expr(a_idx, in_dt);
             infer_load_expr(b_idx, in_dt);
         }
-        KirExpr::TgLoad { idx, .. } | KirExpr::ThreadLoad { idx, .. } => infer_load_expr(idx, in_dt),
+        KirExpr::TgLoad { idx, .. } | KirExpr::ThreadLoad { idx, .. } => {
+            infer_load_expr(idx, in_dt)
+        }
         KirExpr::CastU32ToF32(e) => infer_load_expr(e, in_dt),
         KirExpr::CastF32ToU32(e) => infer_load_expr(e, in_dt),
         KirExpr::SimdSum(a) | KirExpr::Unary { a, .. } => infer_load_expr(a, in_dt),
@@ -1996,11 +2213,9 @@ fn walk_expr_q4(e: &KirExpr, buf: u32) -> bool {
             dtype: DType::Q4K,
             ..
         } if *a_buf == buf => true,
-        KirExpr::VecMulSum {
-            a_idx,
-            b_idx,
-            ..
-        } => walk_expr_q4(a_idx, buf) || walk_expr_q4(b_idx, buf),
+        KirExpr::VecMulSum { a_idx, b_idx, .. } => {
+            walk_expr_q4(a_idx, buf) || walk_expr_q4(b_idx, buf)
+        }
         KirExpr::TgLoad { idx, .. } | KirExpr::ThreadLoad { idx, .. } => walk_expr_q4(idx, buf),
         KirExpr::CastU32ToF32(e) => walk_expr_q4(e, buf),
         KirExpr::CastF32ToU32(e) => walk_expr_q4(e, buf),
@@ -2032,9 +2247,9 @@ fn walk_expr_q4(e: &KirExpr, buf: u32) -> bool {
                 || walk_expr_q4(x_off, buf)
                 || walk_expr_q4(lane, buf)
         }
-        KirExpr::Bin { a, b, .. }
-        | KirExpr::CmpGt { a, b }
-        | KirExpr::CmpEq { a, b } => walk_expr_q4(a, buf) || walk_expr_q4(b, buf),
+        KirExpr::Bin { a, b, .. } | KirExpr::CmpGt { a, b } | KirExpr::CmpEq { a, b } => {
+            walk_expr_q4(a, buf) || walk_expr_q4(b, buf)
+        }
         _ => false,
     }
 }
@@ -2126,9 +2341,7 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                 }
             }
             KirStmt::Q40PackBlock {
-                block,
-                src_elem,
-                ..
+                block, src_elem, ..
             }
             | KirStmt::Q40DequantToTg {
                 tg_off: block,
@@ -2144,21 +2357,20 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
-            KirStmt::TgStoreF4FromLoad { tg_off, src_elem, .. } => {
+            KirStmt::TgStoreF4FromLoad {
+                tg_off, src_elem, ..
+            } => {
                 if walk_expr_q4(tg_off, buf) || walk_expr_q4(src_elem, buf) {
                     return true;
                 }
             }
-            KirStmt::Q4kMulMm { w_buf, .. }
-            | KirStmt::Q4kMulMvExt { w_buf, .. } => {
+            KirStmt::Q4kMulMm { w_buf, .. } | KirStmt::Q4kMulMvExt { w_buf, .. } => {
                 if *w_buf == buf {
                     return true;
                 }
             }
             KirStmt::Q4kMulMvExtGateUpGelu {
-                gate_buf,
-                up_buf,
-                ..
+                gate_buf, up_buf, ..
             } => {
                 if *gate_buf == buf || *up_buf == buf {
                     return true;
@@ -2295,9 +2507,7 @@ fn walk_expr_q6(e: &KirExpr, buf: u32) -> bool {
         }
         KirExpr::Q4kCoopFrag {
             row_base, ib, lane, ..
-        } => {
-            walk_expr_q6(row_base, buf) || walk_expr_q6(ib, buf) || walk_expr_q6(lane, buf)
-        }
+        } => walk_expr_q6(row_base, buf) || walk_expr_q6(ib, buf) || walk_expr_q6(lane, buf),
         KirExpr::Bin { a, b, .. } | KirExpr::CmpGt { a, b } | KirExpr::CmpEq { a, b } => {
             walk_expr_q6(a, buf) || walk_expr_q6(b, buf)
         }
@@ -2348,14 +2558,18 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
             | KirStmt::ThreadgroupReduce { .. }
             | KirStmt::ThreadgroupArgmax { .. } => {}
             KirStmt::Q4kCoopNr4 {
-                row0_base, ib, lane, ..
+                row0_base,
+                ib,
+                lane,
+                ..
             }
             | KirStmt::Q4kCoopNr4Dual {
-                row0_base, ib, lane, ..
+                row0_base,
+                ib,
+                lane,
+                ..
             } => {
-                if walk_expr_q6(row0_base, buf)
-                    || walk_expr_q6(ib, buf)
-                    || walk_expr_q6(lane, buf)
+                if walk_expr_q6(row0_base, buf) || walk_expr_q6(ib, buf) || walk_expr_q6(lane, buf)
                 {
                     return true;
                 }
@@ -2378,9 +2592,7 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
                 }
             }
             KirStmt::Q40PackBlock {
-                block,
-                src_elem,
-                ..
+                block, src_elem, ..
             }
             | KirStmt::Q40DequantToTg {
                 tg_off: block,
@@ -2396,7 +2608,9 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
-            KirStmt::TgStoreF4FromLoad { tg_off, src_elem, .. } => {
+            KirStmt::TgStoreF4FromLoad {
+                tg_off, src_elem, ..
+            } => {
                 if walk_expr_q6(tg_off, buf) || walk_expr_q6(src_elem, buf) {
                     return true;
                 }
@@ -2474,7 +2688,12 @@ fn body_needs_q40(stmts: &[KirStmt]) -> bool {
                         return true;
                     }
                 }
-                KirStmt::Q40PackBlock { .. } | KirStmt::Q40PackFromThread { .. } | KirStmt::Q40DequantToTg { .. } | KirStmt::TgStoreF4FromLoad { dtype: DType::Q40, .. } => return true,
+                KirStmt::Q40PackBlock { .. }
+                | KirStmt::Q40PackFromThread { .. }
+                | KirStmt::Q40DequantToTg { .. }
+                | KirStmt::TgStoreF4FromLoad {
+                    dtype: DType::Q40, ..
+                } => return true,
                 KirStmt::Let { expr, .. }
                 | KirStmt::LetU32 { expr, .. }
                 | KirStmt::Assign { expr, .. } => {
@@ -2517,9 +2736,7 @@ fn body_needs_q40(stmts: &[KirStmt]) -> bool {
             }
             KirExpr::Q4kCoopFrag {
                 row_base, ib, lane, ..
-            } => {
-                expr_needs_q40(row_base) || expr_needs_q40(ib) || expr_needs_q40(lane)
-            }
+            } => expr_needs_q40(row_base) || expr_needs_q40(ib) || expr_needs_q40(lane),
             KirExpr::Q6kCoopFrag {
                 row_base,
                 ib,
@@ -2537,7 +2754,6 @@ fn body_needs_q40(stmts: &[KirStmt]) -> bool {
     }
     walk(stmts)
 }
-
 
 fn emit_stmts(
     stmts: &[KirStmt],
@@ -2611,7 +2827,8 @@ fn emit_stmts(
                 ));
             }
             KirStmt::TgDeclF32 { id, n } => {
-                s.push_str(&format!("{pad}threadgroup float tg{id}[{n}];\n"));
+                // `KS_SMEM` is `threadgroup` under Metal and `__shared__` under CUDA.
+                s.push_str(&format!("{pad}KS_SMEM float tg{id}[{n}];\n"));
             }
             KirStmt::TgStore { id, idx, val } => {
                 let idx_s = emit_expr_ty(idx, n_in, n_out, false, elem)?;
@@ -2657,7 +2874,7 @@ fn emit_stmts(
                     let nsg = (*tg + 31) / 32;
                     s.push_str(&format!(
                         "{pad}v{acc_id} = simd_sum(v{acc_id});\n\
-                         {pad}threadgroup float red_{acc_id}[{nsg}];\n\
+                         {pad}KS_SMEM float red_{acc_id}[{nsg}];\n\
                          {pad}if ((lid & 31u) == 0u) red_{acc_id}[lid / 32u] = v{acc_id};\n\
                          {pad}threadgroup_barrier(mem_flags::mem_threadgroup);\n\
                          {pad}if (lid == 0u) {{\n\
@@ -2695,8 +2912,8 @@ fn emit_stmts(
                 } else {
                     let nsg = (*tg + 31) / 32;
                     s.push_str(&format!(
-                        "{pad}  threadgroup float am_rv[{nsg}];\n\
-                         {pad}  threadgroup float am_ri[{nsg}];\n\
+                        "{pad}  KS_SMEM float am_rv[{nsg}];\n\
+                         {pad}  KS_SMEM float am_ri[{nsg}];\n\
                          {pad}  if ((lid & 31u) == 0u) {{ am_rv[lid / 32u] = am_v; am_ri[lid / 32u] = float(am_i); }}\n\
                          {pad}  threadgroup_barrier(mem_flags::mem_threadgroup);\n\
                          {pad}  if (lid == 0u) {{\n\
@@ -3277,9 +3494,7 @@ fn emit_expr_ty(
             let ib_s = emit_expr_ty(ib, n_in, n_out, false, elem)?;
             let lane_s = emit_expr_ty(lane, n_in, n_out, false, elem)?;
             if let Some(tg) = b_from_tg {
-                format!(
-                    "ksearch_q4k_coop_frag({a}, ({rb}), {cols}u, ({ib_s}), tg{tg}, ({lane_s}))"
-                )
+                format!("ksearch_q4k_coop_frag({a}, ({rb}), {cols}u, ({ib_s}), tg{tg}, ({lane_s}))")
             } else {
                 let xb = buf_name(*x_buf, n_in, n_out);
                 let xp = device_x_plus(xb, x_off, n_in, n_out, elem)?;

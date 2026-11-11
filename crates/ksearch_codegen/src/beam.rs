@@ -75,7 +75,10 @@ pub fn beam_cache_dir() -> PathBuf {
 
 fn dirs_fallback() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("ksearch").join("beam");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("ksearch")
+            .join("beam");
     }
     PathBuf::from(".ksearch_beam_cache")
 }

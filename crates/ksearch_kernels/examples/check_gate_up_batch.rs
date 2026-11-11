@@ -1,9 +1,9 @@
 //! Compare fused gate∥up+GeLU ext vs separate matvec_batch + gelu_mul (batch 2).
 use anyhow::Result;
+use ksearch_compute::{Buffer, Context};
 use ksearch_gguf::{f16_to_f32, f32_to_f16, quantize_f32_to_q4k};
 use ksearch_ir::DType;
 use ksearch_kernels::Eng;
-use ksearch_metal::MetalContext;
 
 fn f16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
@@ -11,7 +11,7 @@ fn f16_bytes(v: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn read_f16(ctx: &MetalContext, buf: &metal::Buffer, n: usize) -> Vec<f32> {
+fn read_f16(ctx: &Context, buf: &Buffer, n: usize) -> Vec<f32> {
     ctx.synchronize().ok();
     ctx.read_u16(buf, n)
         .into_iter()
@@ -41,7 +41,7 @@ fn stats(name: &str, a: &[f32], b: &[f32]) {
 }
 
 fn main() -> Result<()> {
-    let ctx = MetalContext::new()?;
+    let ctx = Context::new()?;
     let mut eng = Eng::new();
     let rows = 2048usize;
     let cols = 1536usize;

@@ -23,12 +23,13 @@
 
 use crate::GemmaConfig;
 use anyhow::{anyhow, Context, Result};
-use ksearch_codegen::{lower_to_metal_chip, MetalKernelSource};
+use ksearch_compute::{
+    Buffer, Context as GpuContext, KernelSource as MetalKernelSource,
+    Pipeline as ComputePipelineState,
+};
 use ksearch_gguf::{f16_to_f32, f32_to_f16, Gguf};
 use ksearch_ir::{DType, Graph, Shape};
 use ksearch_kernels::Eng;
-use ksearch_metal::MetalContext;
-use metal::{Buffer, ComputePipelineState};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -126,7 +127,7 @@ fn rope_table(
     bytes
 }
 
-fn dump_vec_local(ctx: &MetalContext, b: &Buffer, n: usize) -> Vec<f32> {
+fn dump_vec_local(ctx: &GpuContext, b: &Buffer, n: usize) -> Vec<f32> {
     ctx.read_u16(b, n).iter().map(|&x| f16_to_f32(x)).collect()
 }
 
@@ -135,7 +136,7 @@ impl MtpDraft {
     /// K/V the draft's SWA / full attention layers read.
     pub fn load(
         eng: Eng,
-        ctx: &MetalContext,
+        ctx: &GpuContext,
         path: &std::path::Path,
         cfg: &GemmaConfig,
         max_seq: usize,
@@ -376,7 +377,7 @@ impl MtpDraft {
 
     fn tiny(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &GpuContext,
         key: &str,
         build: impl FnOnce(&mut Graph) -> Result<ksearch_ir::TensorId>,
     ) -> Result<()> {
@@ -385,7 +386,7 @@ impl MtpDraft {
         }
         let mut g = Graph::new();
         let o = build(&mut g)?;
-        let src = lower_to_metal_chip(&g, o, &ctx.device_name())?;
+        let src = ctx.lower(&g, o)?;
         let pipe = ctx.compile(&src)?;
         if std::env::var("MTP_DEBUG").is_ok() && key.starts_with("scale") {
             eprintln!("=== tiny kernel {key} source:\n{}", src.source);
@@ -396,7 +397,7 @@ impl MtpDraft {
 
     fn run_tiny(
         &self,
-        ctx: &MetalContext,
+        ctx: &GpuContext,
         key: &str,
         ins: &[&Buffer],
         out: &Buffer,
@@ -432,7 +433,7 @@ impl MtpDraft {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_step(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &GpuContext,
         emb_scaled: &[f32],
         h_seed: &[f32],
         pos: usize,
@@ -473,7 +474,7 @@ impl MtpDraft {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_from_xh(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &GpuContext,
         pos: usize,
         seq_len: usize,
         capacity: usize,
@@ -482,7 +483,7 @@ impl MtpDraft {
     ) -> Result<()> {
         // Serialize producer/consumer kernels. Draft is not the hot path;
         // in-place scale(h→h) in particular races without a barrier.
-        let barrier = |ctx: &MetalContext| ctx.encoder_barrier();
+        let barrier = |ctx: &GpuContext| ctx.encoder_barrier();
 
         // cur = pre_proj · xh
         self.eng.matvec_wd(
@@ -499,7 +500,7 @@ impl MtpDraft {
         let dbg = std::env::var("MTP_DEBUG").is_ok();
         let dump_all = std::env::var("MTP_DUMP_ALL").is_ok();
         let mut dump_seq: Vec<(String, Vec<f32>)> = Vec::new();
-        let stat = |ctx: &MetalContext, b: &Buffer, n: usize, tag: &str| {
+        let stat = |ctx: &GpuContext, b: &Buffer, n: usize, tag: &str| {
             if !dbg {
                 return;
             }
@@ -516,7 +517,7 @@ impl MtpDraft {
         stat(ctx, &self.xh, self.hb * 2, "xh");
         stat(ctx, &self.h, self.hh, "h_after_preproj");
         if dbg {
-            let dump = |ctx: &MetalContext, b: &Buffer, n: usize| -> Vec<f32> {
+            let dump = |ctx: &GpuContext, b: &Buffer, n: usize| -> Vec<f32> {
                 ctx.read_u16(b, n).iter().map(|&x| f16_to_f32(x)).collect()
             };
             let _ = std::fs::write(

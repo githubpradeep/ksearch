@@ -1,13 +1,12 @@
 //! KvPool: continuous-batching style KV slots for B≥1 decode (Thesis A Phase E).
 //!
-//! Metal buffers are owned by the pool; slots track occupancy and sequence length.
+//! GPU buffers are owned by the pool; slots track occupancy and sequence length.
 //! Full multi-stream decode wiring lands on top of this; the pool itself is the
 //! serving contract (SlotId + capacity) called out in DESIGN.md.
 
 use anyhow::{bail, Result};
+use ksearch_compute::{Buffer, Context};
 use ksearch_ir::q40_nbytes;
-use ksearch_metal::MetalContext;
-use metal::Buffer;
 
 /// Opaque slot handle for a resident sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -41,7 +40,7 @@ pub struct KvPool {
 impl KvPool {
     /// Q4_0 packed KV (debt / bandwidth path).
     pub fn new(
-        ctx: &MetalContext,
+        ctx: &Context,
         max_batch: usize,
         max_seq: usize,
         n_kv_layers: usize,
@@ -53,7 +52,7 @@ impl KvPool {
 
     /// F32 KV (legacy).
     pub fn new_f32(
-        ctx: &MetalContext,
+        ctx: &Context,
         max_batch: usize,
         max_seq: usize,
         n_kv_layers: usize,
@@ -65,7 +64,7 @@ impl KvPool {
 
     /// F16 KV for Thesis A prim path (tinygrad `.half()`).
     pub fn new_f16(
-        ctx: &MetalContext,
+        ctx: &Context,
         max_batch: usize,
         max_seq: usize,
         n_kv_layers: usize,
@@ -76,7 +75,7 @@ impl KvPool {
     }
 
     fn new_inner(
-        ctx: &MetalContext,
+        ctx: &Context,
         max_batch: usize,
         max_seq: usize,
         n_kv_layers: usize,
@@ -145,16 +144,17 @@ impl KvPool {
     }
 
     /// Zero K/V packs for a slot (call after [`alloc`] before first prefill).
-    pub fn clear_slot(&self, id: SlotId) -> Result<()> {
+    ///
+    /// `ctx` is the backend the pool was built on: device memory is opaque, so
+    /// zeroing is a `Context::zero` per buffer (a blit on Metal, `cuMemsetD8`
+    /// on CUDA).
+    pub fn clear_slot(&self, ctx: &Context, id: SlotId) -> Result<()> {
         let i = id.0 as usize;
         if i >= self.max_batch {
             bail!("bad SlotId");
         }
         for b in self.k[i].iter().chain(self.v[i].iter()) {
-            let n = b.length() as usize;
-            unsafe {
-                std::ptr::write_bytes(b.contents() as *mut u8, 0, n);
-            }
+            ctx.zero(b);
         }
         Ok(())
     }
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn alloc_free_batch() {
-        let ctx = MetalContext::new().expect("metal");
+        let ctx = Context::new().expect("gpu");
         let mut pool = KvPool::new(&ctx, 4, 64, 2, 256, 1).expect("pool");
         let a = pool.alloc().unwrap();
         let b = pool.alloc().unwrap();

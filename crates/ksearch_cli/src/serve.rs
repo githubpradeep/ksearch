@@ -419,10 +419,15 @@ async fn handle_chat(st: AppState, req: ChatCompletionRequest) -> Result<Respons
                 .collect::<Vec<_>>()
         );
         if req.stream {
-            return Ok(
-                stream_tool_calls_only(id, created, model_name, inferred, include_usage, ids.len())
-                    .into_response(),
-            );
+            return Ok(stream_tool_calls_only(
+                id,
+                created,
+                model_name,
+                inferred,
+                include_usage,
+                ids.len(),
+            )
+            .into_response());
         }
         return Ok(Json(completion_with_tools(
             id,
@@ -660,7 +665,12 @@ fn stream_tool_calls_only(
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
-fn tool_call_sse_events(id: &str, created: u64, model: &str, tool_calls: &[ToolCall]) -> Vec<Event> {
+fn tool_call_sse_events(
+    id: &str,
+    created: u64,
+    model: &str,
+    tool_calls: &[ToolCall],
+) -> Vec<Event> {
     let mut events = Vec::new();
     for (index, tc) in tool_calls.iter().enumerate() {
         events.push(Event::default().data(chunk_json(
@@ -708,7 +718,14 @@ fn stream_sse(
     tool_choice: Option<Value>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>> + Send> {
     let role_json = chunk_json(
-        &id, created, &model, Some("assistant"), None, None, None, None,
+        &id,
+        created,
+        &model,
+        Some("assistant"),
+        None,
+        None,
+        None,
+        None,
     );
     let first = stream::once(async move { Ok(Event::default().data(role_json)) });
     let done = stream::once(async { Ok(Event::default().data("[DONE]")) });

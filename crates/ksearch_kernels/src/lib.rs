@@ -2,10 +2,11 @@
 //! No direct KirBody / catalog Op shortcuts.
 
 use anyhow::Result;
-use ksearch_codegen::{lower_to_metal_chip, LaunchHint, MetalKernelSource};
+use ksearch_codegen::LaunchHint;
+use ksearch_compute::{
+    Buffer, Context, KernelSource as MetalKernelSource, Pipeline as ComputePipelineState,
+};
 use ksearch_ir::{DType, Graph, Shape};
-use ksearch_metal::MetalContext;
-use metal::*;
 use std::collections::HashMap;
 
 pub struct Eng {
@@ -22,19 +23,14 @@ impl Eng {
         }
     }
 
-    fn scratch_f16(&mut self, ctx: &MetalContext, n: usize) -> Buffer {
+    fn scratch_f16(&mut self, ctx: &Context, n: usize) -> Buffer {
         self.fuse_scratch
             .entry(n)
             .or_insert_with(|| ctx.buffer_empty_f16(n))
             .clone()
     }
 
-    fn ensure(
-        &mut self,
-        ctx: &MetalContext,
-        key: &str,
-        src: MetalKernelSource,
-    ) -> Result<()> {
+    fn ensure(&mut self, ctx: &Context, key: &str, src: MetalKernelSource) -> Result<()> {
         if !self.cache.contains_key(key) {
             let p = ctx.compile(&src)?;
             self.cache.insert(key.to_string(), (src, p));
@@ -52,19 +48,13 @@ impl Eng {
         }
     }
 
-    fn run(
-        &self,
-        ctx: &MetalContext,
-        key: &str,
-        inputs: &[&Buffer],
-        output: &Buffer,
-    ) -> Result<()> {
+    fn run(&self, ctx: &Context, key: &str, inputs: &[&Buffer], output: &Buffer) -> Result<()> {
         self.run_multi(ctx, key, inputs, &[output])
     }
 
     fn run_multi(
         &self,
-        ctx: &MetalContext,
+        ctx: &Context,
         key: &str,
         inputs: &[&Buffer],
         outputs: &[&Buffer],
@@ -77,7 +67,7 @@ impl Eng {
 
     fn run_offsets(
         &self,
-        ctx: &MetalContext,
+        ctx: &Context,
         key: &str,
         inputs: &[&Buffer],
         input_byte_offsets: &[u64],
@@ -100,7 +90,7 @@ impl Eng {
 
     fn run_offsets_multi(
         &self,
-        ctx: &MetalContext,
+        ctx: &Context,
         key: &str,
         inputs: &[&Buffer],
         input_byte_offsets: &[u64],
@@ -123,7 +113,7 @@ impl Eng {
 
     pub fn matvec(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         a: &Buffer,
@@ -136,7 +126,7 @@ impl Eng {
     /// Matvec with explicit weight dtype (`F16` or `Q4K`; activations always F16).
     pub fn matvec_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight_dtype: DType,
@@ -151,9 +141,9 @@ impl Eng {
             let w = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_prim(w, v)?;
-            let src = lower_to_metal_chip(&g, out, &ctx.device_name()).map_err(|e| {
-                anyhow::anyhow!("matvec_wd {tag} {rows}x{cols}: {e}")
-            })?;
+            let src = ctx
+                .lower(&g, out)
+                .map_err(|e| anyhow::anyhow!("matvec_wd {tag} {rows}x{cols}: {e}"))?;
             self.ensure(ctx, &key, src)?;
         }
         self.run(ctx, &key, &[a, x], y)
@@ -162,7 +152,7 @@ impl Eng {
     /// Fused Q/K/V matvecs (one launch; LOCAL-stages `x`; three outputs).
     pub fn matvec_qkv(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -192,7 +182,7 @@ impl Eng {
 
     pub fn matvec_qkv_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -226,7 +216,7 @@ impl Eng {
     /// Fused Q/K/V with per-buffer weight dtypes (e.g. Q4K/Q4K/Q6K).
     pub fn matvec_qkv_wds(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -255,7 +245,7 @@ impl Eng {
             let wv_i = g.input(Shape(vec![kv_rows, cols]), wv_dtype);
             let x_i = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_qkv(wq_i, wk_i, wv_i, x_i)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_multi(ctx, &key, &[wq, wk, wv, x], &[q, k, v])
     }
@@ -263,7 +253,7 @@ impl Eng {
     /// Batched fused Q/K/V (MTP verify 2..=8): one dispatch, three mul_mv_ext passes.
     pub fn matvec_qkv_batch_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -298,7 +288,7 @@ impl Eng {
             let wv_i = g.input(Shape(vec![kv_rows, cols]), wv_dtype);
             let x_i = g.input(Shape(vec![batch * cols]), DType::F16);
             let out = g.matvec_qkv_batch(wq_i, wk_i, wv_i, x_i, batch)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_multi(ctx, &key, &[wq, wk, wv, x], &[q, k, v])
     }
@@ -306,7 +296,7 @@ impl Eng {
     /// RMSNorm(x,w_norm) fused into dense matvec (LOCAL-stages `x_hat`).
     pub fn rmsnorm_matvec(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -320,7 +310,7 @@ impl Eng {
 
     pub fn rmsnorm_matvec_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -338,9 +328,9 @@ impl Eng {
             let xi = g.input(Shape(vec![cols]), DType::F16);
             let wn = g.input(Shape(vec![cols]), DType::F16);
             let out = g.rmsnorm_matvec(wm, xi, wn, eps)?;
-            let src = lower_to_metal_chip(&g, out, &ctx.device_name()).map_err(|e| {
-                anyhow::anyhow!("rmsnorm_matvec_wd {tag} {rows}x{cols}: {e}")
-            })?;
+            let src = ctx
+                .lower(&g, out)
+                .map_err(|e| anyhow::anyhow!("rmsnorm_matvec_wd {tag} {rows}x{cols}: {e}"))?;
             self.ensure(ctx, &key, src)?;
         }
         self.run(ctx, &key, &[w_mat, x, w_norm], y)
@@ -349,7 +339,7 @@ impl Eng {
     /// RMSNorm into LOCAL `x_hat`, then fused Q/K/V matvecs (3 outputs).
     pub fn rmsnorm_matvec_qkv(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -383,7 +373,7 @@ impl Eng {
 
     pub fn rmsnorm_matvec_qkv_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -421,7 +411,7 @@ impl Eng {
     /// RMSNorm + fused Q/K/V with per-buffer weight dtypes (mixed Q4K/Q6K ok).
     pub fn rmsnorm_matvec_qkv_wds(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         q_rows: usize,
         kv_rows: usize,
         cols: usize,
@@ -444,7 +434,10 @@ impl Eng {
             weight_cache_tag(wk_dtype),
             weight_cache_tag(wv_dtype)
         );
-        let key = format!("rms_mv_qkv_{tag}_{q_rows}x{kv_rows}x{cols}_{}", eps.to_bits());
+        let key = format!(
+            "rms_mv_qkv_{tag}_{q_rows}x{kv_rows}x{cols}_{}",
+            eps.to_bits()
+        );
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let wq_i = g.input(Shape(vec![q_rows, cols]), wq_dtype);
@@ -453,7 +446,7 @@ impl Eng {
             let x_i = g.input(Shape(vec![cols]), DType::F16);
             let wn = g.input(Shape(vec![cols]), DType::F16);
             let out = g.rmsnorm_matvec_qkv(wq_i, wk_i, wv_i, x_i, wn, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_multi(ctx, &key, &[wq, wk, wv, x, w_norm], &[q, k, v])
     }
@@ -461,7 +454,7 @@ impl Eng {
     /// Thin Q4_K weight matvec (activations F16); Graph uses `DType::Q4K` → generic Load expand.
     pub fn matvec_q4k_prim(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         a: &Buffer,
@@ -473,7 +466,7 @@ impl Eng {
 
     pub fn matvec_q4k_prim_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         a: &Buffer,
@@ -489,7 +482,7 @@ impl Eng {
             let w = g.input(Shape(vec![rows, cols]), DType::Q4K);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_prim(w, v)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let xb = (x_off_elems * DType::F16.size_bytes()) as u64;
         let yb = (y_off_elems * DType::F16.size_bytes()) as u64;
@@ -498,7 +491,7 @@ impl Eng {
 
     pub fn rmsnorm(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         eps: f32,
         x: &Buffer,
@@ -510,7 +503,7 @@ impl Eng {
 
     pub fn rmsnorm_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         eps: f32,
         x: &Buffer,
@@ -525,7 +518,7 @@ impl Eng {
             let xi = g.input(Shape(vec![n]), DType::F16);
             let wi = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_expand(xi, wi, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let xb = (x_off_elems * DType::F16.size_bytes()) as u64;
         let yb = (y_off_elems * DType::F16.size_bytes()) as u64;
@@ -534,7 +527,7 @@ impl Eng {
 
     pub fn rmsnorm_add(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         eps: f32,
         x: &Buffer,
@@ -549,14 +542,14 @@ impl Eng {
             let wi = g.input(Shape(vec![n]), DType::F16);
             let ri = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_add_expand(xi, wi, ri, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, w, residual], y)
     }
 
     pub fn rmsnorm_add_scale(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         eps: f32,
         scale: f32,
@@ -572,7 +565,7 @@ impl Eng {
             let wi = g.input(Shape(vec![n]), DType::F16);
             let ri = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_add_scale_expand(xi, wi, ri, eps, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, w, residual], y)
     }
@@ -581,7 +574,7 @@ impl Eng {
     /// `out_x2 = rms(out_x)*w_ffn` (one launch, two outputs).
     pub fn rmsnorm_add_then_rmsnorm(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         eps: f32,
         y: &Buffer,
@@ -599,14 +592,14 @@ impl Eng {
             let ri = g.input(Shape(vec![n]), DType::F16);
             let wf = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_add_then_rmsnorm(yi, wp, ri, wf, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_multi(ctx, &key, &[y, w_post, residual, w_ffn], &[out_x, out_x2])
     }
 
     pub fn rmsnorm_per_head(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -620,7 +613,7 @@ impl Eng {
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let out = g.rmsnorm_per_head(xi, wi, n_heads, hd, eps, true)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, w], y)
     }
@@ -628,7 +621,7 @@ impl Eng {
     /// Fused per-head RMSNorm + RoPE (one launch).
     pub fn rmsnorm_per_head_rope(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -643,7 +636,7 @@ impl Eng {
     /// Like [`rmsnorm_per_head_rope`] with element offsets into `cos_sin` / `y` (F16 elems).
     pub fn rmsnorm_per_head_rope_off(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -661,7 +654,7 @@ impl Eng {
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rmsnorm_per_head_rope(xi, wi, ci, n_heads, hd, eps, true)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b16 = DType::F16.size_bytes() as u64;
         let b32 = DType::F32.size_bytes() as u64;
@@ -677,7 +670,7 @@ impl Eng {
 
     pub fn rmsnorm_noweight(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -689,7 +682,7 @@ impl Eng {
 
     pub fn rmsnorm_noweight_off(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -703,22 +696,15 @@ impl Eng {
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let out = g.rmsnorm_per_head(xi, wi, n_heads, hd, eps, false)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
-        self.run_offsets(
-            ctx,
-            &key,
-            &[x, x],
-            &[0, 0],
-            y,
-            y_off_elems as u64 * b,
-        )
+        self.run_offsets(ctx, &key, &[x, x], &[0, 0], y, y_off_elems as u64 * b)
     }
 
     pub fn add(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         a: &Buffer,
         b: &Buffer,
@@ -730,14 +716,14 @@ impl Eng {
             let a = g.input(Shape(vec![n]), DType::F16);
             let b = g.input(Shape(vec![n]), DType::F16);
             let out = g.add(a, b)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[a, b], y)
     }
 
     pub fn gelu_mul(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         gate: &Buffer,
         up: &Buffer,
@@ -748,7 +734,7 @@ impl Eng {
 
     pub fn gelu_mul_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         gate: &Buffer,
         up: &Buffer,
@@ -761,7 +747,7 @@ impl Eng {
             let gate_i = g.input(Shape(vec![n]), DType::F16);
             let up_i = g.input(Shape(vec![up_off + n]), DType::F16);
             let out = g.gelu_mul_at(gate_i, up_i, up_off)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[gate, up], y)
     }
@@ -769,7 +755,7 @@ impl Eng {
     /// `y[i] = gelu(gate[i]) * up[i]` with F16 element offsets.
     pub fn gelu_mul_off(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         gate: &Buffer,
         gate_off_elems: usize,
@@ -784,7 +770,7 @@ impl Eng {
             let gate_i = g.input(Shape(vec![n]), DType::F16);
             let up_i = g.input(Shape(vec![n]), DType::F16);
             let out = g.gelu_mul_at(gate_i, up_i, 0)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets_multi(
@@ -800,7 +786,7 @@ impl Eng {
     /// `y[t*inner + i] = gelu(gate[t*inner + i]) * up[t*up_stride + i]` (up may be byte-offset).
     pub fn gelu_mul_strided(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         inner: usize,
         n_tok: usize,
         gate: &Buffer,
@@ -817,7 +803,7 @@ impl Eng {
             let up_need = (n_tok.saturating_sub(1)) * up_stride + inner;
             let up_i = g.input(Shape(vec![up_need.max(1)]), DType::F16);
             let out = g.gelu_mul_strided(gate_i, up_i, inner, n_tok, 0, up_stride)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets_multi(
@@ -833,7 +819,7 @@ impl Eng {
     /// PLE gate: fused matvec + `gelu(acc)*ctx[i]` (one launch). Use `ctx` byte offset for layer slice.
     pub fn matvec_gelu_mul_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight_dtype: DType,
@@ -852,7 +838,7 @@ impl Eng {
             let xi = g.input(Shape(vec![cols]), DType::F16);
             let ci = g.input(Shape(vec![rows]), DType::F16);
             let out = g.matvec_gelu_mul(wi, xi, ci, 0)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets(
@@ -868,7 +854,7 @@ impl Eng {
     /// PLE: fused gate gelu*ctx + proj + rmsnorm_add_scale (one launch).
     pub fn matvec_gelu_mul_proj_rms_add_scale_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         gate_rows: usize,
         cols: usize,
         proj_rows: usize,
@@ -898,10 +884,9 @@ impl Eng {
             let wp = g.input(Shape(vec![proj_rows, gate_rows]), weight_dtype);
             let wn = g.input(Shape(vec![proj_rows]), DType::F16);
             let ri = g.input(Shape(vec![proj_rows]), DType::F16);
-            let out = g.matvec_gelu_mul_proj_rms_add_scale(
-                wg, xi, ci, 0, wp, wn, ri, eps, scale,
-            )?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            let out =
+                g.matvec_gelu_mul_proj_rms_add_scale(wg, xi, ci, 0, wp, wn, ri, eps, scale)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets(
@@ -917,7 +902,7 @@ impl Eng {
     /// F16 short-K: matvec + rmsnorm_add in one Eng CALL (sequenced: fast matvec then rms).
     pub fn matvec_rmsnorm_add(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -939,7 +924,7 @@ impl Eng {
     /// fuse loses to multi-TG coop on 1536×256).
     pub fn matvec_rmsnorm_add_scale(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -960,7 +945,7 @@ impl Eng {
     /// `y = scale * (a + b)` as one elementwise launch.
     pub fn add_scale(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         scale: f32,
         a: &Buffer,
@@ -974,7 +959,7 @@ impl Eng {
             let bi = g.input(Shape(vec![n]), DType::F16);
             let s = g.add(ai, bi)?;
             let out = g.scale_const(s, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[a, b], y)
     }
@@ -982,7 +967,7 @@ impl Eng {
     /// Fused gate/up matvecs + GELU*mul (one launch; LOCAL-stages `x`).
     pub fn matvec_gate_up_gelu(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         gate: &Buffer,
@@ -995,7 +980,7 @@ impl Eng {
 
     pub fn matvec_gate_up_gelu_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight_dtype: DType,
@@ -1012,7 +997,7 @@ impl Eng {
             let wu = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_gate_up_gelu(wg, wu, v)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[gate, up, x], y)
     }
@@ -1020,7 +1005,7 @@ impl Eng {
     /// Batched gate∥up+GeLU (MTP verify 2..=8).
     pub fn matvec_gate_up_gelu_batch_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         batch: usize,
@@ -1046,7 +1031,7 @@ impl Eng {
             let wu = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![batch * cols]), DType::F16);
             let out = g.matvec_gate_up_gelu_batch(wg, wu, v, batch)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[gate, up, x], y)
     }
@@ -1054,7 +1039,7 @@ impl Eng {
     /// RMSNorm into LOCAL `x_hat`, then fused gate/up matvecs + GELU*mul.
     pub fn rmsnorm_matvec_gate_up_gelu(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -1080,7 +1065,7 @@ impl Eng {
 
     pub fn rmsnorm_matvec_gate_up_gelu_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -1100,14 +1085,14 @@ impl Eng {
             let v = g.input(Shape(vec![cols]), DType::F16);
             let wn = g.input(Shape(vec![cols]), DType::F16);
             let out = g.rmsnorm_matvec_gate_up_gelu(wg, wu, v, wn, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[gate, up, x, w_norm], y)
     }
 
     pub fn scale_const(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         scale: f32,
         x: &Buffer,
@@ -1118,14 +1103,14 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n]), DType::F16);
             let out = g.scale_const(xi, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x], y)
     }
 
     pub fn rope(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         x: &Buffer,
@@ -1138,14 +1123,14 @@ impl Eng {
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
             let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rope(xi, ci, n_heads, hd)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, cos_sin], y)
     }
 
     pub fn sdpa_naive(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         hd: usize,
         max_t: usize,
@@ -1162,7 +1147,7 @@ impl Eng {
     /// K/V logical layout `[max_t, n_kv, hd]` (MQA: `n_kv=1`).
     pub fn sdpa_naive_kv(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         hd: usize,
@@ -1182,7 +1167,7 @@ impl Eng {
             let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_naive(qi, ki, vi, mi, n_q, hd, max_t)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, o)?)?;
         }
         self.run(ctx, &key, &[q, k, v, meta], out)
     }
@@ -1194,7 +1179,7 @@ impl Eng {
     /// Partitioned MWG SDPA (pass1 + reduce). `tmp` is F32 `[n_q * NWG * (hd + 2)]`.
     pub fn sdpa_mwg_kv(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         hd: usize,
@@ -1216,14 +1201,14 @@ impl Eng {
             let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_mwg_part(qi, ki, vi, mi, n_q, hd, max_t, nwg)?;
-            self.ensure(ctx, &part_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &part_key, ctx.lower(&g, o)?)?;
         }
         let red_key = format!("sdpa_mwg_reduce_{n_q}_{hd}_{nwg}");
         if !self.cache.contains_key(&red_key) {
             let mut g = Graph::new();
             let ti = g.input(Shape(vec![n_q * nwg * (hd + 2)]), DType::F32);
             let o = g.sdpa_mwg_reduce(ti, n_q, hd, nwg)?;
-            self.ensure(ctx, &red_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &red_key, ctx.lower(&g, o)?)?;
         }
         self.run(ctx, &part_key, &[q, k, v, meta], tmp)?;
         ctx.encoder_barrier();
@@ -1233,7 +1218,7 @@ impl Eng {
     /// Hybrid SDPA: online shared-head if `attn_t < THRESHOLD`, else MWG.
     pub fn sdpa_hybrid_kv(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         hd: usize,
@@ -1257,7 +1242,7 @@ impl Eng {
     /// Pack `n` F16 elems (n%32==0) into Q4_0 at `dst` (+ byte offset).
     pub fn quantize_q40(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         src: &Buffer,
         dst: &Buffer,
@@ -1268,16 +1253,15 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n]), DType::F16);
             let out = g.quantize_q40(xi, n)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_offsets(ctx, &key, &[src], &[0], dst, dst_byte_off as u64)
     }
 
-
     /// RMSNorm + RoPE + Q4_0 pack into `dst` (+ byte offset). One launch for KV-K append.
     pub fn rmsnorm_per_head_rope_q40_off(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -1295,7 +1279,7 @@ impl Eng {
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rmsnorm_per_head_rope_q40(xi, wi, ci, n_heads, hd, eps, true)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets(
@@ -1311,7 +1295,7 @@ impl Eng {
     /// RMSNorm (no weight) + Q4_0 pack into `dst` (+ byte offset). One launch for KV-V append.
     pub fn rmsnorm_per_head_q40_off(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -1325,7 +1309,7 @@ impl Eng {
             let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let out = g.rmsnorm_per_head_q40(xi, wi, n_heads, hd, eps, false)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_offsets(ctx, &key, &[x, x], &[0, 0], dst, dst_byte_off as u64)
     }
@@ -1333,7 +1317,7 @@ impl Eng {
     /// Q rms+RoPE (F16) + K rms+RoPE+Q40 + V rms+Q40 in one launch (KV-owning layers).
     pub fn rmsnorm_per_head_qkv_q40_off(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         hd: usize,
@@ -1360,7 +1344,7 @@ impl Eng {
             let kwi = g.input(Shape(vec![hd]), DType::F16);
             let vi = g.input(Shape(vec![n_kv * hd]), DType::F16);
             let out = g.rmsnorm_per_head_qkv_q40(qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets_multi(
@@ -1375,7 +1359,7 @@ impl Eng {
 
     pub fn copy_slice(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         src: &Buffer,
         src_off: usize,
@@ -1387,14 +1371,14 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![src_off + n]), DType::F16);
             let out = g.copy_slice(xi, src_off, dst_off, n)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[src], dst)
     }
 
     pub fn copy_scale(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         scale: f32,
         src: &Buffer,
@@ -1402,14 +1386,23 @@ impl Eng {
         dst: &Buffer,
         dst_off: usize,
     ) -> Result<()> {
-        self.copy_scale_wd(ctx, n, scale, DType::F16, src, src_off * 2, dst, dst_off * 2)
+        self.copy_scale_wd(
+            ctx,
+            n,
+            scale,
+            DType::F16,
+            src,
+            src_off * 2,
+            dst,
+            dst_off * 2,
+        )
     }
 
     /// Copy `n` logical elems from `src` (+byte offset) with scale. `dtype` may be F16 or
     /// Q4K/Q5K/Q6K (Load expand → F16). Offsets are **bytes** into the buffers.
     pub fn copy_scale_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         scale: f32,
         dtype: DType,
@@ -1425,7 +1418,7 @@ impl Eng {
             // Logical length only — row selection is via Metal buffer byte offset.
             let xi = g.input(Shape(vec![n]), dtype);
             let out = g.copy_scale(xi, 0, 0, n, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_offsets(
             ctx,
@@ -1440,7 +1433,7 @@ impl Eng {
     /// GPU-resident row gather: `dst[i] = scale * src[uint(idx[0]) * n + i]`.
     pub fn copy_scale_indexed_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         scale: f32,
         dtype: DType,
@@ -1455,7 +1448,7 @@ impl Eng {
             let xi = g.input(Shape(vec![n]), dtype);
             let ii = g.input(Shape(vec![1]), DType::F32);
             let out = g.copy_scale_indexed(xi, ii, n, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[src, idx], dst)
     }
@@ -1463,7 +1456,7 @@ impl Eng {
     /// Prefill: gather `batch` rows; `idx` is F32 `[batch]`.
     pub fn copy_scale_indexed_batch_wd(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         batch: usize,
         scale: f32,
@@ -1482,7 +1475,7 @@ impl Eng {
             let xi = g.input(Shape(vec![n]), dtype);
             let ii = g.input(Shape(vec![batch]), DType::F32);
             let out = g.copy_scale_indexed_batch(xi, ii, n, batch, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[src, idx], dst)
     }
@@ -1490,7 +1483,7 @@ impl Eng {
     /// Prefill: `y[t] = W @ x[t]` for `t in 0..batch`.
     pub fn matvec_batch(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         batch: usize,
@@ -1517,7 +1510,7 @@ impl Eng {
             self.ensure(
                 ctx,
                 &key,
-                lower_to_metal_chip(&g, out, &ctx.device_name()).map_err(|e| {
+                ctx.lower(&g, out).map_err(|e| {
                     anyhow::anyhow!("matvec_batch {tag} {batch}x{rows}x{cols}: {e}")
                 })?,
             )?;
@@ -1527,7 +1520,7 @@ impl Eng {
 
     pub fn matvec_wd_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight_dtype: DType,
@@ -1544,7 +1537,7 @@ impl Eng {
             let w = g.input(Shape(vec![rows, cols]), weight_dtype);
             let v = g.input(Shape(vec![cols]), DType::F16);
             let out = g.matvec_prim(w, v)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets(
@@ -1559,7 +1552,7 @@ impl Eng {
 
     pub fn rmsnorm_rows(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         rows: usize,
         eps: f32,
@@ -1576,14 +1569,14 @@ impl Eng {
             let xi = g.input(Shape(vec![rows * n]), DType::F16);
             let wi = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_rows(xi, wi, n, rows, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, w], y)
     }
 
     pub fn rmsnorm_add_rows(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         rows: usize,
         eps: f32,
@@ -1602,14 +1595,14 @@ impl Eng {
             let wi = g.input(Shape(vec![n]), DType::F16);
             let ri = g.input(Shape(vec![rows * n]), DType::F16);
             let out = g.rmsnorm_add_rows(xi, wi, ri, n, rows, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, w, residual], y)
     }
 
     pub fn rmsnorm_add_scale_rows(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         rows: usize,
         eps: f32,
@@ -1620,9 +1613,7 @@ impl Eng {
         y: &Buffer,
     ) -> Result<()> {
         if rows == 1 {
-            return self.rmsnorm_add_scale_at(
-                ctx, n, eps, scale, x, 0, w, residual, 0, y, 0,
-            );
+            return self.rmsnorm_add_scale_at(ctx, n, eps, scale, x, 0, w, residual, 0, y, 0);
         }
         let key = format!(
             "rms_f16_add_sc_rows_{rows}_{n}_{}_{}",
@@ -1635,14 +1626,14 @@ impl Eng {
             let wi = g.input(Shape(vec![n]), DType::F16);
             let ri = g.input(Shape(vec![rows * n]), DType::F16);
             let out = g.rmsnorm_add_scale_rows(xi, wi, ri, n, rows, eps, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run(ctx, &key, &[x, w, residual], y)
     }
 
     pub fn rmsnorm_add_then_rmsnorm_rows(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         rows: usize,
         eps: f32,
@@ -1654,9 +1645,8 @@ impl Eng {
         out_x2: &Buffer,
     ) -> Result<()> {
         if rows == 1 {
-            return self.rmsnorm_add_then_rmsnorm(
-                ctx, n, eps, y, w_post, residual, w_ffn, out_x, out_x2,
-            );
+            return self
+                .rmsnorm_add_then_rmsnorm(ctx, n, eps, y, w_post, residual, w_ffn, out_x, out_x2);
         }
         let key = format!("rms_f16_add_then_rms_rows_{rows}_{n}_{}", eps.to_bits());
         if !self.cache.contains_key(&key) {
@@ -1666,14 +1656,14 @@ impl Eng {
             let ri = g.input(Shape(vec![rows * n]), DType::F16);
             let wf = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_add_then_rmsnorm_rows(yi, wp, ri, wf, n, rows, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         self.run_multi(ctx, &key, &[y, w_post, residual, w_ffn], &[out_x, out_x2])
     }
 
     pub fn sdpa_hybrid_kv_batch(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         n_tok: usize,
@@ -1713,7 +1703,7 @@ impl Eng {
 
     pub fn sdpa_naive_kv_batch(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         n_tok: usize,
@@ -1734,14 +1724,14 @@ impl Eng {
             let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let o = g.sdpa_naive_batch(qi, ki, vi, mi, n_q, n_tok, hd, max_t)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, o)?)?;
         }
         self.run(ctx, &key, &[q, k, v, meta], out)
     }
 
     pub fn sdpa_mwg_kv_batch(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         n_tok: usize,
@@ -1756,7 +1746,8 @@ impl Eng {
         out: &Buffer,
     ) -> Result<()> {
         let nwg = Self::SDPA_MWG_NWG;
-        let part_key = format!("sdpa_mwg_part_b{n_tok}_{n_q}_{n_kv}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
+        let part_key =
+            format!("sdpa_mwg_part_b{n_tok}_{n_q}_{n_kv}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
         let red_key = format!("sdpa_mwg_red_b{n_tok}_{n_q}_{hd}_{nwg}");
         if !self.cache.contains_key(&part_key) {
             let mut g = Graph::new();
@@ -1765,13 +1756,13 @@ impl Eng {
             let vi = g.input(Shape(vec![max_t * n_kv * hd]), kv_dtype);
             let mi = g.input(Shape(vec![4]), DType::F32);
             let t = g.sdpa_mwg_part_batch(qi, ki, vi, mi, n_q, n_tok, hd, max_t, nwg)?;
-            self.ensure(ctx, &part_key, lower_to_metal_chip(&g, t, &ctx.device_name())?)?;
+            self.ensure(ctx, &part_key, ctx.lower(&g, t)?)?;
         }
         if !self.cache.contains_key(&red_key) {
             let mut g = Graph::new();
             let ti = g.input(Shape(vec![n_tok * n_q * nwg * (hd + 2)]), DType::F32);
             let o = g.sdpa_mwg_reduce_batch(ti, n_q, n_tok, hd, nwg)?;
-            self.ensure(ctx, &red_key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &red_key, ctx.lower(&g, o)?)?;
         }
         self.run(ctx, &part_key, &[q, k, v, meta], tmp)?;
         ctx.encoder_barrier();
@@ -1780,7 +1771,7 @@ impl Eng {
 
     pub fn rmsnorm_per_head_qkv_q40_row(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         hd: usize,
@@ -1811,7 +1802,7 @@ impl Eng {
             let kwi = g.input(Shape(vec![hd]), DType::F16);
             let vi = g.input(Shape(vec![n_kv * hd]), DType::F16);
             let out = g.rmsnorm_per_head_qkv_q40(qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, eps)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b16 = DType::F16.size_bytes() as u64;
         let b32 = DType::F32.size_bytes() as u64;
@@ -1838,7 +1829,7 @@ impl Eng {
 
     pub fn rmsnorm_per_head_qkv_q40_batch(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_q: usize,
         n_kv: usize,
         hd: usize,
@@ -1880,7 +1871,10 @@ impl Eng {
                 kv_byte_off,
             );
         }
-        let key = format!("rms_ph_qkv_q40_b{n_tok}_{n_q}_{n_kv}_{hd}_{}", eps.to_bits());
+        let key = format!(
+            "rms_ph_qkv_q40_b{n_tok}_{n_q}_{n_kv}_{hd}_{}",
+            eps.to_bits()
+        );
         if !self.cache.contains_key(&key) {
             let mut g = Graph::new();
             let qi = g.input(Shape(vec![n_tok * n_q * hd]), DType::F16);
@@ -1892,7 +1886,7 @@ impl Eng {
             let out = g.rmsnorm_per_head_qkv_q40_batch(
                 qi, qwi, ci, ki, kwi, vi, n_q, n_kv, hd, n_tok, eps,
             )?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets_multi(
@@ -1907,7 +1901,7 @@ impl Eng {
 
     pub fn rmsnorm_per_head_rope_row(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         eps: f32,
@@ -1926,7 +1920,7 @@ impl Eng {
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let ci = g.input(Shape(vec![hd]), DType::F32);
             let out = g.rmsnorm_per_head_rope(xi, wi, ci, n_heads, hd, eps, true)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b16 = DType::F16.size_bytes() as u64;
         let b32 = DType::F32.size_bytes() as u64;
@@ -1934,11 +1928,7 @@ impl Eng {
             ctx,
             &key,
             &[x, w, cos_sin],
-            &[
-                x_off_elems as u64 * b16,
-                0,
-                cos_sin_off_elems as u64 * b32,
-            ],
+            &[x_off_elems as u64 * b16, 0, cos_sin_off_elems as u64 * b32],
             y,
             y_off_elems as u64 * b16,
         )
@@ -1946,7 +1936,7 @@ impl Eng {
 
     pub fn rmsnorm_per_head_rope_batch(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n_heads: usize,
         hd: usize,
         n_tok: usize,
@@ -1959,7 +1949,17 @@ impl Eng {
     ) -> Result<()> {
         if n_tok == 1 {
             return self.rmsnorm_per_head_rope_row(
-                ctx, n_heads, hd, eps, x, 0, w, cos_sin, cos_sin_off_elems, y, 0,
+                ctx,
+                n_heads,
+                hd,
+                eps,
+                x,
+                0,
+                w,
+                cos_sin,
+                cos_sin_off_elems,
+                y,
+                0,
             );
         }
         let key = format!("rms_f16_ph_rope_b{n_tok}_{n_heads}_{hd}_{}", eps.to_bits());
@@ -1968,10 +1968,8 @@ impl Eng {
             let xi = g.input(Shape(vec![n_tok * n_heads * hd]), DType::F16);
             let wi = g.input(Shape(vec![hd]), DType::F16);
             let ci = g.input(Shape(vec![n_tok * hd]), DType::F32);
-            let out = g.rmsnorm_per_head_rope_batch(
-                xi, wi, ci, n_heads, hd, n_tok, eps, true,
-            )?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            let out = g.rmsnorm_per_head_rope_batch(xi, wi, ci, n_heads, hd, n_tok, eps, true)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b32 = DType::F32.size_bytes() as u64;
         self.run_offsets(
@@ -1986,7 +1984,7 @@ impl Eng {
 
     pub fn matvec_gelu_mul_row(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight_dtype: DType,
@@ -2006,7 +2004,7 @@ impl Eng {
             let xi = g.input(Shape(vec![cols]), DType::F16);
             let ci = g.input(Shape(vec![rows]), DType::F16);
             let out = g.matvec_gelu_mul(wi, xi, ci, 0)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets(
@@ -2021,7 +2019,7 @@ impl Eng {
 
     pub fn rmsnorm_add_scale_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         eps: f32,
         scale: f32,
@@ -2040,7 +2038,7 @@ impl Eng {
             let wi = g.input(Shape(vec![n]), DType::F16);
             let ri = g.input(Shape(vec![n]), DType::F16);
             let out = g.rmsnorm_add_scale_expand(xi, wi, ri, eps, scale)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, out, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
         }
         let b = DType::F16.size_bytes() as u64;
         self.run_offsets_multi(
@@ -2055,7 +2053,7 @@ impl Eng {
 
     pub fn softcap_argmax(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         cap: f32,
         x: &Buffer,
@@ -2068,7 +2066,7 @@ impl Eng {
     /// `out[out_off_elems]` is F32.
     pub fn softcap_argmax_at(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         cap: f32,
         x: &Buffer,
@@ -2081,7 +2079,7 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![n]), DType::F16);
             let o = g.softcap_argmax(xi, cap)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, o)?)?;
         }
         let xb = (x_off_elems * DType::F16.size_bytes()) as u64;
         let yb = (out_off_elems * DType::F32.size_bytes()) as u64;
@@ -2091,7 +2089,7 @@ impl Eng {
     /// Softcap+argmax for `rows` packed logit rows (MTP verify).
     pub fn softcap_argmax_rows(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         n: usize,
         rows: usize,
         cap: f32,
@@ -2106,7 +2104,7 @@ impl Eng {
             let mut g = Graph::new();
             let xi = g.input(Shape(vec![rows * n]), DType::F16);
             let o = g.softcap_argmax_rows(xi, n, rows, cap)?;
-            self.ensure(ctx, &key, lower_to_metal_chip(&g, o, &ctx.device_name())?)?;
+            self.ensure(ctx, &key, ctx.lower(&g, o)?)?;
         }
         self.run(ctx, &key, &[x], out)
     }
@@ -2114,13 +2112,13 @@ impl Eng {
     /// BEAM-search one matvec; `weight` must match `weight_dtype` packing.
     pub fn beam_matvec(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight_dtype: DType,
         weight: &Buffer,
     ) -> Result<()> {
-        use ksearch_codegen::{beam_search_matvec, load_plan};
+        use ksearch_codegen::{beam_search_matvec, load_plan, Target};
         let chip = ctx.device_name();
         let plan_kind = match weight_dtype {
             DType::Q4K => "matvec_q4k_v2",
@@ -2159,7 +2157,12 @@ impl Eng {
             samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             Ok(samples[1])
         };
-        let result = beam_search_matvec(&g, y, &chip, time_one).map_err(|e| anyhow::anyhow!(e))?;
+        let target = match ctx.backend() {
+            ksearch_compute::Backend::Cuda => Target::Cuda,
+            ksearch_compute::Backend::Metal => Target::Metal,
+        };
+        let result =
+            beam_search_matvec(&g, y, &chip, target, time_one).map_err(|e| anyhow::anyhow!(e))?;
         eprintln!(
             "[beam] {rows}x{cols} → tg={} vec={} unroll={} nr0={} ({:.3} ms{})",
             result.schedule.tg,
@@ -2175,7 +2178,7 @@ impl Eng {
     /// BEAM-search one F16 matvec; `weight` must hold `rows*cols` halfs (may be product embd).
     pub fn beam_f16_matvec(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         rows: usize,
         cols: usize,
         weight: &Buffer,
@@ -2186,7 +2189,7 @@ impl Eng {
     /// Warm plan cache for mid-size matvecs (allocates scratch weights).
     pub fn warm_matvec_plans(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         weight_dtype: DType,
         shapes: &[(usize, usize)],
     ) -> Result<()> {
@@ -2214,7 +2217,7 @@ impl Eng {
     /// Warm plan cache for mid-size F16 matvecs (allocates scratch weights).
     pub fn warm_f16_matvec_plans(
         &mut self,
-        ctx: &MetalContext,
+        ctx: &Context,
         shapes: &[(usize, usize)],
     ) -> Result<()> {
         self.warm_matvec_plans(ctx, DType::F16, shapes)
