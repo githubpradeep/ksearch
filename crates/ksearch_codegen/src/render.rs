@@ -1789,6 +1789,14 @@ pub fn render_for(
             // Rows >= 2048: the 128-row tile halves activation re-reads.
             src.push_str(crate::cuda_prelude::F16_MUL_MM_TALL_CUDA_HELPER);
         }
+        if cuda && body_has_mul_mm_f16_p3(&kir.body) {
+            // KSEARCH_MM_PIPE=3: three-stage BK=16 pipeline A/B.
+            src.push_str(crate::cuda_prelude::F16_MUL_MM_P3_CUDA_HELPER);
+        }
+        if cuda && body_has_mul_mm_f16_mma(&kir.body) {
+            // KSEARCH_MM_MMA=1: explicit mma.sync/ldmatrix A/B.
+            src.push_str(crate::cuda_prelude::F16_MMA_CUDA_HELPER);
+        }
     }
     if body_needs_q40(&kir.body) {
         src.push_str(Q40_LOAD_HELPER);
@@ -1963,6 +1971,8 @@ fn cuda_launch(hint: LaunchHint, body: &[KirStmt]) -> LaunchHint {
                             crate::cuda_prelude::CUDA_F16_MUL_MM_THREADS,
                             if tall {
                                 crate::cuda_prelude::CUDA_F16_MUL_MM_TALL_SMEM_BYTES
+                            } else if f16_stmt_uses_p3(rows, split) {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_P3_SMEM_BYTES
                             } else {
                                 crate::cuda_prelude::CUDA_F16_MUL_MM_SMEM_BYTES
                             },
@@ -2660,6 +2670,74 @@ fn f16_stmt_is_tall(rows: u32, split: u32) -> bool {
     split <= 1
         && rows >= crate::cuda_prelude::CUDA_F16_MUL_MM_TALL_MIN_ROWS as u32
         && crate::cuda_prelude::f16_tall_tile_enabled()
+}
+
+/// The explicit mma.sync tile (opt-in `KSEARCH_MM_MMA=1`) applies to plain
+/// F16 shapes only; split-K and tall keep their own paths so the A/B has
+/// exactly one variable. Takes priority over the P3 pipeline if both opt-ins
+/// are set.
+fn f16_stmt_uses_mma(rows: u32, split: u32) -> bool {
+    split <= 1 && !f16_stmt_is_tall(rows, split) && crate::cuda_prelude::f16_mma_tile_enabled()
+}
+
+/// `true` when the body needs the mma.sync helper included.
+fn body_has_mul_mm_f16_mma(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::MulMmF16 { rows, split, .. } => {
+                    if f16_stmt_uses_mma(*rows, *split) {
+                        return true;
+                    }
+                }
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+/// The three-stage BK=16 pipeline (opt-in `KSEARCH_MM_PIPE=3`) applies to
+/// the plain 64x128 F16 tile only — split-K and the tall tile keep their
+/// own path so the A/B has exactly one variable.
+fn f16_stmt_uses_p3(rows: u32, split: u32) -> bool {
+    split <= 1
+        && !f16_stmt_is_tall(rows, split)
+        && !crate::cuda_prelude::f16_mma_tile_enabled()
+        && crate::cuda_prelude::f16_p3_pipeline_enabled()
+}
+
+/// `true` when the body needs the three-stage helper included.
+fn body_has_mul_mm_f16_p3(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::MulMmF16 { rows, split, .. } => {
+                    if f16_stmt_uses_p3(*rows, *split) {
+                        return true;
+                    }
+                }
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
 }
 
 /// `true` when the body's F16 GEMM renders the 128-row tile.
@@ -3371,6 +3449,16 @@ fn emit_stmts(
                     // re-reads.
                     s.push_str(&format!(
                         "{pad}ksearch_f16_mul_mm_tall({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
+                    ));
+                } else if f16_stmt_uses_mma(*rows, *split) {
+                    // KSEARCH_MM_MMA=1: explicit mma.sync/ldmatrix path.
+                    s.push_str(&format!(
+                        "{pad}ksearch_f16_mul_mm_mma({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
+                    ));
+                } else if f16_stmt_uses_p3(*rows, *split) {
+                    // KSEARCH_MM_PIPE=3: deeper pipeline A/B.
+                    s.push_str(&format!(
+                        "{pad}ksearch_f16_mul_mm_p3({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
                     ));
                 } else {
                     s.push_str(&format!(

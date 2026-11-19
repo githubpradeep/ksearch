@@ -20,6 +20,10 @@ use ksearch_codegen::{render_cuda, render_for, render_msl, Target};
 use ksearch_ir::{KernelIr, KirStmt, OptSchedule};
 use std::io::Write;
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Serializes the two tests that toggle a render-time env knob.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Every kernel family that reaches the CUDA backend.
 fn cases() -> Vec<KernelIr> {
@@ -346,6 +350,7 @@ fn cuda_f16_mul_mm_split_launch_is_rederived() {
 
 #[test]
 fn cuda_f16_mul_mm_tall_launch_is_rederived() {
+    let _env = ENV_LOCK.lock().unwrap();
     // The 128-row tall tile is OPT-IN (`KSEARCH_MM_TALL=1`): it measured
     // 12% slower end-to-end on the A10 (one block per SM at 41 KB smem
     // exposes fill latency). Default must render the standard 64x128 tile.
@@ -397,6 +402,46 @@ fn cuda_f16_mul_mm_tall_launch_is_rederived() {
 }
 
 #[test]
+fn cuda_f16_mul_mm_p3_pipeline_is_opt_in() {
+    let _env = ENV_LOCK.lock().unwrap();
+    // KSEARCH_MM_PIPE=3 swaps the plain F16 tile for a three-stage BK=16
+    // pipeline at the same grid/occupancy (27.6 KB smem, still 2 blocks/SM).
+    let k = ksearch_codegen::smoke::smoke_kernel("k_f16_mul_mm").expect("smoke case");
+
+    let standard = render_cuda(&k, OptSchedule::default()).expect("render standard");
+    assert!(
+        standard.source.contains("ksearch_f16_mul_mm("),
+        "default must be the two-stage tile"
+    );
+
+    std::env::set_var("KSEARCH_MM_PIPE", "3");
+    let p3 = render_cuda(&k, OptSchedule::default()).expect("render p3");
+    std::env::remove_var("KSEARCH_MM_PIPE");
+    assert!(
+        p3.source.contains("ksearch_f16_mul_mm_p3"),
+        "KSEARCH_MM_PIPE=3 must call the three-stage tile"
+    );
+    assert!(
+        p3.source.contains("cp.async.wait_group 1"),
+        "three-stage wait discipline missing"
+    );
+    match p3.launch {
+        ksearch_codegen::LaunchHint::MulMm {
+            tg_x,
+            tg_y,
+            tg_z,
+            smem,
+            ..
+        } => {
+            // Same 64x128 grid as the default; only smem changes.
+            assert_eq!((tg_x, tg_y, tg_z), (1, 2, 1));
+            assert_eq!(smem, 27_648);
+        }
+        other => panic!("unexpected launch {other:?}"),
+    }
+}
+
+#[test]
 fn dump_sources_when_requested() {
     let Some(dir) = std::env::var_os("KSEARCH_DUMP_DIR") else {
         return;
@@ -423,6 +468,76 @@ fn dump_sources_when_requested() {
             eprintln!("wrote {}", path.display());
         }
     }
+}
+
+#[test]
+fn cuda_mma_helper_parses_as_cxx() {
+    let _env = ENV_LOCK.lock().unwrap();
+    if std::env::var("KSEARCH_SKIP_CUDA_SYNTAX").is_ok() {
+        return;
+    }
+    let clang = ["clang++", "c++"].into_iter().find(|c| {
+        Command::new(c)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    let Some(clang) = clang else { return };
+
+    std::env::set_var("KSEARCH_MM_MMA", "1");
+    let src = render_cuda(
+        &ksearch_codegen::smoke::smoke_kernel("k_f16_mul_mm").expect("smoke case"),
+        OptSchedule::default(),
+    )
+    .expect("render mma")
+    .source;
+    std::env::remove_var("KSEARCH_MM_MMA");
+    assert!(src.contains("ksearch_f16_mul_mm_mma"), "MMA call missing");
+    assert!(
+        src.contains("ldmatrix.sync.aligned.m8n8.x4.shared.b16"),
+        "A ldmatrix missing"
+    );
+    assert!(
+        src.contains("ldmatrix.sync.aligned.m8n8.x2.shared.b16"),
+        "B ldmatrix (non-trans) missing"
+    );
+    assert!(
+        !src.contains("x2.trans"),
+        "B must use non-trans ldmatrix: the n-major stage is already mma's .col layout"
+    );
+    assert!(
+        src.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+        "mma.sync missing"
+    );
+
+    let dir = std::env::temp_dir().join(format!("ksearch_mma_check_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk temp dir");
+    let path = dir.join("k_f16_mul_mm_mma.cu.cpp");
+    std::fs::write(&path, &src).expect("write source");
+    let out = Command::new(clang)
+        .args([
+            "-std=c++17",
+            "-x",
+            "c++",
+            "-fsyntax-only",
+            "-Wno-unused-variable",
+            "-Wno-unused-parameter",
+            "-Wno-unused-but-set-variable",
+            "-Wno-unknown-pragmas",
+        ])
+        .arg(&path)
+        .output()
+        .expect("run compiler");
+    assert!(
+        out.status.success(),
+        "mma helper failed host syntax check:\n{}\n--- source ---\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        src
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

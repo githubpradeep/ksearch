@@ -320,6 +320,55 @@ Honest limits:
   the same rule — it is verified by the clang++ type-check of the rendered
   translation unit here, and by the A10 run where the numbers live.
 
+## Next experiment: `KSEARCH_MM_PIPE=3`
+
+The remaining GEMM gap is ~6 ms (17 ms at ~30 TFLOPS vs ~11 ms at ~45).
+Before committing to a 300-line `mma.sync`/`ldmatrix` rewrite, test whether
+part of that gap is the two-stage `cp.async.wait_group 0` serialization:
+`KSEARCH_MM_PIPE=3` swaps the plain 64x128 tile for a three-stage BK=16
+pipeline with continuous fills (`wait_group 1`, 3 buffers, 27.6 KB smem —
+still two blocks per SM, so occupancy is unchanged). It applies only to
+plain F16 shapes, leaving split-K and tall on their known paths, so an A/B
+has exactly one variable. Measured on the A10: **PIPE=3 regressed 18%**
+(`6144x1536` 0.072 -> 0.100 ms/call, small shapes 0.040 -> 0.051), so it
+stays opt-in as a negative result — the two-stage `wait_group 0` pipeline is
+part of what makes two resident blocks work, and BK=16 pays twice the steps
+and barriers for no recovered overlap. That closes the low-risk pipeline
+question: the WMMA path is at its ceiling, and the only remaining route to
+~45 TFLOPS is an `mma.sync`/`ldmatrix` kernel (`KSEARCH_MM_MMA=1`), which
+must keep the 64x128 / 30.7 KB / two-stage / two-blocks-per-SM envelope that
+every experiment has now confirmed.
+
+`KSEARCH_MM_MMA=1` implements exactly that: eight 32x32 warp tiles per block,
+each issuing `mma.sync.aligned.m16n8k16` from `ldmatrix` fragments (x4 for the
+16x16 A tile, x2.trans for the 16x8 B tile). The padded LD=40 half stride
+maps the eight ldmatrix rows to eight distinct banks, so no XOR swizzle is
+needed. Accumulator staging reuses the coalesced [n, M] epilogue. Same grid,
+same smem, same fill pipeline as the default — the A/B changes **only** the
+instruction path, and the helper's full translation unit is type-checked by
+the headless clang parse (which already caught a host-dialect leak in the
+ldmatrix address computation).
+
+Debugging note from the three faulted builds, worth keeping: hand-written
+`ldmatrix` addressing has two independent traps. (1) The fragment load must
+use **stage-local** row/column indices — the global `m0`/`n0` block offsets
+belong only in the epilogue's C index; mixing them into the shared address
+reads `As + m0*LD`, past the allocation, for every block with
+`tgpig.y > 0` (the primary Xid 13, present from the first build). (2)
+`ldmatrix` "ignores" the addresses of non-participating lanes, but the
+hardware still faults if they leave the allocation — the x2 B load's lanes
+16-31 pointed at `k0+24`, off the end at the last row of the second buffer.
+Also: `k0` must select the mma's 16-wide K slice in the A load, or both
+K-steps read the k 0-15 tiles. WMMA hides all of this — which is why the
+default tile survived five experiments with zero faults. Verify any future
+hand-written-address kernel with `compute-sanitizer --tool memcheck` before
+benchmarks: it names the faulting instruction and address, which three
+rounds of inspection did not.
+
+Either way, closing the full 7.7 ms also needs attention (4.3 -> ~1.8 ms)
+and q/k/v fusion (~1 ms) — the GEMM rewrite alone gets to ~6,800 tok/s,
+not 8,668.
+
 ## Checkpoint
 
 1. Which env var forces CUDA for `serve`? Which two CLI spellings set it?

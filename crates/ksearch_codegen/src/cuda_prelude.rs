@@ -643,8 +643,9 @@ KS_DEVICE inline void ks_f16_mm_fill(
     uint M, uint K, uint N, uint m0, uint n0, uint k0,
     half* As, half* Bs, uint tid) {
   const uint ncp = KS_F16_MM_BK / 8u;
-  const uint rows = KS_F16_MM_BM * ncp;
-  for (uint c = tid; c < 2u * rows; c += blockDim.x) {
+  const uint rows = KS_F16_MM_BM * ncp;                 // A chunks (64 rows x 4)
+  const uint total = (KS_F16_MM_BM + KS_F16_MM_BN) * ncp;  // + B chunks (128 x 4)
+  for (uint c = tid; c < total; c += blockDim.x) {
     if (c < rows) {
       const uint row = c / ncp;
       const uint part = c - row * ncp;
@@ -956,7 +957,8 @@ KS_DEVICE inline void ks_f16t_mm_fill(
     half* As, half* Bs, uint tid) {
   const uint ncp = KS_F16T_MM_BK / 8u;
   const uint rows = KS_F16T_MM_BM * ncp;
-  for (uint c = tid; c < 2u * rows; c += blockDim.x) {
+  const uint total = (KS_F16T_MM_BM + KS_F16T_MM_BN) * ncp;
+  for (uint c = tid; c < total; c += blockDim.x) {
     if (c < rows) {
       const uint row = c / ncp;
       const uint part = c - row * ncp;
@@ -1127,6 +1129,486 @@ pub fn f16_tall_tile_enabled() -> bool {
 }
 /// Rows per F16 `mul_mm` output tile (one 64-row weight strip per block;
 /// tall shapes use [`CUDA_F16_MUL_MM_TALL_BM`] instead).
+/// Three-stage, BK=16 variant of the F16 prefill tile (CUDA) — opt-in via
+/// `KSEARCH_MM_PIPE=3`, for an A/B against the two-stage BK=32 default.
+///
+/// Same 64x128 block tile, 32x32 register-blocked warp tiles, and coalesced
+/// epilogue as the default; only the K-loop pipelining changes. Shared
+/// memory per stage is `(64+128)*(16+8)*2 = 9216` B, so three stages cost
+/// **27.6 KB** — still two blocks per SM in the default carveout, avoiding
+/// the occupancy regression that sank every >30 KB variant. The questions
+/// this answers on the A10: was part of the ~30 TFLOPS ceiling the
+/// two-stage `cp.async.wait_group 0` serialization (step time = fill latency
+/// + MMA), and does a continuously-filled three-stage pipeline recover it?
+///
+/// All symbols carry a `p3` prefix so it can share a translation unit with
+/// the default helper without redefinitions.
+pub const F16_MUL_MM_P3_CUDA_HELPER: &str = r#"
+#define KS_F16P3_MM_BM 64u
+#define KS_F16P3_MM_BN 128u
+#define KS_F16P3_MM_BK 16u
+#define KS_F16P3_MM_STAGES 3u
+#define KS_F16P3_MM_LD (KS_F16P3_MM_BK + 8u)
+
+#ifndef KS_F16P3_MM_DEFINED
+#define KS_F16P3_MM_DEFINED
+KS_DEVICE inline void ks_f16p3_cp_async16(half* dst, device const half* src) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned smem = __cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(src));
+#else
+  for (int i = 0; i < 8; ++i) dst[i] = src[i];
+#endif
+}
+KS_DEVICE inline void ks_f16p3_cp_commit() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_f16p3_cp_wait(unsigned groups) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  if (groups == 0u) {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+  } else {
+    asm volatile("cp.async.wait_group 1;\n" ::);
+  }
+#else
+  (void)groups;
+#endif
+}
+
+/* Fill one stage: 64x2 A chunks + 128x2 B chunks = 384 chunks, two per
+   thread. Bounds fall back to scalar zero-padding. */
+KS_DEVICE inline void ks_f16p3_mm_fill(
+    device const half* W, device const half* X,
+    uint M, uint K, uint N, uint m0, uint n0, uint k0,
+    half* As, half* Bs, uint tid) {
+  const uint ncp = KS_F16P3_MM_BK / 8u;
+  const uint rows = KS_F16P3_MM_BM * ncp;
+  const uint total = (KS_F16P3_MM_BM + KS_F16P3_MM_BN) * ncp;
+  for (uint c = tid; c < total; c += blockDim.x) {
+    if (c < rows) {
+      const uint row = c / ncp;
+      const uint part = c - row * ncp;
+      const uint m = m0 + row;
+      half* dst = As + row * KS_F16P3_MM_LD + part * 8u;
+      if (m < M && k0 + KS_F16P3_MM_BK <= K) {
+        ks_f16p3_cp_async16(dst, W + m * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (m < M && k < K) ? W[m * K + k] : half(0.0f);
+        }
+      }
+    } else {
+      const uint c2 = c - rows;
+      const uint ni = c2 / ncp;
+      const uint part = c2 - ni * ncp;
+      const uint n = n0 + ni;
+      half* dst = Bs + ni * KS_F16P3_MM_LD + part * 8u;
+      if (n < N && k0 + KS_F16P3_MM_BK <= K) {
+        ks_f16p3_cp_async16(dst, X + n * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (n < N && k < K) ? X[n * K + k] : half(0.0f);
+        }
+      }
+    }
+  }
+  ks_f16p3_cp_commit();
+}
+
+KS_DEVICE inline void ks_f16p3_mm_gemm(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  // 2x4 warp grid over the 64x128 block: 32x32 register tiles.
+  static_assert(2u * 32u == KS_F16P3_MM_BM, "warp row strips must tile BM");
+  static_assert(4u * 32u == KS_F16P3_MM_BN, "warp column strips must tile BN");
+  (void)sgitg;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_F16P3_MM_BM;
+  const uint n0 = tgpig.x * KS_F16P3_MM_BN;
+  const uint stage_h = (KS_F16P3_MM_BM + KS_F16P3_MM_BN) * KS_F16P3_MM_LD;
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + stage_h;
+  half* buf2 = buf1 + stage_h;
+#define KS_F16P3_STAGE(s) ((s) == 0u ? buf0 : ((s) == 1u ? buf1 : buf2))
+#define KS_F16P3_STAGE_B(s) \
+  ((s) == 0u ? buf0 + KS_F16P3_MM_BM * KS_F16P3_MM_LD \
+             : ((s) == 1u ? buf1 + KS_F16P3_MM_BM * KS_F16P3_MM_LD \
+                          : buf2 + KS_F16P3_MM_BM * KS_F16P3_MM_LD))
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  const uint warp_m = warp & 1u;
+  const uint warp_n = warp >> 1;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag[2][2];
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 2; ++j) nvcuda::wmma::fill_fragment(cfrag[a][j], 0.0f);
+  }
+#endif
+  const uint nsteps = (K + KS_F16P3_MM_BK - 1u) / KS_F16P3_MM_BK;
+  if (nsteps > 0u) {
+    ks_f16p3_mm_fill(W, X, M, K, N, m0, n0, 0u, buf0,
+                     buf0 + KS_F16P3_MM_BM * KS_F16P3_MM_LD, tid);
+    if (nsteps > 1u) {
+      ks_f16p3_mm_fill(W, X, M, K, N, m0, n0, KS_F16P3_MM_BK, buf1,
+                       buf1 + KS_F16P3_MM_BM * KS_F16P3_MM_LD, tid);
+      ks_f16p3_cp_wait(1u);
+    } else {
+      ks_f16p3_cp_wait(0u);
+    }
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = KS_F16P3_STAGE(step % KS_F16P3_MM_STAGES);
+    const uint next2 = step + 2u;
+    if (next2 < nsteps) {
+      // Issue the third-stage fill before the MMA so it overlaps.
+      ks_f16p3_mm_fill(W, X, M, K, N, m0, n0, next2 * KS_F16P3_MM_BK,
+                       KS_F16P3_STAGE(next2 % KS_F16P3_MM_STAGES),
+                       KS_F16P3_STAGE_B(next2 % KS_F16P3_MM_STAGES), tid);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = As + KS_F16P3_MM_BM * KS_F16P3_MM_LD;
+    // BK=16 -> one m16n16k16 MMA per k-step.
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b_frag[2];
+#  pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const uint col = warp_n * 32u + (uint)j * 16u;
+      nvcuda::wmma::load_matrix_sync(b_frag[j], Bs + col * KS_F16P3_MM_LD, KS_F16P3_MM_LD);
+    }
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a_frag;
+    nvcuda::wmma::load_matrix_sync(a_frag, As + (warp_m * 32u) * KS_F16P3_MM_LD, KS_F16P3_MM_LD);
+#  pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      nvcuda::wmma::mma_sync(cfrag[0][j], a_frag, b_frag[j], cfrag[0][j]);
+    }
+    nvcuda::wmma::load_matrix_sync(a_frag, As + (warp_m * 32u + 16u) * KS_F16P3_MM_LD, KS_F16P3_MM_LD);
+#  pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      nvcuda::wmma::mma_sync(cfrag[1][j], a_frag, b_frag[j], cfrag[1][j]);
+    }
+#endif
+    if (next2 < nsteps) {
+      // Leave the newest group in flight; the next step's buffer is ready.
+      ks_f16p3_cp_wait(1u);
+    } else if (step + 1u < nsteps) {
+      ks_f16p3_cp_wait(0u);
+    }
+    ks_block_barrier();
+  }
+#undef KS_F16P3_STAGE
+#undef KS_F16P3_STAGE_B
+#if defined(__CUDACC__)
+  float* mine = (float*)shmem + warp * 256u;
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
+      for (uint e = lane; e < 256u; e += 32u) {
+        // C is [n, M]: consecutive lanes must vary m (the contiguous axis).
+        const uint i = e & 15u;
+        const uint col = e >> 4;
+        const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
+        const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
+        if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
+      }
+    }
+  }
+#else
+  (void)C;
+  (void)tid;
+#endif
+}
+#endif
+
+KS_DEVICE inline void ksearch_f16_mul_mm_p3(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  ks_f16p3_mm_gemm(W, X, C, M, K, N, tgpig, tiitg, sgitg, shmem);
+}
+"#;
+
+/// Shared memory for one three-stage BK=16 F16 GEMM block.
+pub const CUDA_F16_MUL_MM_P3_SMEM_BYTES: u64 = 27_648;
+/// `KSEARCH_MM_PIPE=3` opts in to the three-stage BK=16 pipeline (A/B only).
+pub fn f16_p3_pipeline_enabled() -> bool {
+    std::env::var("KSEARCH_MM_PIPE")
+        .map(|v| v == "3")
+        .unwrap_or(false)
+}
+
+/// Explicit `mma.sync`/`ldmatrix` variant of the F16 prefill tile (CUDA) —
+/// opt-in via `KSEARCH_MM_MMA=1` for an A/B against the WMMA default.
+///
+/// This is the same block/grid/smem/pipeline envelope that five tile
+/// experiments confirmed (64x128, BK=32, two stages, 30.7 KB, two blocks per
+/// SM, coalesced epilogue). Only the instruction path changes: 8 warp tiles
+/// of 32x32, each issuing eight `mma.sync.aligned.m16n8k16` per K-step from
+/// `ldmatrix` fragments, instead of WMMA's `m16n16k16` hidden loads. No smem
+/// swizzle is needed: the BK+8 padded stride (40 halfs = 80 B) maps the 8
+/// rows of an ldmatrix tile to 8 distinct banks.
+pub const F16_MMA_CUDA_HELPER: &str = r#"
+#define KS_F16MMA_BM 64u
+#define KS_F16MMA_BN 128u
+#define KS_F16MMA_BK 32u
+#define KS_F16MMA_LD (KS_F16MMA_BK + 8u)
+
+#ifndef KS_F16MMA_DEFINED
+#define KS_F16MMA_DEFINED
+KS_DEVICE inline void ks_f16mma_cp_async16(half* dst, device const half* src) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned smem = __cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(src));
+#else
+  for (int i = 0; i < 8; ++i) dst[i] = src[i];
+#endif
+}
+KS_DEVICE inline void ks_f16mma_cp_commit() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_f16mma_cp_wait() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+KS_DEVICE inline void ks_f16mma_mm_fill(
+    device const half* W, device const half* X,
+    uint M, uint K, uint N, uint m0, uint n0, uint k0,
+    half* As, half* Bs, uint tid) {
+  const uint ncp = KS_F16MMA_BK / 8u;
+  const uint rows = KS_F16MMA_BM * ncp;                 // A chunks (64 rows x 4)
+  const uint total = (KS_F16MMA_BM + KS_F16MMA_BN) * ncp;  // + B chunks (128 x 4)
+  for (uint c = tid; c < total; c += blockDim.x) {
+    if (c < rows) {
+      const uint row = c / ncp;
+      const uint part = c - row * ncp;
+      const uint m = m0 + row;
+      half* dst = As + row * KS_F16MMA_LD + part * 8u;
+      if (m < M && k0 + KS_F16MMA_BK <= K) {
+        ks_f16mma_cp_async16(dst, W + m * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (m < M && k < K) ? W[m * K + k] : half(0.0f);
+        }
+      }
+    } else {
+      const uint c2 = c - rows;
+      const uint ni = c2 / ncp;
+      const uint part = c2 - ni * ncp;
+      const uint n = n0 + ni;
+      half* dst = Bs + ni * KS_F16MMA_LD + part * 8u;
+      if (n < N && k0 + KS_F16MMA_BK <= K) {
+        ks_f16mma_cp_async16(dst, X + n * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (n < N && k < K) ? X[n * K + k] : half(0.0f);
+        }
+      }
+    }
+  }
+  ks_f16mma_cp_commit();
+}
+
+/* Load an m16xk16 A fragment with ldmatrix.x4. Lane groups of 8 supply the
+   rows of four 8x8 tiles. mma.sync expects the tiles in register order
+   (row0,k0), (row1,k0), (row0,k1), (row1,k1) — so the group's low bit picks
+   the row half and its high bit the k half.
+
+   `row0` is STAGE-LOCAL (0..48): `As` is the stage base that already holds
+   rows m0..m0+63, so the global m0 must appear only in the epilogue's C
+   index. Mixing it in here reads As + m0*LD — past the allocation for every
+   block with tgpig.y > 0 (Xid 13). `k0` selects this mma's 16-wide K slice;
+   omitting it reads the k 0-15 tiles twice. */
+KS_DEVICE inline void ks_f16mma_load_a(half* As, uint row0, uint k0, uint lane,
+                                       unsigned& a0, unsigned& a1,
+                                       unsigned& a2, unsigned& a3) {
+  const uint g = lane >> 3;
+  const uint row = row0 + (g & 1u) * 8u + (lane & 7u);
+  const uint col = k0 + (g >> 1) * 8u;
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned addr = __cvta_generic_to_shared(As + row * KS_F16MMA_LD + col);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+#else
+  (void)row; (void)col;
+  a0 = a1 = a2 = a3 = 0u;
+#endif
+}
+
+/* Load a k16xn8 B fragment with ldmatrix.x2 (NON-trans) from the n-major B
+   stage. The stage stores B as [n][k] (k-contiguous per token) — exactly the
+   .col layout mma.m16n8k16 wants — so plain ldmatrix of the n-rows yields the
+   k x n fragment directly: lane L gets B[k=(L%4)*2+{0,1}][n=L/4]. (.trans
+   would swap k and n; the host simulator proved it wrong.) x2 consumes lanes
+   0-15 in groups of 8: lanes 0-7 the n rows at k+0, lanes 8-15 at k+8. Lanes
+   16-31 are ignored but their addresses must stay in-bounds (the A10 faults
+   otherwise), so they mirror the participating groups via (group & 1). */
+KS_DEVICE inline void ks_f16mma_load_b(half* Bs, uint col0, uint k0, uint lane,
+                                       unsigned& b0, unsigned& b1) {
+  const uint khalf = ((lane >> 3) & 1u) * 8u;
+  const uint row = col0 + (lane & 7u);
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned addr = __cvta_generic_to_shared(Bs + row * KS_F16MMA_LD + k0 + khalf);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+      : "=r"(b0), "=r"(b1) : "r"(addr));
+#else
+  (void)row; (void)khalf;
+  b0 = b1 = 0u;
+#endif
+}
+
+KS_DEVICE inline void ks_f16mma_mm_gemm(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  static_assert(2u * 32u == KS_F16MMA_BM, "warp row strips must tile BM");
+  static_assert(4u * 32u == KS_F16MMA_BN, "warp column strips must tile BN");
+  (void)sgitg;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_F16MMA_BM;
+  const uint n0 = tgpig.x * KS_F16MMA_BN;
+  const uint stage_h = (KS_F16MMA_BM + KS_F16MMA_BN) * KS_F16MMA_LD;
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + stage_h;
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  const uint warp_m = warp & 1u;   // 32-row strip
+  const uint warp_n = warp >> 1;   // 64-column strip
+  // 8 accumulator fragments (m16n8 f32 = 4 regs each) per warp.
+  union Acc { float f; unsigned u; };
+  Acc c[2][4][4];
+#pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+#pragma unroll
+      for (int r = 0; r < 4; ++r) c[a][j][r].f = 0.0f;
+    }
+  }
+#endif
+  const uint nsteps = (K + KS_F16MMA_BK - 1u) / KS_F16MMA_BK;
+  if (nsteps > 0u) {
+    ks_f16mma_mm_fill(W, X, M, K, N, m0, n0, 0u, buf0,
+                      buf0 + KS_F16MMA_BM * KS_F16MMA_LD, tid);
+    ks_f16mma_cp_wait();
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = (step & 1u) == 0u ? buf0 : buf1;
+    half* nxt = (step & 1u) == 0u ? buf1 : buf0;
+    const uint next = step + 1u;
+    if (next < nsteps) {
+      ks_f16mma_mm_fill(W, X, M, K, N, m0, n0, next * KS_F16MMA_BK, nxt,
+                        nxt + KS_F16MMA_BM * KS_F16MMA_LD, tid);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = cur + KS_F16MMA_BM * KS_F16MMA_LD;
+#pragma unroll
+    for (int ks = 0; ks < 2; ++ks) {   // BK=32 -> two m16n8k16 steps
+      const uint k0 = (uint)ks * 16u;
+      unsigned b[4][2];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        // The warp's column strip is 4 fragments x 8 = 32 columns wide;
+        // 4 column warps tile BN=128. `col0` is STAGE-LOCAL: the global n0
+        // belongs only in the epilogue (n0 is 0 while N <= 128, so mixing it
+        // in was latent, but it is the same bug class as the m0 one).
+        ks_f16mma_load_b(Bs, warp_n * 32u + (uint)j * 8u, k0, lane,
+                         b[j][0], b[j][1]);
+      }
+#pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        unsigned a0, a1, a2, a3;
+        // Stage-local row (warp's 32-row strip), k0 = this mma's K slice.
+        ks_f16mma_load_a(As, warp_m * 32u + (uint)a * 16u, k0, lane,
+                         a0, a1, a2, a3);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          Acc d0, d1, d2, d3;
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+              : "=f"(d0.f), "=f"(d1.f), "=f"(d2.f), "=f"(d3.f)
+              : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                "r"(b[j][0]), "r"(b[j][1]),
+                "r"(c[a][j][0].u), "r"(c[a][j][1].u),
+                "r"(c[a][j][2].u), "r"(c[a][j][3].u));
+          c[a][j][0] = d0; c[a][j][1] = d1;
+          c[a][j][2] = d2; c[a][j][3] = d3;
+        }
+      }
+    }
+#endif
+    if (next < nsteps) ks_f16mma_cp_wait();
+    ks_block_barrier();
+  }
+#if defined(__CUDACC__)
+  // Accumulator lane layout: row = lane/4 + 8*(r/2), col = (lane%4)*2 + r%2.
+  // Stage one m16n8 fragment at a time, then write C coalesced along rows.
+  float* mine = (float*)shmem + warp * 128u;
+#pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      mine[((lane >> 2) + 8u * 0u) * 8u + (lane & 3u) * 2u + 0u] = c[a][j][0].f;
+      mine[((lane >> 2) + 8u * 0u) * 8u + (lane & 3u) * 2u + 1u] = c[a][j][1].f;
+      mine[((lane >> 2) + 8u * 1u) * 8u + (lane & 3u) * 2u + 0u] = c[a][j][2].f;
+      mine[((lane >> 2) + 8u * 1u) * 8u + (lane & 3u) * 2u + 1u] = c[a][j][3].f;
+      // Lanes read slots staged by other lanes of the same warp: unlike
+      // wmma::store_matrix_sync there is no implicit warp sync here.
+      __syncwarp();
+      // Each warp stages into its own 512 B slot — no cross-warp dependency.
+      for (uint e = lane; e < 128u; e += 32u) {
+        // C is [n, M]: consecutive lanes vary m (the contiguous axis).
+        const uint i = e & 15u;
+        const uint col = e >> 4;
+        const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
+        const uint n = n0 + warp_n * 32u + (uint)j * 8u + col;
+        if (m < M && n < N) C[n * M + m] = half(mine[i * 8u + col]);
+      }
+      // Reads of this fragment's slots must finish before the next fragment
+      // overwrites them.
+      __syncwarp();
+    }
+  }
+#else
+  (void)C;
+  (void)tid;
+#endif
+}
+#endif
+
+KS_DEVICE inline void ksearch_f16_mul_mm_mma(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  ks_f16mma_mm_gemm(W, X, C, M, K, N, tgpig, tiitg, sgitg, shmem);
+}
+"#;
+
+/// `KSEARCH_MM_MMA=1` opts in to the explicit mma.sync/ldmatrix tile.
+pub fn f16_mma_tile_enabled() -> bool {
+    std::env::var("KSEARCH_MM_MMA")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 pub const CUDA_F16_MUL_MM_BM: u64 = 64;
 /// Columns (tokens) per F16 `mul_mm` output tile. At `N <= 128` the whole
 /// pass reads each cached weight byte exactly once.
