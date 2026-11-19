@@ -523,8 +523,11 @@ KS_DEVICE inline void ks_mm_gemm(
   for (int j = 0; j < 2; ++j) {
     nvcuda::wmma::store_matrix_sync(mine, cfrag[j], 16, nvcuda::wmma::mem_row_major);
     for (uint e = lane; e < 256u; e += 32u) {
-      const uint i = e >> 4;
-      const uint col = e & 15u;
+      // C is [n, M]: consecutive lanes must vary m (the contiguous axis).
+      // Varying n instead scatters every 2-byte store into its own 32-byte
+      // sector — 16x the write traffic, ~40% of big-GEMM time on the A10.
+      const uint i = e & 15u;
+      const uint col = e >> 4;
       const uint m = m0 + warp_m * 16u + i;
       const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
       if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
@@ -764,8 +767,11 @@ KS_DEVICE inline void ks_f16_mm_gemm(
     for (int j = 0; j < 2; ++j) {
       nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
       for (uint e = lane; e < 256u; e += 32u) {
-        const uint i = e >> 4;
-        const uint col = e & 15u;
+        // C/partials are [n, M]: consecutive lanes must vary m (contiguous).
+        // Varying n scatters each store into its own 32-byte sector — 16x
+        // the write traffic, ~40% of big-GEMM time on the A10.
+        const uint i = e & 15u;
+        const uint col = e >> 4;
         const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
         const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
         if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
@@ -873,8 +879,11 @@ KS_DEVICE inline void ks_f16_mm_gemm_split(
     for (int j = 0; j < 2; ++j) {
       nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
       for (uint e = lane; e < 256u; e += 32u) {
-        const uint i = e >> 4;
-        const uint col = e & 15u;
+        // C/partials are [n, M]: consecutive lanes must vary m (contiguous).
+        // Varying n scatters each store into its own 32-byte sector — 16x
+        // the write traffic, ~40% of big-GEMM time on the A10.
+        const uint i = e & 15u;
+        const uint col = e >> 4;
         const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
         const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
         if (m < M && n < N) {
@@ -1061,8 +1070,11 @@ KS_DEVICE inline void ks_f16t_mm_gemm(
     for (int j = 0; j < 4; ++j) {
       nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
       for (uint e = lane; e < 256u; e += 32u) {
-        const uint i = e >> 4;
-        const uint col = e & 15u;
+        // C/partials are [n, M]: consecutive lanes must vary m (contiguous).
+        // Varying n scatters each store into its own 32-byte sector — 16x
+        // the write traffic, ~40% of big-GEMM time on the A10.
+        const uint i = e & 15u;
+        const uint col = e >> 4;
         const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
         const uint n = n0 + warp_n * 64u + (uint)j * 16u + col;
         if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
@@ -1268,8 +1280,11 @@ KS_DEVICE inline void ks_mm_gemm(
   for (int j = 0; j < 2; ++j) {
     nvcuda::wmma::store_matrix_sync(mine, cfrag[j], 16, nvcuda::wmma::mem_row_major);
     for (uint e = lane; e < 256u; e += 32u) {
-      const uint i = e >> 4;
-      const uint col = e & 15u;
+      // C is [n, M]: consecutive lanes must vary m (the contiguous axis).
+      // Varying n instead scatters every 2-byte store into its own 32-byte
+      // sector — 16x the write traffic, ~40% of big-GEMM time on the A10.
+      const uint i = e & 15u;
+      const uint col = e >> 4;
       const uint m = m0 + warp_m * 16u + i;
       const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
       if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);

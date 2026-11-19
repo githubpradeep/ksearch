@@ -207,6 +207,17 @@ family as an occupancy regression until measured otherwise
 (`KSEARCH_MM_TALL=1` re-enables the tall tile for A/B on other parts).
 Beyond this point the prefill gap lives in attention (4.3 ms by phase
 split, untouched) and small-GEMM latency floors — not the tile.
+
+**The epilogue was the hidden 2×.** The C store is `C[n * M + m]`
+(token-major), and the original lane mapping varied `n` across consecutive
+lanes — so every 2-byte store landed in its own 32-byte sector: a 64×128
+tile (16 KB useful) emitted 256 KB of write traffic per block. The A10
+per-shape times fit `compute floor + epilogue sectors` almost exactly
+(`6144×1536`: 38 + 41 ≈ 85 µs; lm_head: 56 + 60 ≈ 118 µs). Swapping the
+mapping so consecutive lanes vary `m` (the contiguous axis) coalesces the
+writes — a two-line change per epilogue, applied to all five tile helpers.
+This is the largest remaining GEMM lever and it is orthogonal to the tile
+shape.
 - Kernels with ≥ 24 KB dynamic smem request a max carveout hint
   (`CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT`).
 - **Split-K for wide-K / short-M shapes** (`rows <= 2048 && cols >= 2048`,
