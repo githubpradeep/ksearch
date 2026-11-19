@@ -239,6 +239,16 @@ fn cases() -> Vec<Case> {
             },
         },
         Case {
+            // Dequant-once F16 prefill cache: batch > 8 lowers to the F16
+            // tensor-core tile instead of the AST matvec.
+            name: "matvec_batch_f16",
+            build: |g| {
+                let ww = w(g, INTER, HID, F16);
+                let x = f16(g, 128 * HID);
+                g.matvec_batch(ww, x, 128)
+            },
+        },
+        Case {
             name: "matvec_gate_up_gelu_q4k",
             build: |g| {
                 let gate = w(g, INTER, HID, Q4K);

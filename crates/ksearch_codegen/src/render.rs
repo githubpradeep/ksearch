@@ -1539,6 +1539,109 @@ KS_DEVICE inline void ksearch_q6k_mul_mm(
 }
 "#;
 
+/// Prefill F16 GEMM, MSL flavour: the dequant-once weight cache on Metal.
+///
+/// Same 64x32x32 `simdgroup_matrix` tile as the Q6_K helper; the only
+/// difference is that `W` is already `[M, K]` half, so the A-tile load is a
+/// direct read instead of a quantized-element expander.
+const F16_MUL_MM_HELPER: &str = r#"
+KS_DEVICE inline void ksearch_f16_mul_mm(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  constexpr short NR0 = 64;
+  constexpr short NR1 = 32;
+  constexpr short NK = 32;
+  constexpr short NL0 = 2;
+  constexpr short NL1 = 4;
+  threadgroup half* sa = (threadgroup half*)(shmem);
+  threadgroup half* sb = (threadgroup half*)(shmem + 4096);
+  const uint r0 = tgpig.y * uint(NR0);
+  const uint r1 = tgpig.x * uint(NR1);
+  const short nr0 = (M - r0 < uint(NR0)) ? short(M - r0) : NR0;
+  const short nr1 = (N - r1 < uint(NR1)) ? short(N - r1) : NR1;
+  const short lr0 = ((short)tiitg / NL0) < nr0 ? ((short)tiitg / NL0) : short(nr0 - 1);
+  const short lr1 = ((short)tiitg / NL1) < nr1 ? ((short)tiitg / NL1) : short(nr1 - 1);
+  const short il0 = (short)tiitg % NL0;
+  simdgroup_half8x8 ma[4];
+  simdgroup_half8x8 mb[2];
+  simdgroup_float8x8 mc[8];
+  for (short i = 0; i < 8; i++) {
+    mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+  }
+  for (uint loop_k = 0; loop_k < K; loop_k += uint(NK)) {
+    {
+      half temp_a[16];
+      uint grow = r0 + uint(lr0);
+      uint gk0 = loop_k + uint(il0) * 16u;
+      for (short i = 0; i < 16; i++) {
+        uint kk = gk0 + uint(i);
+        temp_a[i] = (grow < M && kk < K) ? W[grow * K + kk] : half(0);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (short i = 0; i < 16; i++) {
+        const short sx = 2 * il0 + i / 8;
+        const short sy = ((short)tiitg / NL0) / 8;
+        const short lx = ((short)tiitg / NL0) % 8;
+        const short ly = i % 8;
+        const short ib = 8 * sx + sy;
+        *(sa + 64 * ib + 8 * ly + lx) = temp_a[i];
+      }
+    }
+    {
+      const short iy = 8 * ((short)tiitg % NL1);
+      uint gtok = r1 + uint(lr1);
+      uint gk0 = loop_k + uint(iy);
+      const short sx = (short)tiitg % NL1;
+      const short sy = ((short)tiitg / NL1) / 8;
+      const short ly = ((short)tiitg / NL1) % 8;
+      const short ib = 4 * sx + sy;
+      threadgroup half* dst = sb + 64 * ib + 8 * ly;
+      for (short i = 0; i < 8; i++) {
+        uint kk = gk0 + uint(i);
+        dst[i] = (gtok < N && kk < K) ? X[gtok * K + kk] : half(0);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const half* lsma = sa + 4 * 64 * (sgitg % 2);
+    threadgroup const half* lsmb = sb + 2 * 64 * (sgitg / 2);
+    for (short ik = 0; ik < NK / 8; ik++) {
+      simdgroup_barrier(mem_flags::mem_none);
+      for (short i = 0; i < 4; i++) {
+        simdgroup_load(ma[i], lsma + 64 * i, 8, 0, false);
+      }
+      simdgroup_barrier(mem_flags::mem_none);
+      for (short i = 0; i < 2; i++) {
+        simdgroup_load(mb[i], lsmb + 64 * i, 8, 0, false);
+      }
+      simdgroup_barrier(mem_flags::mem_none);
+      for (short i = 0; i < 8; i++) {
+        simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+      }
+      lsma += 8 * 64;
+      lsmb += 4 * 64;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup float* temp_str =
+      ((threadgroup float*)shmem) + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * NR0;
+  for (short i = 0; i < 8; i++) {
+    simdgroup_store(mc[i], temp_str + 8 * (i % 4) + 8 * NR0 * (i / 4), NR0, 0, false);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgitg == 0) {
+    for (int j = int(tiitg); j < int(nr1); j += 32) {
+      device half* D = C + r0 + (r1 + uint(j)) * M;
+      threadgroup float* src = ((threadgroup float*)shmem) + j * NR0;
+      for (int i = 0; i < int(nr0); i++) {
+        D[i] = half(src[i]);
+      }
+    }
+  }
+}
+"#;
+
 /// GPU backend a kernel is lowered for.
 ///
 /// The emitter writes a single MSL-flavoured dialect for both targets.
@@ -1612,6 +1715,25 @@ pub fn render_for(
     target: Target,
 ) -> Result<MetalKernelSource, CodegenError> {
     let cuda = target == Target::Cuda;
+    if !cuda {
+        let mut cuda_only = false;
+        for s in &kir.body {
+            if let KirStmt::MulMmF16 { rows, split, .. } = s {
+                // Split-K emits `blockIdx.z`; the tall tile has no MSL helper.
+                // (The F16 cache is CUDA-only, so Metal never lowers these —
+                // this guard makes that a render error rather than a bad TU.)
+                if *split > 1 || f16_stmt_is_tall(*rows, *split) {
+                    cuda_only = true;
+                    break;
+                }
+            }
+        }
+        if cuda_only {
+            return Err(CodegenError::Msg(
+                "split-K / tall F16 mul_mm is CUDA-only".into(),
+            ));
+        }
+    }
     // Q4_K is a Load dtype like F16: generic expand to float (tinygrad ggml_data_to_tensor ops).
     // No named matvec_q4k kernel template — only dtype expansion on Load / VecMulSum.
     let mut src = String::new();
@@ -1654,6 +1776,18 @@ pub fn render_for(
         }
         if body_has_mul_mv_ext_q6(&kir.body) {
             src.push_str(Q6K_MUL_MV_EXT_HELPER);
+        }
+    }
+    if body_has_mul_mm_f16(&kir.body) {
+        // Dequant-once F16 weight cache: the tile has no Q4/Q6 dependency.
+        src.push_str(if cuda {
+            crate::cuda_prelude::F16_MUL_MM_CUDA_HELPER
+        } else {
+            F16_MUL_MM_HELPER
+        });
+        if cuda && body_has_mul_mm_f16_tall(&kir.body) {
+            // Rows >= 2048: the 128-row tile halves activation re-reads.
+            src.push_str(crate::cuda_prelude::F16_MUL_MM_TALL_CUDA_HELPER);
         }
     }
     if body_needs_q40(&kir.body) {
@@ -1709,6 +1843,7 @@ pub fn render_for(
         KirLaunch::MulMm {
             tg_x,
             tg_y,
+            tg_z,
             tw,
             nsg,
             smem,
@@ -1721,6 +1856,7 @@ pub fn render_for(
                 LaunchHint::MulMm {
                     tg_x: (*tg_x).max(1),
                     tg_y: (*tg_y).max(1),
+                    tg_z: (*tg_z).max(1),
                     tw: (*tw).max(1),
                     nsg: (*nsg).max(1),
                     smem: (*smem).max(1),
@@ -1806,30 +1942,64 @@ fn buffer_params(kir: &KernelIr) -> String {
 fn cuda_launch(hint: LaunchHint, body: &[KirStmt]) -> LaunchHint {
     match hint {
         LaunchHint::MulMm { .. } => match mul_mm_dims(body) {
-            Some((rows, batch)) => LaunchHint::MulMm {
-                tg_x: (batch as u64)
-                    .div_ceil(crate::cuda_prelude::CUDA_MUL_MM_BN as u64)
-                    .max(1),
-                tg_y: (rows as u64)
-                    .div_ceil(crate::cuda_prelude::CUDA_MUL_MM_BM as u64)
-                    .max(1),
-                tw: crate::cuda_prelude::CUDA_MUL_MM_THREADS,
-                nsg: 1,
-                smem: crate::cuda_prelude::CUDA_MUL_MM_SMEM_BYTES.max(1),
-            },
+            Some((rows, batch, dtype, split)) => {
+                // F16 cache tile: 64x128 standard, 128x128 for tall shapes
+                // (halves activation re-reads), split-K rides grid.z;
+                // dequant tiles: 64x64 double-buffered.
+                let (bm, bn, threads, smem) = match dtype {
+                    DType::F16 => {
+                        let tall = f16_stmt_is_tall(rows, split);
+                        (
+                            if tall {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_TALL_BM
+                            } else {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_BM
+                            },
+                            if tall {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_TALL_BN
+                            } else {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_BN
+                            },
+                            crate::cuda_prelude::CUDA_F16_MUL_MM_THREADS,
+                            if tall {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_TALL_SMEM_BYTES
+                            } else {
+                                crate::cuda_prelude::CUDA_F16_MUL_MM_SMEM_BYTES
+                            },
+                        )
+                    }
+                    _ => (
+                        crate::cuda_prelude::CUDA_MUL_MM_BM as u64,
+                        crate::cuda_prelude::CUDA_MUL_MM_BN as u64,
+                        crate::cuda_prelude::CUDA_MUL_MM_THREADS,
+                        crate::cuda_prelude::CUDA_MUL_MM_SMEM_BYTES,
+                    ),
+                };
+                LaunchHint::MulMm {
+                    tg_x: (batch as u64).div_ceil(bn).max(1),
+                    tg_y: (rows as u64).div_ceil(bm).max(1),
+                    tg_z: split.max(1) as u64,
+                    tw: threads,
+                    nsg: 1,
+                    smem: smem.max(1),
+                }
+            }
             None => hint,
         },
         other => other,
     }
 }
 
-/// `(rows, batch)` of the `mul_mm` GEMM in `body`, if there is one.
-fn mul_mm_dims(body: &[KirStmt]) -> Option<(u32, u32)> {
+/// `(rows, batch, weight dtype, split)` of the `mul_mm` GEMM in `body`, if
+/// there is one.
+fn mul_mm_dims(body: &[KirStmt]) -> Option<(u32, u32, DType, u32)> {
     for s in body {
         match s {
-            KirStmt::Q4kMulMm { rows, batch, .. } | KirStmt::Q6kMulMm { rows, batch, .. } => {
-                return Some((*rows, *batch));
-            }
+            KirStmt::Q4kMulMm { rows, batch, .. } => return Some((*rows, *batch, DType::Q4K, 1)),
+            KirStmt::Q6kMulMm { rows, batch, .. } => return Some((*rows, *batch, DType::Q6K, 1)),
+            KirStmt::MulMmF16 {
+                rows, batch, split, ..
+            } => return Some((*rows, *batch, DType::F16, *split)),
             KirStmt::For { body, .. }
             | KirStmt::If { body, .. }
             | KirStmt::ForRange { body, .. } => {
@@ -1929,6 +2099,13 @@ fn infer_out_dtypes(kir: &KernelIr) -> Vec<DType> {
                         }
                     }
                 }
+                // Split-K F16 GEMM: the out buffer holds F32 partials.
+                KirStmt::MulMmF16 { split, out_buf, .. } if *split > 1 && *out_buf >= n_in => {
+                    let o = (*out_buf - n_in) as usize;
+                    if o < out_dt.len() {
+                        out_dt[o] = DType::F32;
+                    }
+                }
                 KirStmt::For { body, .. }
                 | KirStmt::If { body, .. }
                 | KirStmt::ForRange { body, .. } => walk(body, n_in, out_dt),
@@ -2026,6 +2203,14 @@ fn infer_load_dtypes(stmts: &[KirStmt], in_dt: &mut [DType]) {
             KirStmt::Q4kMulMm { w_buf, x_buf, .. } | KirStmt::Q4kMulMvExt { w_buf, x_buf, .. } => {
                 if (*w_buf as usize) < in_dt.len() {
                     in_dt[*w_buf as usize] = DType::Q4K;
+                }
+                if (*x_buf as usize) < in_dt.len() {
+                    in_dt[*x_buf as usize] = DType::F16;
+                }
+            }
+            KirStmt::MulMmF16 { w_buf, x_buf, .. } => {
+                if (*w_buf as usize) < in_dt.len() {
+                    in_dt[*w_buf as usize] = DType::F16;
                 }
                 if (*x_buf as usize) < in_dt.len() {
                     in_dt[*x_buf as usize] = DType::F16;
@@ -2376,6 +2561,8 @@ fn buf_is_q4(stmts: &[KirStmt], buf: u32) -> bool {
                     return true;
                 }
             }
+            // F16 weights: neither the Q4 nor the Q6 expander is involved.
+            KirStmt::MulMmF16 { .. } => {}
             KirStmt::Q6kMulMm { .. } | KirStmt::Q6kMulMvExt { .. } => {}
         }
     }
@@ -2431,6 +2618,60 @@ fn body_has_mul_mm_q6(stmts: &[KirStmt]) -> bool {
         for s in stmts {
             match s {
                 KirStmt::Q6kMulMm { .. } => return true,
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+fn body_has_mul_mm_f16(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::MulMmF16 { .. } => return true,
+                KirStmt::For { body, .. }
+                | KirStmt::If { body, .. }
+                | KirStmt::ForRange { body, .. } => {
+                    if walk(body) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(stmts)
+}
+
+/// The tall-tile decision for one F16 GEMM statement: `rows >= 2048` and not
+/// split-K (split shapes are wide-K/short-M by construction). Behind
+/// `KSEARCH_MM_TALL=0` so the fallback is a same-process A/B.
+fn f16_stmt_is_tall(rows: u32, split: u32) -> bool {
+    split <= 1
+        && rows >= crate::cuda_prelude::CUDA_F16_MUL_MM_TALL_MIN_ROWS as u32
+        && crate::cuda_prelude::f16_tall_tile_enabled()
+}
+
+/// `true` when the body's F16 GEMM renders the 128-row tile.
+fn body_has_mul_mm_f16_tall(stmts: &[KirStmt]) -> bool {
+    fn walk(stmts: &[KirStmt]) -> bool {
+        for s in stmts {
+            match s {
+                KirStmt::MulMmF16 { rows, split, .. } => {
+                    if f16_stmt_is_tall(*rows, *split) {
+                        return true;
+                    }
+                }
                 KirStmt::For { body, .. }
                 | KirStmt::If { body, .. }
                 | KirStmt::ForRange { body, .. } => {
@@ -2622,7 +2863,8 @@ fn buf_is_q6(stmts: &[KirStmt], buf: u32) -> bool {
             }
             KirStmt::Q4kMulMm { .. }
             | KirStmt::Q4kMulMvExt { .. }
-            | KirStmt::Q4kMulMvExtGateUpGelu { .. } => {}
+            | KirStmt::Q4kMulMvExtGateUpGelu { .. }
+            | KirStmt::MulMmF16 { .. } => {}
         }
     }
     false
@@ -3105,6 +3347,36 @@ fn emit_stmts(
                 s.push_str(&format!(
                     "{pad}ksearch_q6k_mul_mm({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
                 ));
+            }
+            KirStmt::MulMmF16 {
+                rows,
+                cols,
+                batch,
+                split,
+                w_buf,
+                x_buf,
+                out_buf,
+            } => {
+                let w = buf_name(*w_buf, n_in, n_out);
+                let x = buf_name(*x_buf, n_in, n_out);
+                let o = buf_name(*out_buf, n_in, n_out);
+                if *split > 1 {
+                    // Split-K: `blockIdx.z` is the K slice, the out buffer is
+                    // F32 partials. CUDA-only — Metal render rejects it.
+                    s.push_str(&format!(
+                        "{pad}ksearch_f16_mul_mm_split({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, {split}u, tgpig, (ushort)blockIdx.z, tiitg, shmem);\n"
+                    ));
+                } else if f16_stmt_is_tall(*rows, *split) {
+                    // Tall shape: 128-row blocks halve the activation
+                    // re-reads.
+                    s.push_str(&format!(
+                        "{pad}ksearch_f16_mul_mm_tall({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
+                    ));
+                } else {
+                    s.push_str(&format!(
+                        "{pad}ksearch_f16_mul_mm({w}, {x}, {o}, {rows}u, {cols}u, {batch}u, tgpig, tiitg, sgitg, shmem);\n"
+                    ));
+                }
             }
             KirStmt::Q4kMulMvExt {
                 rows,

@@ -23,7 +23,9 @@ fn every_smoke_kernel_maps_to_a_valid_launch() {
             cfg.threads()
         );
         assert!(cfg.blocks() >= 1, "{}: empty grid", k.name);
-        assert_eq!(cfg.grid.2, 1, "{}: 3-D grid is never needed", k.name);
+        // The split-K F16 GEMM is the one kernel that rides the grid depth.
+        let want_z = if k.name == "k_f16_mul_mm_split" { 4 } else { 1 };
+        assert_eq!(cfg.grid.2, want_z, "{}: unexpected grid depth", k.name);
 
         // The block size must cover the whole output for the flat hints.
         match rendered.launch {
@@ -65,8 +67,23 @@ fn mul_mm_launch_keeps_tile_and_smem() {
     let rendered = render_cuda(&k, OptSchedule::default()).expect("render cuda");
     let cfg = launch_config(&rendered.launch, DEFAULT_TG);
     assert_eq!(cfg.block, (256, 1, 1));
-    assert_eq!(cfg.smem, 8192);
+    // CUDA re-derives the dequant tile: 64×64×64, two double-buffered stages.
+    assert_eq!(cfg.smem, 36864);
     assert_eq!(cfg.grid, (1, 1, 1), "64x64 tile over rows=64, batch=64");
+}
+
+/// The F16 cache tile is 64x128 with BK=32 and two stages — 30.7 KB, two
+/// blocks per SM. The wide `N` half reads each cached weight byte exactly
+/// once at `N <= 128`; the short `M` half keeps the grid (and the
+/// two-resident-blocks overlap) of the measured-faster 64x64 tile.
+#[test]
+fn f16_mul_mm_launch_keeps_tile_and_smem() {
+    let k = smoke::smoke_kernel("k_f16_mul_mm").expect("smoke kernel");
+    let rendered = render_cuda(&k, OptSchedule::default()).expect("render cuda");
+    let cfg = launch_config(&rendered.launch, DEFAULT_TG);
+    assert_eq!(cfg.block, (256, 1, 1));
+    assert_eq!(cfg.smem, 30720);
+    assert_eq!(cfg.grid, (1, 2, 1), "64x128 tile over rows=128, batch=128");
 }
 
 /// The two-dimensional-block hints must line up with the emitted prologue

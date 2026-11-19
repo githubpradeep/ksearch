@@ -585,6 +585,549 @@ KS_DEVICE inline void ksearch_q4k_mul_mm(
 }
 "#;
 
+/// F16 prefill GEMM, CUDA flavour: the dequant-once weight cache.
+///
+/// Output tile **64 x 128** with `BK = 32`, two stages, both tiles streamed
+/// with `cp.async` — no dequant in the loop. Each dimension is an A10
+/// measurement:
+///
+/// - **BN = 128**: at a 128-token pass a 64-wide column tile runs two column
+///   blocks and streams every weight byte twice. 128 reads each cached weight
+///   exactly once.
+/// - **BM = 64 with two stages (30.7 KB smem)**: the 128x128 variant ran one
+///   block per SM and collapsed the grid (a `rows=256` GEMM was 2 blocks on
+///   72 SMs) — prefill regressed 4,164 -> 2,486 tok/s. BM=64 restores 4x the
+///   blocks and two-resident-blocks-per-SM overlap.
+///
+/// 8 warps in a 4x2 grid: warp (warp_m, warp_n) owns 16 rows x 64 columns
+/// (4 accumulator fragments).
+///
+/// All symbols carry an `f16` prefix: this helper can be included in the same
+/// translation unit as the Q4_K / Q6_K tiles without redefining their
+/// `ks_cp_async*` shims.
+pub const F16_MUL_MM_CUDA_HELPER: &str = r#"
+#define KS_F16_MM_BM 64u
+#define KS_F16_MM_BN 128u
+#define KS_F16_MM_BK 32u
+#define KS_F16_MM_LD (KS_F16_MM_BK + 8u)
+
+#ifndef KS_F16_MM_DEFINED
+#define KS_F16_MM_DEFINED
+KS_DEVICE inline void ks_f16_cp_async16(half* dst, device const half* src) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned smem = __cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(src));
+#else
+  for (int i = 0; i < 8; ++i) dst[i] = src[i];
+#endif
+}
+KS_DEVICE inline void ks_f16_cp_commit() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_f16_cp_wait() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+/* Fill one stage: threads walk 16-byte chunks of the A tile (64 rows x 4)
+   and the B tile (128 cols x 4) = 768 chunks over 256 threads. Bounds fall
+   back to a scalar zero-padded copy. */
+KS_DEVICE inline void ks_f16_mm_fill(
+    device const half* W, device const half* X,
+    uint M, uint K, uint N, uint m0, uint n0, uint k0,
+    half* As, half* Bs, uint tid) {
+  const uint ncp = KS_F16_MM_BK / 8u;
+  const uint rows = KS_F16_MM_BM * ncp;
+  for (uint c = tid; c < 2u * rows; c += blockDim.x) {
+    if (c < rows) {
+      const uint row = c / ncp;
+      const uint part = c - row * ncp;
+      const uint m = m0 + row;
+      half* dst = As + row * KS_F16_MM_LD + part * 8u;
+      if (m < M && k0 + KS_F16_MM_BK <= K) {
+        ks_f16_cp_async16(dst, W + m * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (m < M && k < K) ? W[m * K + k] : half(0.0f);
+        }
+      }
+    } else {
+      const uint c2 = c - rows;
+      const uint ni = c2 / ncp;
+      const uint part = c2 - ni * ncp;
+      const uint n = n0 + ni;
+      half* dst = Bs + ni * KS_F16_MM_LD + part * 8u;
+      if (n < N && k0 + KS_F16_MM_BK <= K) {
+        ks_f16_cp_async16(dst, X + n * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (n < N && k < K) ? X[n * K + k] : half(0.0f);
+        }
+      }
+    }
+  }
+  ks_f16_cp_commit();
+}
+
+/* Two-stage double buffer, the Q4_K tile's discipline: issue the next fill,
+   run the MMA of the current buffer while it flies, wait, barrier.
+   Warps are a 2x4 grid over the 64x128 block tile: each warp owns a
+   32x32 register tile (2x2 accumulator fragments). Register blocking is the
+   whole point — a 16-row warp tile spends 2.5 KB of shared-memory traffic
+   per 4 MMAs and the A10 measures that ceiling at ~30 TFLOPS; 32x32 cuts
+   bytes per MAC by 5x and moves the limit toward the tensor cores. */
+KS_DEVICE inline void ks_f16_mm_gemm(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  // The warp grid must exactly tile the block tile: 2 row strips x 4 column
+  // strips. A warp assigned past BN reads off the end of the B stage — the
+  // fault surfaces later, at the next driver call, as an async sticky error.
+  static_assert(2u * 32u == KS_F16_MM_BM, "warp row strips must tile BM");
+  static_assert(4u * 32u == KS_F16_MM_BN, "warp column strips must tile BN");
+  (void)sgitg;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_F16_MM_BM;
+  const uint n0 = tgpig.x * KS_F16_MM_BN;
+  const uint stage_h = (KS_F16_MM_BM + KS_F16_MM_BN) * KS_F16_MM_LD;
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + stage_h;
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  const uint warp_m = warp & 1u;
+  const uint warp_n = warp >> 1;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag[2][2];
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 2; ++j) nvcuda::wmma::fill_fragment(cfrag[a][j], 0.0f);
+  }
+#endif
+  const uint nsteps = (K + KS_F16_MM_BK - 1u) / KS_F16_MM_BK;
+  if (nsteps > 0u) {
+    ks_f16_mm_fill(W, X, M, K, N, m0, n0, 0u, buf0, buf0 + KS_F16_MM_BM * KS_F16_MM_LD, tid);
+    ks_f16_cp_wait();
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = (step & 1u) == 0u ? buf0 : buf1;
+    half* nxt = (step & 1u) == 0u ? buf1 : buf0;
+    const uint next = step + 1u;
+    if (next < nsteps) {
+      // Issue first, then compute: the fill overlaps the whole MMA pass.
+      ks_f16_mm_fill(W, X, M, K, N, m0, n0, next * KS_F16_MM_BK, nxt,
+                     nxt + KS_F16_MM_BM * KS_F16_MM_LD, tid);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = As + KS_F16_MM_BM * KS_F16_MM_LD;
+#  pragma unroll
+    for (int kstep = 0; kstep < (int)(KS_F16_MM_BK / 16u); ++kstep) {
+      const uint kk = (uint)kstep * 16u;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b_frag[2];
+#  pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const uint col = warp_n * 32u + (uint)j * 16u;
+        nvcuda::wmma::load_matrix_sync(b_frag[j], Bs + col * KS_F16_MM_LD + kk, KS_F16_MM_LD);
+      }
+#  pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a_frag;
+        nvcuda::wmma::load_matrix_sync(
+            a_frag, As + (warp_m * 32u + (uint)a * 16u) * KS_F16_MM_LD + kk, KS_F16_MM_LD);
+#  pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          nvcuda::wmma::mma_sync(cfrag[a][j], a_frag, b_frag[j], cfrag[a][j]);
+        }
+      }
+    }
+#endif
+    if (next < nsteps) {
+      ks_f16_cp_wait();
+    }
+    ks_block_barrier();
+  }
+#if defined(__CUDACC__)
+  // Epilogue: each warp stages its fragments in a private 1 KB slot of the,
+  // by now, pipeline-idle shared memory. Same-warp store -> read needs no
+  // barrier; the loop's final barrier already released the tile buffers.
+  float* mine = (float*)shmem + warp * 256u;
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
+      for (uint e = lane; e < 256u; e += 32u) {
+        const uint i = e >> 4;
+        const uint col = e & 15u;
+        const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
+        const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
+        if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
+      }
+    }
+  }
+#else
+  (void)C;
+  (void)tid;
+#endif
+}
+
+KS_DEVICE inline void ksearch_f16_mul_mm(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  ks_f16_mm_gemm(W, X, C, M, K, N, tgpig, tiitg, sgitg, shmem);
+}
+
+/* Split-K variant for wide-K / short-M shapes: `zidx` is the K slice, each
+   block accumulates `slice = K / splits` of the loop and writes **F32
+   partials** at `parts[zidx * N * M + n * M + m]`. The caller reduces the
+   slices into the F16 result (runtime `ks_f16_mm_reduce`). */
+KS_DEVICE inline void ks_f16_mm_gemm_split(
+    device const half* W, device const half* X, device float* parts,
+    uint M, uint K, uint N, uint splits,
+    uint2 tgpig, ushort zidx, ushort tiitg, threadgroup char* shmem) {
+  (void)zidx;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_F16_MM_BM;
+  const uint n0 = tgpig.x * KS_F16_MM_BN;
+  const uint slice = K / splits;
+  if (slice < KS_F16_MM_BK) return;
+  const uint k_base = (uint)zidx * slice;
+  const uint k_end = (zidx + 1u >= splits) ? K : (k_base + slice);
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + (KS_F16_MM_BM + KS_F16_MM_BN) * KS_F16_MM_LD;
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  // 2x4 warp grid: each warp owns a 32x32 register tile (2x2 fragments);
+  // must exactly tile BM x BN (off-tile warps fault off the B stage).
+  const uint warp_m = warp & 1u;
+  const uint warp_n = warp >> 1;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag[2][2];
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 2; ++j) nvcuda::wmma::fill_fragment(cfrag[a][j], 0.0f);
+  }
+#endif
+  const uint nsteps = (k_end - k_base + KS_F16_MM_BK - 1u) / KS_F16_MM_BK;
+  if (nsteps > 0u) {
+    ks_f16_mm_fill(W, X, M, K, N, m0, n0, k_base, buf0,
+                   buf0 + KS_F16_MM_BM * KS_F16_MM_LD, tid);
+    ks_f16_cp_wait();
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = (step & 1u) == 0u ? buf0 : buf1;
+    half* nxt = (step & 1u) == 0u ? buf1 : buf0;
+    const uint next = step + 1u;
+    if (next < nsteps) {
+      // Issue first, then compute: the fill overlaps the whole MMA pass.
+      ks_f16_mm_fill(W, X, M, K, N, m0, n0,
+                     k_base + next * KS_F16_MM_BK, nxt,
+                     nxt + KS_F16_MM_BM * KS_F16_MM_LD, tid);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = As + KS_F16_MM_BM * KS_F16_MM_LD;
+#  pragma unroll
+    for (int kstep = 0; kstep < (int)(KS_F16_MM_BK / 16u); ++kstep) {
+      const uint kk = (uint)kstep * 16u;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b_frag[2];
+#  pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const uint col = warp_n * 32u + (uint)j * 16u;
+        nvcuda::wmma::load_matrix_sync(b_frag[j], Bs + col * KS_F16_MM_LD + kk, KS_F16_MM_LD);
+      }
+#  pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a_frag;
+        nvcuda::wmma::load_matrix_sync(
+            a_frag, As + (warp_m * 32u + (uint)a * 16u) * KS_F16_MM_LD + kk, KS_F16_MM_LD);
+#  pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          nvcuda::wmma::mma_sync(cfrag[a][j], a_frag, b_frag[j], cfrag[a][j]);
+        }
+      }
+    }
+#endif
+    if (next < nsteps) {
+      ks_f16_cp_wait();
+    }
+    ks_block_barrier();
+  }
+#if defined(__CUDACC__)
+  // Epilogue: F32 partials at [zidx][n][m]; the reduce sums the slices.
+  float* mine = (float*)shmem + warp * 256u;
+  const uint nm = N * M;
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
+      for (uint e = lane; e < 256u; e += 32u) {
+        const uint i = e >> 4;
+        const uint col = e & 15u;
+        const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
+        const uint n = n0 + warp_n * 32u + (uint)j * 16u + col;
+        if (m < M && n < N) {
+          parts[(unsigned long long)zidx * nm + (unsigned long long)n * M + m] =
+              mine[i * 16u + col];
+        }
+      }
+    }
+  }
+#else
+  (void)parts;
+  (void)tid;
+#endif
+}
+
+KS_DEVICE inline void ksearch_f16_mul_mm_split(
+    device const half* W, device const half* X, device float* parts,
+    uint M, uint K, uint N, uint splits,
+    uint2 tgpig, ushort zidx, ushort tiitg, threadgroup char* shmem) {
+  ks_f16_mm_gemm_split(W, X, parts, M, K, N, splits, tgpig, zidx, tiitg, shmem);
+}
+#endif
+"#;
+
+/// Rows per F16 `mul_mm` output tile (one 64-row weight strip per block).
+/// Tall-variant F16 prefill GEMM (rows >= 2048), CUDA flavour — **measured
+/// slower on the A10, off by default** (`KSEARCH_MM_TALL=1` opts in).
+///
+/// Same two-stage `cp.async` pipeline as the standard tile on a 128x128
+/// output block, halving the row blocks (and with them the activation
+/// re-reads). The A10 falsified the premise: the 384 KB X strip is an L2
+/// resident, so the re-reads it saves are L2 hits, while the 41 KB of shared
+/// memory it costs drops occupancy to one block per SM and exposes the
+/// weight-stream fill latency that the 64-row tile's second resident block
+/// was hiding (tall shapes regressed 1.26-2.07x per call). Warp grid is the
+/// 4x2 mapping (32x64 register tiles) proven correct on device; kept for
+/// opt-in A/B and for parts where the carveout behaves differently.
+pub const F16_MUL_MM_TALL_CUDA_HELPER: &str = r#"
+#define KS_F16T_MM_BM 128u
+#define KS_F16T_MM_BN 128u
+#define KS_F16T_MM_BK 32u
+#define KS_F16T_MM_LD (KS_F16T_MM_BK + 8u)
+
+#ifndef KS_F16T_MM_DEFINED
+#define KS_F16T_MM_DEFINED
+KS_DEVICE inline void ks_f16t_cp_async16(half* dst, device const half* src) {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  unsigned smem = __cvta_generic_to_shared(dst);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(smem), "l"(src));
+#else
+  for (int i = 0; i < 8; ++i) dst[i] = src[i];
+#endif
+}
+KS_DEVICE inline void ks_f16t_cp_commit() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+KS_DEVICE inline void ks_f16t_cp_wait() {
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group 0;\n" ::);
+#endif
+}
+
+/* Fill one stage: A chunks (128 rows x 4) then B chunks (128 cols x 4) —
+   1024 chunks over 256 threads. Bounds fall back to scalar zero-padding. */
+KS_DEVICE inline void ks_f16t_mm_fill(
+    device const half* W, device const half* X,
+    uint M, uint K, uint N, uint m0, uint n0, uint k0,
+    half* As, half* Bs, uint tid) {
+  const uint ncp = KS_F16T_MM_BK / 8u;
+  const uint rows = KS_F16T_MM_BM * ncp;
+  for (uint c = tid; c < 2u * rows; c += blockDim.x) {
+    if (c < rows) {
+      const uint row = c / ncp;
+      const uint part = c - row * ncp;
+      const uint m = m0 + row;
+      half* dst = As + row * KS_F16T_MM_LD + part * 8u;
+      if (m < M && k0 + KS_F16T_MM_BK <= K) {
+        ks_f16t_cp_async16(dst, W + m * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (m < M && k < K) ? W[m * K + k] : half(0.0f);
+        }
+      }
+    } else {
+      const uint c2 = c - rows;
+      const uint ni = c2 / ncp;
+      const uint part = c2 - ni * ncp;
+      const uint n = n0 + ni;
+      half* dst = Bs + ni * KS_F16T_MM_LD + part * 8u;
+      if (n < N && k0 + KS_F16T_MM_BK <= K) {
+        ks_f16t_cp_async16(dst, X + n * K + k0 + part * 8u);
+      } else {
+        for (uint t = 0u; t < 8u; ++t) {
+          const uint k = k0 + part * 8u + t;
+          dst[t] = (n < N && k < K) ? X[n * K + k] : half(0.0f);
+        }
+      }
+    }
+  }
+  ks_f16t_cp_commit();
+}
+
+KS_DEVICE inline void ks_f16t_mm_gemm(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  // 4x2 warp grid over the 128x128 block: 32x64 register tiles. The grid
+  // must exactly tile the block — an off-tile warp reads past the B stage
+  // and faults the context (the error surfaces at the next driver call).
+  static_assert(4u * 32u == KS_F16T_MM_BM, "warp row strips must tile BM");
+  static_assert(2u * 64u == KS_F16T_MM_BN, "warp column strips must tile BN");
+  (void)sgitg;
+  const uint tid = (uint)tiitg;
+  const uint m0 = tgpig.y * KS_F16T_MM_BM;
+  const uint n0 = tgpig.x * KS_F16T_MM_BN;
+  const uint stage_h = (KS_F16T_MM_BM + KS_F16T_MM_BN) * KS_F16T_MM_LD;
+  half* buf0 = (half*)shmem;
+  half* buf1 = buf0 + stage_h;
+#if defined(__CUDACC__)
+  const uint lane = tid & 31u;
+  const uint warp = tid >> 5;
+  const uint warp_m = warp & 3u;
+  const uint warp_n = warp >> 2;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cfrag[2][4];
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 4; ++j) nvcuda::wmma::fill_fragment(cfrag[a][j], 0.0f);
+  }
+#endif
+  const uint nsteps = (K + KS_F16T_MM_BK - 1u) / KS_F16T_MM_BK;
+  if (nsteps > 0u) {
+    ks_f16t_mm_fill(W, X, M, K, N, m0, n0, 0u, buf0,
+                    buf0 + KS_F16T_MM_BM * KS_F16T_MM_LD, tid);
+    ks_f16t_cp_wait();
+    ks_block_barrier();
+  }
+  for (uint step = 0u; step < nsteps; ++step) {
+    half* cur = (step & 1u) == 0u ? buf0 : buf1;
+    half* nxt = (step & 1u) == 0u ? buf1 : buf0;
+    const uint next = step + 1u;
+    if (next < nsteps) {
+      ks_f16t_mm_fill(W, X, M, K, N, m0, n0, next * KS_F16T_MM_BK, nxt,
+                      nxt + KS_F16T_MM_BM * KS_F16T_MM_LD, tid);
+    }
+#if defined(__CUDACC__)
+    half* As = cur;
+    half* Bs = As + KS_F16T_MM_BM * KS_F16T_MM_LD;
+#  pragma unroll
+    for (int kstep = 0; kstep < (int)(KS_F16T_MM_BK / 16u); ++kstep) {
+      const uint kk = (uint)kstep * 16u;
+      nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> b_frag[4];
+#  pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint col = warp_n * 64u + (uint)j * 16u;
+        nvcuda::wmma::load_matrix_sync(b_frag[j], Bs + col * KS_F16T_MM_LD + kk, KS_F16T_MM_LD);
+      }
+#  pragma unroll
+      for (int a = 0; a < 2; ++a) {
+        nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> a_frag;
+        nvcuda::wmma::load_matrix_sync(
+            a_frag, As + (warp_m * 32u + (uint)a * 16u) * KS_F16T_MM_LD + kk, KS_F16T_MM_LD);
+#  pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          nvcuda::wmma::mma_sync(cfrag[a][j], a_frag, b_frag[j], cfrag[a][j]);
+        }
+      }
+    }
+#endif
+    if (next < nsteps) {
+      ks_f16t_cp_wait();
+    }
+    ks_block_barrier();
+  }
+#if defined(__CUDACC__)
+  // Epilogue: per-warp 1 KB staging slot, fragments drained sequentially.
+  float* mine = (float*)shmem + warp * 256u;
+#  pragma unroll
+  for (int a = 0; a < 2; ++a) {
+#    pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      nvcuda::wmma::store_matrix_sync(mine, cfrag[a][j], 16, nvcuda::wmma::mem_row_major);
+      for (uint e = lane; e < 256u; e += 32u) {
+        const uint i = e >> 4;
+        const uint col = e & 15u;
+        const uint m = m0 + warp_m * 32u + (uint)a * 16u + i;
+        const uint n = n0 + warp_n * 64u + (uint)j * 16u + col;
+        if (m < M && n < N) C[n * M + m] = half(mine[i * 16u + col]);
+      }
+    }
+  }
+#else
+  (void)C;
+  (void)tid;
+#endif
+}
+#endif
+
+KS_DEVICE inline void ksearch_f16_mul_mm_tall(
+    device const half* W, device const half* X, device half* C,
+    uint M, uint K, uint N,
+    uint2 tgpig, ushort tiitg, ushort sgitg, threadgroup char* shmem) {
+  ks_f16t_mm_gemm(W, X, C, M, K, N, tgpig, tiitg, sgitg, shmem);
+}
+"#;
+
+/// Rows per F16 `mul_mm` **tall** output tile (128-row weight strips, used
+/// for `rows >= 2048`).
+pub const CUDA_F16_MUL_MM_TALL_BM: u64 = 128;
+/// Columns per F16 `mul_mm` tall output tile.
+pub const CUDA_F16_MUL_MM_TALL_BN: u64 = 128;
+/// At or above this many weight rows, the tall tile wins: enough row blocks
+/// to fill the SMs even at 128 rows per block, and the activation re-read
+/// per pass halves.
+pub const CUDA_F16_MUL_MM_TALL_MIN_ROWS: u64 = 2048;
+/// Dynamic shared memory for a tall F16 `mul_mm` block: two stages of a
+/// `128 x 32` half weight tile plus a `128 x 32` half activation tile.
+///
+/// `(128 + 128) * (32 + 8) * 2 * 2 = 40960` bytes — under the 48 KB default,
+/// two blocks per SM with the carveout hint.
+pub const CUDA_F16_MUL_MM_TALL_SMEM_BYTES: u64 = 40_960;
+/// `KSEARCH_MM_TALL=1` opts **in** to the 128-row tile for tall shapes.
+///
+/// Default **off**: measured on the A10 it regressed every tall shape
+/// (`2048x1536` 0.046 -> 0.095 ms/call, `6144x1536` 0.085 -> 0.107) and
+/// pp128 by 12%. The activation re-reads it targets turn out to be L2 hits;
+/// the real cost it adds is falling to one resident block per SM (41 KB
+/// smem), which exposes the weight-stream fill latency the 64-row tile hides
+/// behind its second block. Kept compiled for A/B and for parts with
+/// different carveout behavior.
+pub fn f16_tall_tile_enabled() -> bool {
+    std::env::var("KSEARCH_MM_TALL")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+/// Rows per F16 `mul_mm` output tile (one 64-row weight strip per block;
+/// tall shapes use [`CUDA_F16_MUL_MM_TALL_BM`] instead).
+pub const CUDA_F16_MUL_MM_BM: u64 = 64;
+/// Columns (tokens) per F16 `mul_mm` output tile. At `N <= 128` the whole
+/// pass reads each cached weight byte exactly once.
+pub const CUDA_F16_MUL_MM_BN: u64 = 128;
+/// Threads per block for a CUDA F16 `mul_mm` kernel (8 warps, 4x2 warp tile).
+pub const CUDA_F16_MUL_MM_THREADS: u64 = 256;
+/// Dynamic shared memory for a CUDA F16 `mul_mm` block: two stages, each a
+/// `BM x BK` half weight tile plus a `BN x BK` half activation tile.
+///
+/// `(64 + 128) * (32 + 8) * 2 * 2 = 30720` bytes — two blocks resident per SM,
+/// the overlap structure of the 4,164 tok/s 64x64 tile.
+pub const CUDA_F16_MUL_MM_SMEM_BYTES: u64 = 30_720;
+
 /// Q6_K prefill GEMM, CUDA flavour (see [`Q4K_MUL_MM_CUDA_HELPER`]).
 pub const Q6K_MUL_MM_CUDA_HELPER: &str = r#"
 #define KS_MM_BM 64u

@@ -75,6 +75,8 @@ pub enum LaunchHint {
     MulMm {
         tg_x: u64,
         tg_y: u64,
+        /// Grid depth — `1` except for split-K F16 GEMMs.
+        tg_z: u64,
         tw: u64,
         nsg: u64,
         smem: u64,

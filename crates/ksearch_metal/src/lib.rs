@@ -498,9 +498,10 @@ impl MetalContext {
             LaunchHint::MulMm {
                 tg_x,
                 tg_y,
+                smem,
                 tw,
                 nsg,
-                smem,
+                ..
             } => {
                 enc.set_threadgroup_memory_length(0, *smem);
                 enc.dispatch_thread_groups(
@@ -576,9 +577,10 @@ impl MetalContext {
                 LaunchHint::MulMm {
                     tg_x,
                     tg_y,
+                    smem,
                     tw,
                     nsg,
-                    smem,
+                    ..
                 } => {
                     enc.set_threadgroup_memory_length(0, *smem);
                     enc.dispatch_thread_groups(

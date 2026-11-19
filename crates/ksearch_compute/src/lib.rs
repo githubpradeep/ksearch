@@ -19,12 +19,12 @@
 //! With neither set, an Apple GPU prefers Metal and everything else prefers
 //! CUDA, so the same binary is fast on a Mac and on an H100.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 #[cfg(feature = "cuda")]
 use ksearch_codegen::lower_to_cuda_chip;
 #[cfg(feature = "metal")]
 use ksearch_codegen::lower_to_metal_chip;
-use ksearch_ir::{Graph, TensorId};
+use ksearch_ir::{DType, Graph, TensorId};
 use std::cell::RefCell;
 use std::time::Instant;
 
@@ -94,6 +94,13 @@ pub enum Pipeline {
     Cuda(ksearch_cuda::Kernel),
 }
 
+/// Opaque CUDA event handle returned by [`Context::phase_event_mark`].
+///
+/// `Copy` and defined on every build (only the CUDA backend can produce a
+/// real one); pass it back to the phase-event methods unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct PhaseEventHandle(usize);
+
 /// A GPU context driving one [`Backend`].
 pub struct Context {
     backend: Backend,
@@ -104,6 +111,10 @@ pub struct Context {
     /// Host-side phase timers (the CUDA path has no GPU counters).
     marks: RefCell<Vec<Instant>>,
     max_marks: RefCell<usize>,
+    /// GPU phase events (CUDA): one per host mark, so
+    /// [`Context::resolve_phase_times_ms`] can report device time.
+    #[cfg(feature = "cuda")]
+    gpu_marks: RefCell<Vec<Option<ksearch_cuda::PhaseEvent>>>,
 }
 
 // The CUDA context is `Send` and re-binds itself per call; the Metal context
@@ -208,6 +219,8 @@ impl Context {
             cuda: None,
             marks: RefCell::new(Vec::new()),
             max_marks: RefCell::new(0),
+            #[cfg(feature = "cuda")]
+            gpu_marks: RefCell::new(Vec::new()),
         }
     }
 
@@ -221,6 +234,8 @@ impl Context {
             cuda: Some(RefCell::new(ctx)),
             marks: RefCell::new(Vec::new()),
             max_marks: RefCell::new(0),
+            #[cfg(feature = "cuda")]
+            gpu_marks: RefCell::new(Vec::new()),
         }
     }
 
@@ -610,6 +625,262 @@ impl Context {
         }
     }
 
+    /// Upload raw bytes to the start of `buf`.
+    pub fn write_bytes(&self, buf: &Buffer, data: &[u8]) -> Result<()> {
+        match (self.backend, buf) {
+            #[cfg(feature = "metal")]
+            (Backend::Metal, Buffer::Metal(b)) => unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), b.contents() as *mut u8, data.len());
+                Ok(())
+            },
+            #[cfg(feature = "cuda")]
+            (Backend::Cuda, Buffer::Cuda(b)) => self
+                .cuda_ctx()
+                .copy_to(b, data)
+                .map_err(|e| anyhow!("upload bytes: {e}")),
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow!("buffer of a different backend")),
+        }
+    }
+
+    /// One little-endian `u32` at the start of `buf`.
+    pub fn write_u32(&self, buf: &Buffer, v: u32) -> Result<()> {
+        self.write_bytes(buf, &v.to_le_bytes())
+    }
+
+    /// Dequantize `n` packed weights from `src` into an F16 `dst`, once.
+    ///
+    /// This is the prefill weight cache: it runs on the first large-batch use
+    /// of a tensor, costs ~`n * 2.6 B` of extra device memory, and removes the
+    /// per-GEMM dequant from every later prefill chunk. `dtype` selects the
+    /// packed layout (`Q4K` or `Q6K`).
+    pub fn dequant_f16(&self, src: &Buffer, dst: &Buffer, n: usize, dtype: DType) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        let q6 = match dtype {
+            DType::Q4K => false,
+            DType::Q6K => true,
+            other => bail!("dequant_f16: {other:?} is not a packed K-quant"),
+        };
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (src, dst, n, dtype);
+        }
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let src = Self::cuda_buf(src)?;
+                let dst = Self::cuda_buf(dst)?;
+                self.cuda_ctx_mut()
+                    .dequant_f16(src, dst, n, q6)
+                    .map_err(|e| anyhow!("dequant_f16: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("dequant_f16 is a CUDA path"),
+        }
+    }
+
+    /// Sum `splits` F32 partial planes into the F16 GEMM output.
+    ///
+    /// The tail of the split-K prefill GEMM; see [`Graph::mul_mm_f16_split`].
+    pub fn f16_mm_reduce(
+        &self,
+        parts: &Buffer,
+        out: &Buffer,
+        nm: usize,
+        splits: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let parts = Self::cuda_buf(parts)?;
+                let out = Self::cuda_buf(out)?;
+                self.cuda_ctx_mut()
+                    .f16_mm_reduce(parts, out, nm, splits)
+                    .map_err(|e| anyhow!("f16_mm_reduce: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("f16_mm_reduce is a CUDA path"),
+        }
+    }
+
+    /// Device addresses of `metas`, packed as `u64`s into `table`.
+    pub fn publish_ptr_table(&self, metas: &[Buffer], table: &Buffer) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let mut bytes = Vec::with_capacity(metas.len() * 8);
+                for m in metas {
+                    let p = self.device_ptr(m)?;
+                    bytes.extend_from_slice(&p.to_le_bytes());
+                }
+                return self.write_bytes(table, &bytes);
+            }
+        }
+        let _ = (metas, table);
+        Err(anyhow!("publish_ptr_table is a CUDA path"))
+    }
+
+    /// Fill per-layer attention metadata from the device position.
+    pub fn fill_decode_meta(
+        &self,
+        table: &Buffer,
+        pos: &Buffer,
+        swa_mask: u64,
+        n_layers: u32,
+        window: u32,
+    ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let table = Self::cuda_buf(table)?;
+                let pos = Self::cuda_buf(pos)?;
+                return self
+                    .cuda_ctx_mut()
+                    .fill_attn_meta(table, pos, swa_mask, n_layers, window)
+                    .map_err(|e| anyhow!("fill decode meta: {e}"));
+            }
+        }
+        let _ = (table, pos, swa_mask, n_layers, window);
+        Err(anyhow!("fill_decode_meta is a CUDA path"))
+    }
+
+    /// Increment the device `u32` at `pos`.
+    pub fn inc_decode_pos(&self, pos: &Buffer) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let pos = Self::cuda_buf(pos)?;
+                return self
+                    .cuda_ctx_mut()
+                    .inc_u32(pos)
+                    .map_err(|e| anyhow!("inc decode pos: {e}"));
+            }
+        }
+        let _ = pos;
+        Err(anyhow!("inc_decode_pos is a CUDA path"))
+    }
+
+    /// Scatter 4-float records from `src` into the per-layer meta slots.
+    pub fn scatter_meta(&self, table: &Buffer, src: &Buffer, n_layers: u32) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let table = Self::cuda_buf(table)?;
+                let src = Self::cuda_buf(src)?;
+                return self
+                    .cuda_ctx_mut()
+                    .scatter_meta(table, src, n_layers)
+                    .map_err(|e| anyhow!("scatter meta: {e}"));
+            }
+        }
+        let _ = (table, src, n_layers);
+        Err(anyhow!("scatter_meta is a CUDA path"))
+    }
+
+    /// `true` when both decode-token graphs are captured.
+    pub fn decode_graphs_ready(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                return self.cuda_ctx().decode_graphs_ready();
+            }
+        }
+        false
+    }
+
+    /// Record subsequent launches into the even or odd decode graph.
+    pub fn begin_decode_capture(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                return self
+                    .cuda_ctx_mut()
+                    .begin_decode_capture()
+                    .map_err(|e| anyhow!("begin decode capture: {e}"));
+            }
+        }
+        Err(anyhow!("begin_decode_capture is a CUDA path"))
+    }
+
+    /// Instantiate the graph recorded since [`begin_decode_capture`].
+    pub fn end_decode_capture(&self, parity: usize) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                return self
+                    .cuda_ctx_mut()
+                    .end_decode_capture(parity)
+                    .map_err(|e| anyhow!("end decode capture: {e}"));
+            }
+        }
+        let _ = parity;
+        Err(anyhow!("end_decode_capture is a CUDA path"))
+    }
+
+    /// Drop an in-progress capture after a failed token.
+    pub fn abort_decode_capture(&self) {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                self.cuda_ctx_mut().abort_decode_capture();
+            }
+        }
+    }
+
+    /// Replay one captured decode token. `parity` is 0 or 1.
+    pub fn launch_decode_graph(&self, parity: usize) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                return self
+                    .cuda_ctx_mut()
+                    .launch_decode_graph(parity)
+                    .map_err(|e| anyhow!("launch decode graph: {e}"));
+            }
+        }
+        let _ = parity;
+        Err(anyhow!("launch_decode_graph is a CUDA path"))
+    }
+
+    /// `dst[*index] = src[0]; *index += 1`.
+    pub fn stash_f32_inc(&self, src: &Buffer, dst: &Buffer, index: &Buffer) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let src = Self::cuda_buf(src)?;
+                let dst = Self::cuda_buf(dst)?;
+                let index = Self::cuda_buf(index)?;
+                return self
+                    .cuda_ctx_mut()
+                    .stash_f32_inc(src, dst, index)
+                    .map_err(|e| anyhow!("stash f32 inc: {e}"));
+            }
+        }
+        let _ = (src, dst, index);
+        Err(anyhow!("stash_f32_inc is a CUDA path"))
+    }
+
+    /// Queue `dst[index] = src[0]` without a host readback.
+    pub fn stash_f32(&self, src: &Buffer, dst: &Buffer, index: u32) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let src = Self::cuda_buf(src)?;
+                let dst = Self::cuda_buf(dst)?;
+                self.cuda_ctx_mut()
+                    .stash_f32(src, dst, index)
+                    .map_err(|e| anyhow!("stash f32: {e}"))
+            }
+            #[cfg(feature = "metal")]
+            Backend::Metal => {
+                self.blit_copy_bytes(src, 0, dst, u64::from(index) * 4, 4);
+                Ok(())
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow!("stash_f32 has no backend")),
+        }
+    }
+
     // ------------------------------------------------------------------- sync
 
     pub fn has_gpu_work(&self) -> bool {
@@ -894,6 +1165,16 @@ impl Context {
         bufs.iter().map(|b| Self::metal_buf(b)).collect()
     }
 
+    /// CUDA allocation behind a backend-neutral buffer.
+    #[cfg(feature = "cuda")]
+    fn cuda_buf(buf: &Buffer) -> Result<&ksearch_cuda::Buffer> {
+        match buf {
+            Buffer::Cuda(b) => Ok(b),
+            #[allow(unreachable_patterns)]
+            _ => Err(anyhow!("buffer of a different backend")),
+        }
+    }
+
     /// Raw device pointer of a buffer of this context.
     #[cfg(feature = "cuda")]
     fn device_ptr(&self, buf: &Buffer) -> Result<ksearch_cuda::CUdeviceptr> {
@@ -932,11 +1213,20 @@ impl Context {
         }
     }
 
-    /// Begin phase timing. Metal uses its GPU counters; CUDA records host
-    /// instants, which is the honest thing to do without GPU timestamps.
+    /// Begin phase timing. Metal uses its GPU counters; CUDA records device
+    /// events (falling back to host instants with `KSEARCH_CUDA_EVENTS=0`).
     pub fn init_phase_counters(&self, max_samples: u64) -> Result<()> {
         *self.max_marks.borrow_mut() = max_samples as usize;
         self.marks.borrow_mut().clear();
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let mut gpu = self.gpu_marks.borrow_mut();
+                for ev in gpu.drain(..).flatten() {
+                    self.cuda_ctx().phase_event_destroy(ev);
+                }
+            }
+        }
         match self.backend {
             #[cfg(not(feature = "metal"))]
             Backend::Metal => unreachable!("this build has no `metal` feature"),
@@ -949,6 +1239,14 @@ impl Context {
         }
     }
 
+    /// `true` when CUDA phase marks should record device events.
+    #[cfg(feature = "cuda")]
+    fn cuda_phase_events(&self) -> bool {
+        std::env::var("KSEARCH_CUDA_EVENTS")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
     pub fn phase_mark(&self) {
         match self.backend {
             #[cfg(not(feature = "metal"))]
@@ -959,10 +1257,28 @@ impl Context {
             Backend::Metal => self.metal_ctx().phase_mark(),
             #[cfg(feature = "cuda")]
             Backend::Cuda => {
+                // Eager launches are enqueued on the default stream, so the
+                // event is ordered with the work the phase covers. A capture in
+                // progress has no phase marks of its own (replay brackets use
+                // `phase_event_mark(true)`).
+                let event = if self.cuda_phase_events() {
+                    self.cuda_ctx().record_phase_event(false).ok()
+                } else {
+                    None
+                };
                 let mut marks = self.marks.borrow_mut();
                 let max = *self.max_marks.borrow();
                 if max == 0 || marks.len() < max + 1 {
                     marks.push(Instant::now());
+                    #[cfg(feature = "cuda")]
+                    {
+                        // Keep the two sequences the same length so
+                        // `resolve_phase_times_ms` can pick device times.
+                        let mut gpu = self.gpu_marks.borrow_mut();
+                        if gpu.is_empty() || event.is_some() {
+                            gpu.push(event);
+                        }
+                    }
                 }
             }
         }
@@ -978,11 +1294,100 @@ impl Context {
             Backend::Metal => self.metal_ctx().resolve_phase_times_ms(),
             #[cfg(feature = "cuda")]
             Backend::Cuda => {
+                #[cfg(feature = "cuda")]
+                {
+                    let marks_len = self.marks.borrow().len();
+                    let gpu = self.gpu_marks.borrow();
+                    if self.cuda_phase_events() && gpu.len() == marks_len && !gpu.is_empty() {
+                        let host = self.marks.borrow();
+                        let mut out = Vec::with_capacity(gpu.len().saturating_sub(1));
+                        for w in gpu.windows(2) {
+                            match (w[0], w[1]) {
+                                // A skipped mark (capture, failed event) falls
+                                // back to the host interval for this phase.
+                                (Some(a), Some(b)) => {
+                                    match self.cuda_ctx().phase_event_elapsed_ms(a, b) {
+                                        Ok(ms) => out.push(ms),
+                                        Err(_) => {
+                                            let idx = out.len();
+                                            let hw = &host[idx..idx + 2];
+                                            out.push(
+                                                hw[1].duration_since(hw[0]).as_secs_f64() * 1e3,
+                                            );
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    let idx = out.len();
+                                    let hw = &host[idx..idx + 2];
+                                    out.push(hw[1].duration_since(hw[0]).as_secs_f64() * 1e3);
+                                }
+                            }
+                        }
+                        drop(gpu);
+                        drop(host);
+                        let mut gpu = self.gpu_marks.borrow_mut();
+                        for ev in gpu.drain(..).flatten() {
+                            self.cuda_ctx().phase_event_destroy(ev);
+                        }
+                        return out;
+                    }
+                }
                 let marks = self.marks.borrow();
                 marks
                     .windows(2)
                     .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1e3)
                     .collect()
+            }
+        }
+    }
+
+    /// Record an event on the stream the caller is about to enqueue on.
+    ///
+    /// `on_decode_stream` brackets replayed decode graphs (the capture
+    /// stream); `false` covers eager launches on the default stream. Returns
+    /// a raw event handle for [`Context::phase_event_elapsed_ms`].
+    pub fn phase_event_mark(&self, on_decode_stream: bool) -> Result<PhaseEventHandle> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let ev = self
+                    .cuda_ctx()
+                    .record_phase_event(on_decode_stream)
+                    .map_err(|e| anyhow!("phase event: {e}"))?;
+                return Ok(PhaseEventHandle(ev.raw() as usize));
+            }
+        }
+        let _ = on_decode_stream;
+        Err(anyhow!("phase_event_mark is a CUDA path"))
+    }
+
+    /// GPU milliseconds between two [`Context::phase_event_mark`] handles.
+    pub fn phase_event_elapsed_ms(&self, a: PhaseEventHandle, b: PhaseEventHandle) -> Result<f64> {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                let (a, b) = (
+                    ksearch_cuda::PhaseEvent::from_raw(a.0 as _),
+                    ksearch_cuda::PhaseEvent::from_raw(b.0 as _),
+                );
+                return self
+                    .cuda_ctx()
+                    .phase_event_elapsed_ms(a, b)
+                    .map_err(|e| anyhow!("phase event elapsed: {e}"));
+            }
+        }
+        let _ = (a, b);
+        Err(anyhow!("phase_event_elapsed_ms is a CUDA path"))
+    }
+
+    /// Free a [`Context::phase_event_mark`] handle.
+    pub fn phase_event_destroy(&self, ev: PhaseEventHandle) {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend == Backend::Cuda {
+                self.cuda_ctx()
+                    .phase_event_destroy(ksearch_cuda::PhaseEvent::from_raw(ev.0 as _));
             }
         }
     }

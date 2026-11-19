@@ -41,11 +41,13 @@ use std::sync::Arc;
 
 pub use ffi::{CUdeviceptr, CudaError, DRIVER_LIB_NAMES};
 pub use launch::{launch_config, LaunchConfig};
-
 /// Default threads per block for flat (`Elementwise` / `Rows`) kernels.
 pub const DEFAULT_TG: u64 = 256;
 /// Above this, a kernel must opt in to its dynamic shared memory size.
 const DEFAULT_MAX_SMEM: u32 = 48 * 1024;
+/// At or above this dynamic shared size, ask for a max shared-memory carveout
+/// (hint) so more than one block fits per SM.
+const SMEM_CARVEOUT_THRESHOLD: u32 = 24 * 1024;
 /// Environment override for the `nvcc` binary.
 const NVCC_ENV: &str = "KSEARCH_NVCC";
 
@@ -100,6 +102,13 @@ pub struct CudaContext {
     shared: Arc<Shared>,
     /// cubins loaded into this context, keyed by a hash of the source.
     modules: HashMap<u64, ffi::CUmodule>,
+    /// Fill / increment / stash kernels for GPU-resident decode state.
+    runtime: Option<RuntimeKernels>,
+    /// Non-default stream used to capture and replay a decode token.
+    stream: ffi::CUstream,
+    capturing: bool,
+    /// Even and odd token graphs. `None` until capture succeeds.
+    decode_exec: [Option<ffi::CUgraphExec>; 2],
     /// Threads per block used by [`launch_config`] for flat kernels.
     tg: u64,
 }
@@ -200,6 +209,10 @@ impl CudaContext {
                 nvcc: find_nvcc(),
             }),
             modules: HashMap::new(),
+            runtime: None,
+            stream: std::ptr::null_mut(),
+            capturing: false,
+            decode_exec: [None, None],
             tg: tg.max(1),
         })
     }
@@ -382,6 +395,164 @@ impl CudaContext {
         Ok(Kernel { func })
     }
 
+    fn runtime_kernels(&mut self) -> Result<RuntimeKernels, CudaError> {
+        if let Some(k) = self.runtime {
+            return Ok(k);
+        }
+        let src = RUNTIME_SRC;
+        let k = RuntimeKernels {
+            fill: self.load_source("ks_fill_attn_meta", src)?,
+            inc: self.load_source("ks_inc_u32", src)?,
+            scatter: self.load_source("ks_scatter_meta", src)?,
+            stash: self.load_source("ks_stash_f32", src)?,
+            stash_inc: self.load_source("ks_stash_f32_inc", src)?,
+            deq_q4k: self.load_source("ks_dequant_q4k_f16", DEQUANT_SRC)?,
+            deq_q6k: self.load_source("ks_dequant_q6k_f16", DEQUANT_SRC)?,
+            mm_reduce: self.load_source("ks_f16_mm_reduce", DEQUANT_SRC)?,
+        };
+        self.runtime = Some(k);
+        Ok(k)
+    }
+
+    /// Write every layer's attention metadata from the device position.
+    ///
+    /// `table` holds one device pointer per layer (the 32-byte meta slot).
+    /// `pos` is a single `f32` in device memory. `swa_mask` bit `i` marks a
+    /// sliding-window layer. One launch, no host copy.
+    pub fn fill_attn_meta(
+        &mut self,
+        table: &Buffer,
+        pos: &Buffer,
+        swa_mask: u64,
+        n_layers: u32,
+        window: u32,
+    ) -> Result<(), CudaError> {
+        let k = self.runtime_kernels()?;
+        let mut args = KernelArgs::new();
+        args.ptr(table.as_ptr())
+            .ptr(pos.as_ptr())
+            .u64(swa_mask)
+            .u32(n_layers)
+            .u32(window);
+        let block = 64u32;
+        let grid = (n_layers.max(1) + block - 1) / block;
+        self.launch_with(k.fill, LaunchConfig::new((grid.max(1), 1), (block, 1), 0), &mut args)
+    }
+
+    /// `*pos += 1` on the device, ordered with the surrounding launches.
+    pub fn inc_u32(&mut self, pos: &Buffer) -> Result<(), CudaError> {
+        let k = self.runtime_kernels()?;
+        let mut args = KernelArgs::new();
+        args.ptr(pos.as_ptr());
+        self.launch_with(k.inc, LaunchConfig::new((1, 1), (1, 1), 0), &mut args)
+    }
+
+    /// Scatter `n_layers` records of 4 floats from `src` into the per-layer slots.
+    pub fn scatter_meta(
+        &mut self,
+        table: &Buffer,
+        src: &Buffer,
+        n_layers: u32,
+    ) -> Result<(), CudaError> {
+        let k = self.runtime_kernels()?;
+        let mut args = KernelArgs::new();
+        args.ptr(table.as_ptr()).ptr(src.as_ptr()).u32(n_layers);
+        let block = 64u32;
+        let grid = (n_layers.max(1) + block - 1) / block;
+        self.launch_with(
+            k.scatter,
+            LaunchConfig::new((grid.max(1), 1), (block, 1), 0),
+            &mut args,
+        )
+    }
+
+    /// `dst[index] = src[0]`, queued on the default stream.
+    pub fn stash_f32(
+        &mut self,
+        src: &Buffer,
+        dst: &Buffer,
+        index: u32,
+    ) -> Result<(), CudaError> {
+        let k = self.runtime_kernels()?;
+        let mut args = KernelArgs::new();
+        args.ptr(src.as_ptr()).ptr(dst.as_ptr()).u32(index);
+        self.launch_with(k.stash, LaunchConfig::new((1, 1), (1, 1), 0), &mut args)
+    }
+
+    /// `dst[*index] = src[0]; *index += 1`, so a replayed graph advances the slot.
+    pub fn stash_f32_inc(
+        &mut self,
+        src: &Buffer,
+        dst: &Buffer,
+        index: &Buffer,
+    ) -> Result<(), CudaError> {
+        let k = self.runtime_kernels()?;
+        let mut args = KernelArgs::new();
+        args.ptr(src.as_ptr()).ptr(dst.as_ptr()).ptr(index.as_ptr());
+        self.launch_with(
+            k.stash_inc,
+            LaunchConfig::new((1, 1), (1, 1), 0),
+            &mut args,
+        )
+    }
+
+    /// Dequantize `n` packed weights from `src` into F16 `dst`, once.
+    ///
+    /// `q6` selects the Q6_K layout; otherwise `src` is Q4_K. `n` must be a
+    /// multiple of 256 (the super-block size). Queued on the default stream
+    /// so a following GEMM launch is ordered after it.
+    pub fn dequant_f16(
+        &mut self,
+        src: &Buffer,
+        dst: &Buffer,
+        n: usize,
+        q6: bool,
+    ) -> Result<(), CudaError> {
+        if !n.is_multiple_of(256) {
+            return Err(CudaError::Other(format!(
+                "dequant_f16: {n} elements is not a multiple of the 256-element block"
+            )));
+        }
+        let k = self.runtime_kernels()?;
+        let block = 256u32;
+        let (kernel, units) = if q6 {
+            (k.deq_q6k, n as u64)
+        } else {
+            (k.deq_q4k, (n / 16) as u64)
+        };
+        let grid = (units.div_ceil(block as u64)).min(u32::MAX as u64) as u32;
+        let mut args = KernelArgs::new();
+        args.ptr(src.as_ptr()).ptr(dst.as_ptr()).u64(units);
+        self.launch_with(
+            kernel,
+            LaunchConfig::new((grid.max(1), 1), (block, 1), 0),
+            &mut args,
+        )
+    }
+
+    /// Sum `splits` F32 partial planes of `nm` elements into the F16 `out`.
+    ///
+    /// The tail of the split-K prefill GEMM: `parts[s * nm + i]`, summed
+    /// over `s`. Queued on the default stream, ordered after the GEMM.
+    pub fn f16_mm_reduce(
+        &mut self,
+        parts: &Buffer,
+        out: &Buffer,
+        nm: usize,
+        splits: usize,
+    ) -> Result<(), CudaError> {
+        let k = self.runtime_kernels()?;
+        let block = 256u32;
+        let grid = ((nm as u64).div_ceil(block as u64)).min(u32::MAX as u64) as u32;
+        let mut args = KernelArgs::new();
+        args.ptr(parts.as_ptr()).ptr(out.as_ptr()).u64(nm as u64).u32(splits as u32);
+        self.launch_with(
+            k.mm_reduce,
+            LaunchConfig::new((grid.max(1), 1), (block, 1), 0),
+            &mut args,
+        )
+    }
+
     // ---------------------------------------------------------------- dispatch
 
     /// Launch with the grid/block the [`ksearch_codegen::LaunchHint`] asks for.
@@ -417,6 +588,20 @@ impl CudaContext {
                     ),
                 )?;
             }
+        } else if cfg.smem >= SMEM_CARVEOUT_THRESHOLD {
+            // Large-but-fitting tiles (the F16 GEMM's 30 KB) ask for a shared
+            // memory carveout so two blocks are resident per SM; the driver
+            // treats this as a hint.
+            unsafe {
+                let _ = drv.check(
+                    "cuFuncSetAttribute",
+                    (drv.cuFuncSetAttribute)(
+                        k.func,
+                        ffi::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                        100,
+                    ),
+                );
+            }
         }
         let mut ptrs = args.pointers();
         unsafe {
@@ -431,11 +616,170 @@ impl CudaContext {
                     cfg.block.1,
                     cfg.block.2,
                     cfg.smem,
-                    std::ptr::null_mut(),
+                    if self.capturing {
+                        self.stream
+                    } else {
+                        std::ptr::null_mut()
+                    },
                     ptrs.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
             )
+        }
+    }
+
+    fn ensure_stream(&mut self) -> Result<(), CudaError> {
+        if !self.stream.is_null() {
+            return Ok(());
+        }
+        let drv = &self.shared.drv;
+        unsafe {
+            drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx))?;
+            // CU_STREAM_NON_BLOCKING
+            drv.check(
+                "cuStreamCreate",
+                (drv.cuStreamCreate)(&mut self.stream, 1),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `true` after both parity graphs have been instantiated.
+    pub fn decode_graphs_ready(&self) -> bool {
+        self.decode_exec[0].is_some() && self.decode_exec[1].is_some()
+    }
+
+    /// Record subsequent launches on the decode stream. Does not execute them.
+    pub fn begin_decode_capture(&mut self) -> Result<(), CudaError> {
+        if self.capturing {
+            return Err(CudaError::Other("decode capture already active".into()));
+        }
+        self.ensure_stream()?;
+        let drv = &self.shared.drv;
+        unsafe {
+            drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx))?;
+            drv.check(
+                "cuStreamBeginCapture",
+                (drv.cuStreamBeginCapture)(self.stream, 0),
+            )?;
+        }
+        self.capturing = true;
+        Ok(())
+    }
+
+    /// Finish the capture and keep the executable graph for `parity` (0 or 1).
+    pub fn end_decode_capture(&mut self, parity: usize) -> Result<(), CudaError> {
+        if !self.capturing {
+            return Err(CudaError::Other("decode capture is not active".into()));
+        }
+        self.capturing = false;
+        let drv = &self.shared.drv;
+        let mut graph: ffi::CUgraph = std::ptr::null_mut();
+        unsafe {
+            drv.check(
+                "cuStreamEndCapture",
+                (drv.cuStreamEndCapture)(self.stream, &mut graph),
+            )?;
+        }
+        let mut exec: ffi::CUgraphExec = std::ptr::null_mut();
+        let instantiated = unsafe {
+            drv.check(
+                "cuGraphInstantiateWithFlags",
+                (drv.cuGraphInstantiateWithFlags)(&mut exec, graph, 0),
+            )
+        };
+        unsafe {
+            (drv.cuGraphDestroy)(graph);
+        }
+        instantiated?;
+        if let Some(old) = self.decode_exec[parity].replace(exec) {
+            unsafe { (drv.cuGraphExecDestroy)(old) };
+        }
+        Ok(())
+    }
+
+    /// Leave capture mode after a failed token recording.
+    pub fn abort_decode_capture(&mut self) {
+        if !self.capturing {
+            return;
+        }
+        self.capturing = false;
+        let drv = &self.shared.drv;
+        let mut graph: ffi::CUgraph = std::ptr::null_mut();
+        unsafe {
+            let _ = (drv.cuStreamEndCapture)(self.stream, &mut graph);
+            if !graph.is_null() {
+                (drv.cuGraphDestroy)(graph);
+            }
+        }
+    }
+
+    /// Replay one captured token on the decode stream.
+    pub fn launch_decode_graph(&mut self, parity: usize) -> Result<(), CudaError> {
+        let Some(exec) = self.decode_exec[parity] else {
+            return Err(CudaError::Other("decode graph is not captured".into()));
+        };
+        self.ensure_stream()?;
+        let drv = &self.shared.drv;
+        unsafe {
+            drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx))?;
+            drv.check("cuGraphLaunch", (drv.cuGraphLaunch)(exec, self.stream))
+        }
+    }
+
+    // ------------------------------------------------------------------ events
+
+    /// Record a phase event and return its handle.
+    ///
+    /// `on_decode_stream` picks the stream the bracketed work was enqueued on:
+    /// the capture stream for replayed decode tokens, the default stream for
+    /// eager launches. Recording during an active capture is an error (the
+    /// event would become a node of the replayed graph).
+    pub fn record_phase_event(&self, on_decode_stream: bool) -> Result<PhaseEvent, CudaError> {
+        if self.capturing {
+            return Err(CudaError::Other(
+                "cannot record a phase event during decode capture".into(),
+            ));
+        }
+        let drv = &self.shared.drv;
+        unsafe {
+            drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx))?;
+            let mut ev: ffi::CUevent = std::ptr::null_mut();
+            drv.check("cuEventCreate", (drv.cuEventCreate)(&mut ev, 0))?;
+            let stream = if on_decode_stream && !self.stream.is_null() {
+                self.stream
+            } else {
+                std::ptr::null_mut()
+            };
+            drv.check("cuEventRecord", (drv.cuEventRecord)(ev, stream))?;
+            Ok(PhaseEvent { ev })
+        }
+    }
+
+    /// GPU milliseconds from `a` to `b` (waits for `b` to complete).
+    pub fn phase_event_elapsed_ms(&self, a: PhaseEvent, b: PhaseEvent) -> Result<f64, CudaError> {
+        let drv = &self.shared.drv;
+        unsafe {
+            drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx))?;
+            drv.check("cuEventSynchronize", (drv.cuEventSynchronize)(b.ev))?;
+            let mut ms: f32 = 0.0;
+            drv.check(
+                "cuEventElapsedTime",
+                (drv.cuEventElapsedTime)(&mut ms, a.ev, b.ev),
+            )?;
+            Ok(ms as f64)
+        }
+    }
+
+    /// Free a phase event.
+    pub fn phase_event_destroy(&self, ev: PhaseEvent) {
+        if ev.ev.is_null() {
+            return;
+        }
+        let drv = &self.shared.drv;
+        unsafe {
+            let _ = (drv.cuCtxSetCurrent)(self.shared.ctx);
+            let _ = (drv.cuEventDestroy)(ev.ev);
         }
     }
 
@@ -506,10 +850,20 @@ pub fn nvcc_cubin(nvcc: &Path, arch: &str, source: &str, name: &str) -> Result<V
 
 impl Drop for CudaContext {
     fn drop(&mut self) {
-        // Unload while the context is still current/valid.
+        self.abort_decode_capture();
+        // Graphs and the stream reference the context, so they go before modules.
         unsafe {
             let drv = &self.shared.drv;
             let _ = drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx));
+            for slot in &mut self.decode_exec {
+                if let Some(exec) = slot.take() {
+                    (drv.cuGraphExecDestroy)(exec);
+                }
+            }
+            if !self.stream.is_null() {
+                (drv.cuStreamDestroy)(self.stream);
+                self.stream = std::ptr::null_mut();
+            }
             for module in self.modules.values() {
                 (drv.cuModuleUnload)(*module);
             }
@@ -591,6 +945,169 @@ impl Buffer {
     }
 }
 
+/// Decode-state kernels compiled once per context.
+#[derive(Clone, Copy)]
+struct RuntimeKernels {
+    fill: Kernel,
+    inc: Kernel,
+    scatter: Kernel,
+    stash: Kernel,
+    stash_inc: Kernel,
+    deq_q4k: Kernel,
+    deq_q6k: Kernel,
+    mm_reduce: Kernel,
+}
+
+const RUNTIME_SRC: &str = r#"
+extern "C" __global__ void ks_fill_attn_meta(
+    const unsigned long long* metas,
+    const float* pos,
+    unsigned long long swa_mask,
+    unsigned n_layers,
+    unsigned window) {
+  unsigned layer = blockIdx.x * blockDim.x + threadIdx.x;
+  if (layer >= n_layers || layer >= 64u) return;
+  unsigned kv = (unsigned)pos[0] + 1u;
+  unsigned start = 0u;
+  unsigned tlen = kv;
+  if ((swa_mask >> layer) & 1ull) {
+    start = kv > window ? kv - window : 0u;
+    tlen = kv - start;
+  }
+  float* dst = (float*)metas[layer];
+  dst[0] = (float)tlen;
+  dst[1] = (float)start;
+  dst[2] = 0.0f;
+}
+
+extern "C" __global__ void ks_inc_u32(float* pos) { pos[0] += 1.0f; }
+
+extern "C" __global__ void ks_scatter_meta(
+    const unsigned long long* metas, const float* src, unsigned n_layers) {
+  unsigned layer = blockIdx.x * blockDim.x + threadIdx.x;
+  if (layer >= n_layers) return;
+  float* dst = (float*)metas[layer];
+  const float* s = src + layer * 4u;
+  dst[0] = s[0];
+  dst[1] = s[1];
+  dst[2] = s[2];
+}
+
+extern "C" __global__ void ks_stash_f32(const float* src, float* dst, unsigned index) {
+  dst[index] = src[0];
+}
+
+extern "C" __global__ void ks_stash_f32_inc(const float* src, float* dst, unsigned* index) {
+  unsigned i = index[0];
+  dst[i] = src[0];
+  index[0] = i + 1u;
+}
+"#;
+
+/// One-time weight dequantization into the F16 prefill cache.
+///
+/// These kernels are the `ksearch_load_q4k` / `ksearch_load_q6k` expanders
+/// written out as plain CUDA (the runtime kernels are compiled standalone,
+/// without the MSL-dialect prelude). Each Q4_K thread dequantizes one 16
+/// element chunk — the same recipe the WMMA tile proved on device — and the
+/// Q6_K kernel maps one thread per element.
+const DEQUANT_SRC: &str = r#"
+#include <cuda_fp16.h>
+extern "C" __global__ void ks_dequant_q4k_f16(
+    const unsigned char* src, half* dst, unsigned long long n16) {
+  unsigned long long c = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+  if (c >= n16) return;
+  unsigned long long e = c * 16ull;
+  const unsigned char* blk = src + (e >> 8) * 144ull;
+  const float d = __half2float(*((const half*)blk));
+  const float dmin = __half2float(*((const half*)(blk + 2)));
+  const unsigned char* scales = blk + 4;
+  const unsigned char* qs = blk + 16;
+  const unsigned j = (unsigned)(e & 255ull);
+  const unsigned group = j >> 6;
+  const unsigned jl = j & 63u;
+  const unsigned is = (group << 1) | (jl >= 32u ? 1u : 0u);
+  const unsigned qbase = (group << 5) | (jl & 16u);
+  unsigned char sc, mn;
+  if (is < 4u) {
+    sc = (unsigned char)(scales[is] & 63u);
+    mn = (unsigned char)(scales[is + 4u] & 63u);
+  } else {
+    sc = (unsigned char)((scales[is + 4u] & 0x0Fu) | ((scales[is - 4u] & 0xC0u) >> 2));
+    mn = (unsigned char)((scales[is + 4u] >> 4) | ((scales[is] & 0xC0u) >> 2));
+  }
+  const float scale = d * (float)sc;
+  const float m = dmin * (float)mn;
+  const bool hi = jl >= 32u;
+  half* out = dst + e;
+#pragma unroll
+  for (unsigned l = 0u; l < 16u; l += 4u) {
+    const unsigned bits = *(const unsigned*)(qs + qbase + l);
+    float n0, n1, n2, n3;
+    if (!hi) {
+      n0 = (float)(bits & 0xFu);
+      n1 = (float)((bits >> 8) & 0xFu);
+      n2 = (float)((bits >> 16) & 0xFu);
+      n3 = (float)((bits >> 24) & 0xFu);
+    } else {
+      n0 = (float)((bits >> 4) & 0xFu);
+      n1 = (float)((bits >> 12) & 0xFu);
+      n2 = (float)((bits >> 20) & 0xFu);
+      n3 = (float)((bits >> 28) & 0xFu);
+    }
+    out[l] = __float2half(scale * n0 - m);
+    out[l + 1u] = __float2half(scale * n1 - m);
+    out[l + 2u] = __float2half(scale * n2 - m);
+    out[l + 3u] = __float2half(scale * n3 - m);
+  }
+}
+
+static __device__ float ks_q6k_at(const unsigned char* blk, unsigned j) {
+  const unsigned hpart = j >> 7;
+  const unsigned char* ql = blk + hpart * 64u;
+  const unsigned char* qh = blk + 128u + hpart * 32u;
+  const signed char* sc = (const signed char*)(blk + 192u) + hpart * 8u;
+  const float d = __half2float(*((const half*)(blk + 208)));
+  const unsigned jl = j & 127u;
+  const unsigned l = jl & 31u;
+  const unsigned is = l >> 4;
+  int q;
+  if (jl < 32u) {
+    q = (int)((ql[l] & 0x0Fu) | (((qh[l] >> 0) & 3) << 4)) - 32;
+    return d * (float)sc[is] * (float)q;
+  } else if (jl < 64u) {
+    q = (int)((ql[l + 32u] & 0x0Fu) | (((qh[l] >> 2) & 3) << 4)) - 32;
+    return d * (float)sc[is + 2] * (float)q;
+  } else if (jl < 96u) {
+    q = (int)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+    return d * (float)sc[is + 4] * (float)q;
+  } else {
+    q = (int)((ql[l + 32u] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+    return d * (float)sc[is + 6] * (float)q;
+  }
+}
+
+extern "C" __global__ void ks_dequant_q6k_f16(
+    const unsigned char* src, half* dst, unsigned long long n) {
+  unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  dst[i] = __float2half(ks_q6k_at(src + (i >> 8) * 210ull, (unsigned)(i & 255ull)));
+}
+
+/* Sum split-K F32 partials into the F16 GEMM output:
+   out[i] = sum_s parts[s * nm + i]. */
+extern "C" __global__ void ks_f16_mm_reduce(
+    const float* parts, half* out, unsigned long long nm, unsigned splits) {
+  unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x;
+  if (i >= nm) return;
+  float acc = 0.0f;
+  for (unsigned s = 0u; s < splits; ++s) {
+    acc += parts[(unsigned long long)s * nm + i];
+  }
+  out[i] = __float2half(acc);
+}
+"#;
+
 /// A loaded kernel entry point (a `CUfunction` belonging to its context's module).
 ///
 /// `Copy` because it is a bare handle: the module is owned by the
@@ -598,6 +1115,26 @@ impl Buffer {
 #[derive(Clone, Copy, Debug)]
 pub struct Kernel {
     func: ffi::CUfunction,
+}
+
+/// Opaque driver event handle for phase timing. Pass it back to the
+/// [`CudaContext`] methods; it is `Copy` and freed with
+/// [`CudaContext::phase_event_destroy`].
+#[derive(Clone, Copy, Debug)]
+pub struct PhaseEvent {
+    ev: ffi::CUevent,
+}
+
+impl PhaseEvent {
+    /// Raw `CUevent`, for the backend-neutral wrapper in `ksearch_compute`.
+    pub fn raw(&self) -> ffi::CUevent {
+        self.ev
+    }
+
+    /// Wrap a raw `CUevent` produced by this crate's context.
+    pub fn from_raw(ev: ffi::CUevent) -> Self {
+        PhaseEvent { ev }
+    }
 }
 
 impl Kernel {

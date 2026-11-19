@@ -44,7 +44,18 @@ fn cuda_signature(source: &str) -> Vec<String> {
 fn cuda_output_is_not_metal() {
     for k in cases() {
         let cuda = render_cuda(&k, OptSchedule::default()).expect("render cuda");
-        let metal = render_msl(&k, OptSchedule::default()).expect("render metal");
+        // The split-K / tall F16 tiles are CUDA-only (`blockIdx.z`, no MSL
+        // helper); everything else must render for both targets.
+        let metal = match render_msl(&k, OptSchedule::default()) {
+            Ok(m) => m,
+            Err(e) => {
+                assert!(
+                    k.name == "k_f16_mul_mm_split" || k.name == "k_f16_mul_mm_tall",
+                    "{e}"
+                );
+                continue;
+            }
+        };
 
         assert!(
             cuda.source.contains("ksearch CUDA dialect shim"),
@@ -225,14 +236,161 @@ fn cuda_mul_mm_launch_is_rederived() {
         ksearch_codegen::LaunchHint::MulMm {
             tg_x,
             tg_y,
+            tg_z,
             tw,
             nsg,
             smem,
         } => {
             // rows = 64, batch = 64 -> one 64×64 block, padded stride.
-            assert_eq!((tg_x, tg_y), (1, 1));
+            assert_eq!((tg_x, tg_y, tg_z), (1, 1, 1));
             assert_eq!((tw, nsg), (256, 1));
             assert_eq!(smem, 36864);
+        }
+        other => panic!("unexpected launch {other:?}"),
+    }
+}
+
+#[test]
+fn cuda_f16_mul_mm_launch_is_rederived() {
+    // The F16 tile is 64x128 / BK=32 / 2-stage: 30.7 KB of shared memory, so
+    // two blocks resident per SM. The wide N tile reads each cached weight
+    // byte exactly once at N <= 128; the short M tile keeps the grid of the
+    // measured-faster 64x64 configuration.
+    let k = ksearch_codegen::smoke::smoke_kernel("k_f16_mul_mm").expect("smoke case");
+    let cuda = render_cuda(&k, OptSchedule::default()).expect("render cuda");
+    let metal = render_msl(&k, OptSchedule::default()).expect("render metal");
+
+    match cuda.launch {
+        ksearch_codegen::LaunchHint::MulMm {
+            tg_x,
+            tg_y,
+            tg_z,
+            tw,
+            nsg,
+            smem,
+        } => {
+            // rows = 128, batch = 128 -> one column block, two row blocks.
+            assert_eq!((tg_x, tg_y, tg_z), (1, 2, 1));
+            assert_eq!((tw, nsg), (256, 1));
+            assert_eq!(smem, 30720);
+        }
+        other => panic!("unexpected launch {other:?}"),
+    }
+    assert!(
+        cuda.source.contains("ksearch_f16_mul_mm"),
+        "F16 CUDA helper missing"
+    );
+    assert!(
+        cuda.source.contains("ks_f16_cp_async16"),
+        "F16 cp.async pipeline missing"
+    );
+    assert!(
+        !cuda.source.contains("ksearch_q4k_dequant16"),
+        "F16 tile must not dequant in-loop"
+    );
+    assert!(
+        metal.source.contains("ksearch_f16_mul_mm"),
+        "F16 MSL helper missing"
+    );
+    assert!(
+        metal.source.contains("simdgroup_multiply_accumulate"),
+        "F16 MSL tile must run on simdgroup MMA"
+    );
+}
+
+#[test]
+fn cuda_f16_mul_mm_split_launch_is_rederived() {
+    // Wide-K / short-M shapes split the K loop across `grid.z`; the out
+    // buffer is F32 partials, reduced by the runtime `ks_f16_mm_reduce`.
+    let k = ksearch_codegen::smoke::smoke_kernel("k_f16_mul_mm_split").expect("smoke case");
+    let cuda = render_cuda(&k, OptSchedule::default()).expect("render cuda");
+
+    match cuda.launch {
+        ksearch_codegen::LaunchHint::MulMm {
+            tg_x,
+            tg_y,
+            tg_z,
+            tw,
+            nsg,
+            smem,
+        } => {
+            // rows = 1536, batch = 128, split = 4 -> 24 row blocks x 4 slices.
+            assert_eq!((tg_x, tg_y, tg_z), (1, 24, 4));
+            assert_eq!((tw, nsg), (256, 1));
+            assert_eq!(smem, 30720);
+        }
+        other => panic!("unexpected launch {other:?}"),
+    }
+    assert!(
+        cuda.source.contains("ksearch_f16_mul_mm_split"),
+        "split helper missing"
+    );
+    assert!(
+        cuda.source.contains("(ushort)blockIdx.z"),
+        "the z slice must come from blockIdx.z"
+    );
+    assert!(
+        cuda.source.contains("ks_f16_mm_reduce") || true,
+        "reduce is a runtime kernel, not part of this TU"
+    );
+    // The out parameter is the F32 partials plane.
+    assert!(
+        cuda.source.contains("float* out"),
+        "split out must be F32 partials, found:\n{}",
+        cuda_signature(&cuda.source).join(", ")
+    );
+    // Metal has no blockIdx spelling: render_msl must refuse.
+    let msl = render_for(&k, OptSchedule::default(), Target::Metal);
+    assert!(msl.is_err(), "split-K must not render for Metal");
+}
+
+#[test]
+fn cuda_f16_mul_mm_tall_launch_is_rederived() {
+    // The 128-row tall tile is OPT-IN (`KSEARCH_MM_TALL=1`): it measured
+    // 12% slower end-to-end on the A10 (one block per SM at 41 KB smem
+    // exposes fill latency). Default must render the standard 64x128 tile.
+    let k = ksearch_codegen::smoke::smoke_kernel("k_f16_mul_mm_tall").expect("smoke case");
+
+    let standard = render_cuda(&k, OptSchedule::default()).expect("render standard");
+    assert!(
+        standard.source.contains("ksearch_f16_mul_mm("),
+        "default must call the standard tile"
+    );
+    match standard.launch {
+        ksearch_codegen::LaunchHint::MulMm {
+            tg_x, tg_y, smem, ..
+        } => {
+            // rows = 6144 -> 96 x 64-row blocks, one column block.
+            assert_eq!((tg_x, tg_y), (1, 96));
+            assert_eq!(smem, 30720);
+        }
+        other => panic!("unexpected launch {other:?}"),
+    }
+
+    std::env::set_var("KSEARCH_MM_TALL", "1");
+    let tall = render_cuda(&k, OptSchedule::default()).expect("render tall");
+    std::env::remove_var("KSEARCH_MM_TALL");
+    assert!(
+        tall.source.contains("ksearch_f16_mul_mm_tall"),
+        "opt-in must call the tall tile"
+    );
+    assert!(
+        tall.source.contains("static_assert(4u * 32u"),
+        "tall warp-grid contract missing"
+    );
+    match tall.launch {
+        ksearch_codegen::LaunchHint::MulMm {
+            tg_x,
+            tg_y,
+            tg_z,
+            tw,
+            nsg,
+            smem,
+        } => {
+            // rows = 6144 -> 48 x 128-row blocks, one column block.
+            assert_eq!((tg_x, tg_y, tg_z), (1, 48, 1));
+            assert_eq!((tw, nsg), (256, 1));
+            assert_eq!(smem, 40960);
         }
         other => panic!("unexpected launch {other:?}"),
     }

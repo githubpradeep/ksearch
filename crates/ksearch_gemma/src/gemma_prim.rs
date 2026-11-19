@@ -5,7 +5,7 @@ use crate::mtp::MtpDraft;
 use crate::sample::sample_softcap_min_p;
 use crate::{GemmaConfig, GenerateStats, KvPool, LayerMeta, LayerNorms, SlotId};
 use anyhow::{anyhow, bail, Result};
-use ksearch_compute::{Buffer, Context};
+use ksearch_compute::{Backend, Buffer, Context};
 use ksearch_gguf::{dequant_row_to_f32, f32_to_f16, ggml_type, quantize_f32_to_q4k, Gguf};
 use ksearch_ir::{q40_nbytes, q40_row_bytes, DType};
 use ksearch_kernels::Eng;
@@ -88,6 +88,24 @@ impl WeightBuf {
     }
 }
 
+/// One event-bracketed prefill GEMM ([`GemmaPrimModel::matvec_w_batch`]).
+struct MmProfPair {
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    a: ksearch_compute::PhaseEventHandle,
+    b: ksearch_compute::PhaseEventHandle,
+}
+
+/// Per-shape totals printed after a prefill pass.
+struct MmShapeStat {
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    calls: u64,
+    ms: f64,
+}
+
 pub struct GemmaPrimModel {
     pub cfg: GemmaConfig,
     pub vocab: Option<ksearch_gguf::Vocab>,
@@ -135,6 +153,22 @@ pub struct GemmaPrimModel {
     ple_u: Buffer,
     ple_proj: Buffer,
     meta: Vec<Buffer>,
+    /// Device pointers of `meta`, one `u64` per layer. CUDA decode fills through this.
+    meta_ptrs: Buffer,
+    /// Host-packed prefill metadata (4 floats per layer) scattered once per chunk.
+    meta_stage: Buffer,
+    /// GPU `f32` position. Incremented on device after each decode token.
+    decode_pos: Buffer,
+    /// Next slot in `decode_ids`. Advanced on device by the replayed graph.
+    decode_step: Buffer,
+    /// Greedy ids for a no-readback decode bench. One `f32` per step.
+    decode_ids: Buffer,
+    /// Bit `i` set when layer `i` uses the sliding window. Fits the 35-layer model.
+    swa_mask: u64,
+    decode_pos_live: bool,
+    /// Capture failed once; later tokens stay on the eager launch path.
+    graph_failed: bool,
+    meta_ready: bool,
     rope_swa: Buffer,
     rope_full: Buffer,
     hd_swa: usize,
@@ -144,6 +178,18 @@ pub struct GemmaPrimModel {
     kv_v: Vec<Buffer>,
     eng: Eng,
     weight_bufs: HashMap<String, WeightBuf>,
+    /// Dequant-once F16 prefill cache (CUDA), keyed like `weight_bufs`.
+    f16_bufs: HashMap<String, Buffer>,
+    /// Total F16-cache bytes, reported once.
+    f16_cache_bytes: u64,
+    /// CUDA + `KSEARCH_PREFILL_F16!=0`: batch>8 GEMMs run on the F16 cache.
+    prefill_f16: bool,
+    /// `KSEARCH_MM_PROF=1`: event-bracket every prefill GEMM, report per shape.
+    mm_prof: bool,
+    /// Open `(rows, cols, batch)` event pairs awaiting the prefill report.
+    mm_prof_open: Vec<MmProfPair>,
+    /// F32 split-K partials, `[KSEARCH_MM_SPLIT, PREFILL_CHUNK, 2048]`.
+    mm_parts: Buffer,
     max_seq: usize,
     pub pos: usize,
     decode_src: usize,
@@ -168,6 +214,23 @@ impl GemmaPrimModel {
 
         let ctx = Context::new()?;
         eprintln!("GPU: {} ({})", ctx.device_name(), ctx.backend().as_str());
+        // Dequant-once F16 prefill cache: CUDA-only, on by default, opt out
+        // with KSEARCH_PREFILL_F16=0 (it costs ~2.6 B/weight of VRAM).
+        let prefill_f16 = ctx.backend() == Backend::Cuda
+            && std::env::var("KSEARCH_PREFILL_F16")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        // Per-GEMM prefill timing (device events, CUDA only).
+        let mm_prof = ctx.backend() == Backend::Cuda
+            && std::env::var("KSEARCH_MM_PROF")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+        // Split-K partials for wide-K / short-M prefill shapes (down-proj,
+        // o-proj): `[split, chunk, 2048]` F32.
+        let mm_parts = {
+            let split = Eng::matvec_split_k(1536, 12288).max(1);
+            ctx.buffer_empty_f32(split * PREFILL_CHUNK * 2048)
+        };
 
         let embd_name = "token_embd.weight";
         let token_embd = if g.tensor_type(embd_name) == ggml_type::Q4_K {
@@ -231,10 +294,21 @@ impl GemmaPrimModel {
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            meta.push(
-                ctx.buffer_empty_bytes(32),
-            );
+            meta.push(ctx.buffer_empty_bytes(32));
         }
+        let meta_ptrs = ctx.buffer_empty_bytes(cfg.n_layers * 8);
+        let meta_stage = ctx.buffer_empty_f32(cfg.n_layers * 4);
+        let decode_pos = ctx.buffer_empty_bytes(4);
+        let decode_step = ctx.buffer_empty_bytes(4);
+        let decode_ids = ctx.buffer_empty_f32(max_seq);
+        let swa_mask = cfg
+            .swa_pattern
+            .iter()
+            .take(64)
+            .enumerate()
+            .fold(0u64, |mask, (i, swa)| {
+                if *swa { mask | (1u64 << i) } else { mask }
+            });
         let rope_swa = {
             let hd = cfg.head_dim_swa;
             let bytes = precompute_rope_table(max_seq, hd, cfg.rope_theta_swa, hd / 2);
@@ -248,14 +322,16 @@ impl GemmaPrimModel {
         };
 
         let t = PREFILL_CHUNK;
+        // Decode and prefill SDPA take independent NWG knobs; the shared
+        // partials buffer must fit the larger of the two.
+        let attn_nwg = Eng::sdpa_mwg_nwg().max(Eng::sdpa_mwg_nwg_prefill());
         let x = ctx.buffer_empty_f16(t * cfg.hidden);
         let x2 = ctx.buffer_empty_f16(t * cfg.hidden);
         let tmp_q = ctx.buffer_empty_f16(t * cfg.n_heads * max_hd);
         let tmp_k = ctx.buffer_empty_f16(t * cfg.n_kv * max_hd);
         let tmp_v = ctx.buffer_empty_f16(t * cfg.n_kv * max_hd);
         let tmp_o = ctx.buffer_empty_f16(t * cfg.n_heads * max_hd);
-        let tmp_attn_mwg =
-            ctx.buffer_empty_f32(t * cfg.n_heads * Eng::SDPA_MWG_NWG * (max_hd + 2));
+        let tmp_attn_mwg = ctx.buffer_empty_f32(t * cfg.n_heads * attn_nwg * (max_hd + 2));
         let tmp_ff1 = ctx.buffer_empty_f16(t * max_ff);
         let tmp_ff2 = ctx.buffer_empty_f16(t * max_ff);
         let tmp_ff3 = ctx.buffer_empty_f16(t * max_ff.max(ple_total));
@@ -351,6 +427,15 @@ impl GemmaPrimModel {
             ple_u,
             ple_proj,
             meta,
+            meta_ptrs,
+            meta_stage,
+            decode_pos,
+            decode_step,
+            decode_ids,
+            swa_mask,
+            decode_pos_live: false,
+            graph_failed: false,
+            meta_ready: false,
             rope_swa,
             rope_full,
             hd_swa: cfg.head_dim_swa,
@@ -359,6 +444,12 @@ impl GemmaPrimModel {
             kv_v,
             eng,
             weight_bufs: HashMap::new(),
+            f16_bufs: HashMap::new(),
+            f16_cache_bytes: 0,
+            prefill_f16,
+            mm_prof,
+            mm_prof_open: Vec::new(),
+            mm_parts,
             max_seq,
             pos: 0,
             decode_src: 0,
@@ -495,6 +586,38 @@ impl GemmaPrimModel {
             .matvec_wd(&self.ctx, rows, cols, wd, &w, &x, &y)
     }
 
+    /// Lazy F16 copy of a packed weight for the prefill GEMM (CUDA only).
+    ///
+    /// The one-time `dequant_f16` kernel costs a few ms per tensor and ~2.6 B
+    /// of VRAM per weight; in exchange every later `batch > 8` GEMM streams
+    /// F16 tiles with `cp.async` instead of dequantizing inside the K-loop.
+    fn ensure_f16_weight(&mut self, name: &str, rows: usize, cols: usize) -> Result<Option<Buffer>> {
+        if let Some(b) = self.f16_bufs.get(name) {
+            return Ok(Some(b.clone()));
+        }
+        let (dt, src) = {
+            let w = self.weight_bufs.get(name).unwrap();
+            (w.dtype(), w.buf().clone())
+        };
+        if !is_packed(dt) {
+            return Ok(None);
+        }
+        let n = rows * cols;
+        if n == 0 || n % 256 != 0 {
+            return Ok(None);
+        }
+        let dst = self.ctx.buffer_empty_bytes(n * DType::F16.size_bytes());
+        self.ctx.dequant_f16(&src, &dst, n, dt)?;
+        self.f16_cache_bytes += (n * DType::F16.size_bytes()) as u64;
+        if self.f16_bufs.is_empty() {
+            eprintln!(
+                "[prim] prefill F16 weight cache enabled (KSEARCH_PREFILL_F16=0 disables)"
+            );
+        }
+        self.f16_bufs.insert(name.to_string(), dst.clone());
+        Ok(Some(dst))
+    }
+
     fn matvec_w_batch(
         &mut self,
         rows: usize,
@@ -505,11 +628,122 @@ impl GemmaPrimModel {
         batch: usize,
     ) -> Result<()> {
         self.ensure_weight(name)?;
-        let w = self.weight_bufs.get(name).unwrap();
-        let wd = w.dtype();
-        let w = w.buf().clone();
-        self.eng
-            .matvec_batch(&self.ctx, rows, cols, batch, wd, &w, &x, &y)
+        // KSEARCH_MM_PROF: bracket the GEMM itself (weight caches and kernel
+        // compilation happen before the first event, so warmups don't pollute
+        // later passes).
+        let ev0 = if self.mm_prof {
+            self.ctx.phase_event_mark(false).ok()
+        } else {
+            None
+        };
+        let ran = if self.prefill_f16 && batch > 8 {
+            if let Some(f16) = self.ensure_f16_weight(name, rows, cols)? {
+                if Eng::matvec_split_k(rows, cols) > 1 {
+                    // Wide-K / short-M shape: split the K loop across blocks.
+                    Some(self.eng.matvec_batch_split(
+                        &self.ctx,
+                        rows,
+                        cols,
+                        batch,
+                        &f16,
+                        &x,
+                        &self.mm_parts,
+                        &y,
+                    ))
+                } else {
+                    Some(
+                        self.eng
+                            .matvec_batch(&self.ctx, rows, cols, batch, DType::F16, &f16, &x, &y),
+                    )
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let ran = match ran {
+            Some(r) => r?,
+            None => {
+                let w = self.weight_bufs.get(name).unwrap();
+                let wd = w.dtype();
+                let w = w.buf().clone();
+                self.eng
+                    .matvec_batch(&self.ctx, rows, cols, batch, wd, &w, &x, &y)?
+            }
+        };
+        if let Some(a) = ev0 {
+            if let Ok(b) = self.ctx.phase_event_mark(false) {
+                self.mm_prof_open.push(MmProfPair {
+                    rows,
+                    cols,
+                    batch,
+                    a,
+                    b,
+                });
+            } else {
+                self.ctx.phase_event_destroy(a);
+            }
+        }
+        Ok(ran)
+    }
+
+    /// Per-shape GEMM report for the prefill pass ([`GemmaPrimModel::mm_prof`]).
+    ///
+    /// One table per `prefill_chunk` call (one full model pass): calls, total
+    /// ms, ms per call, and effective TFLOPS per shape, sorted by time. The
+    /// pass total answers which of the two remaining prefill stories is true:
+    /// a uniform ~18 TFLOPS ceiling on every shape (the WMMA tile itself), or
+    /// a per-GEMM latency floor that dominates the small shapes (fusion work).
+    fn flush_mm_prof(&mut self, pass_wall_ms: f64) {
+        const CAP: usize = 4096;
+        if self.mm_prof_open.len() > CAP {
+            for p in self.mm_prof_open.drain(..CAP) {
+                self.ctx.phase_event_destroy(p.a);
+                self.ctx.phase_event_destroy(p.b);
+            }
+        }
+        let mut stats: Vec<MmShapeStat> = Vec::new();
+        let mut total_ms = 0.0f64;
+        for p in self.mm_prof_open.drain(..) {
+            let ms = self.ctx.phase_event_elapsed_ms(p.a, p.b).unwrap_or(0.0);
+            self.ctx.phase_event_destroy(p.a);
+            self.ctx.phase_event_destroy(p.b);
+            total_ms += ms;
+            match stats.iter_mut().find(|s| {
+                s.rows == p.rows && s.cols == p.cols && s.batch == p.batch
+            }) {
+                Some(s) => {
+                    s.calls += 1;
+                    s.ms += ms;
+                }
+                None => stats.push(MmShapeStat {
+                    rows: p.rows,
+                    cols: p.cols,
+                    batch: p.batch,
+                    calls: 1,
+                    ms,
+                }),
+            }
+        }
+        stats.sort_by(|x, y| y.ms.partial_cmp(&x.ms).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("[mm-prof] prefill pass: GEMM {total_ms:.1} ms of {pass_wall_ms:.1} ms wall");
+        for s in &stats {
+            // GFLOP across all calls of this shape; GFLOP / ms = TFLOPS.
+            let gflop = 2.0 * s.rows as f64 * s.cols as f64 * s.batch as f64 * s.calls as f64
+                / 1e9;
+            let tflops = gflop / s.ms.max(1e-9);
+            eprintln!(
+                "  {rows:>6}x{cols:<6} b{batch:<4} calls={calls:<3} {ms:7.2} ms  {per:6.3} ms/call  {tflops:6.2} TFLOPS",
+                rows = s.rows,
+                cols = s.cols,
+                batch = s.batch,
+                calls = s.calls,
+                ms = s.ms,
+                per = s.ms / s.calls as f64,
+                tflops = tflops,
+            );
+        }
     }
 
     fn rmsnorm_matvec_w(
@@ -666,6 +900,129 @@ impl GemmaPrimModel {
         // f32: integers stay exact through max_seq (F16 ULP is 2+ past 2048).
         self.ctx
             .write_f32_at(&self.meta[layer], 0, &[tlen as f32, start as f32, window as f32]);
+    }
+
+    fn ensure_meta_table(&mut self) -> Result<()> {
+        if self.meta_ready || self.ctx.backend() != Backend::Cuda {
+            return Ok(());
+        }
+        self.ctx.publish_ptr_table(&self.meta, &self.meta_ptrs)?;
+        self.meta_ready = true;
+        Ok(())
+    }
+
+    /// One device launch writes every layer's `(tlen, start)` from `decode_pos`.
+    fn publish_decode_meta(&mut self) -> Result<()> {
+        let n = self.cfg.n_layers;
+        let window = self.cfg.sliding_window;
+        if self.ctx.backend() == Backend::Cuda && n <= 64 {
+            self.ensure_meta_table()?;
+            if !self.decode_pos_live {
+                self.ctx
+                    .write_f32_at(&self.decode_pos, 0, &[self.pos as f32]);
+                self.decode_pos_live = true;
+            }
+            self.ctx.fill_decode_meta(
+                &self.meta_ptrs,
+                &self.decode_pos,
+                self.swa_mask,
+                n as u32,
+                window as u32,
+            )?;
+            return Ok(());
+        }
+        self.ctx
+            .write_f32_at(&self.decode_pos, 0, &[self.pos as f32]);
+        for layer in 0..n {
+            let kv_len = self.pos + 1;
+            let (tlen, start) = if self.cfg.is_swa(layer) {
+                let start = kv_len.saturating_sub(window);
+                ((kv_len - start) as u32, start as u32)
+            } else {
+                (kv_len as u32, 0)
+            };
+            self.write_meta(layer, tlen, start);
+        }
+        Ok(())
+    }
+
+    /// Record the two ping-pong tokens. Launches during capture are not executed.
+    fn capture_decode_graphs(&mut self, tok: u32) -> Result<bool> {
+        if self.graph_failed || self.ctx.decode_graphs_ready() {
+            return Ok(self.ctx.decode_graphs_ready());
+        }
+        // The MWG attention kernel is selected from the host length. After a
+        // 128-token prefill every layer stays on that kernel for the bench.
+        if self.ctx.backend() != Backend::Cuda || self.pos + 1 < 128 {
+            return Ok(false);
+        }
+        let saved = self.pos;
+        self.return_token_sync = false;
+        let mut ok = true;
+        for parity in 0..2 {
+            self.pos = saved;
+            self.decode_src = parity;
+            if let Err(err) = self.ctx.begin_decode_capture() {
+                eprintln!("[graph] begin capture failed: {err}");
+                ok = false;
+                break;
+            }
+            let ran = self.forward_token(tok, true).and_then(|_| {
+                let slot = self.decode_src ^ 1;
+                self.ctx.stash_f32_inc(
+                    &self.tok_idx[slot],
+                    &self.decode_ids,
+                    &self.decode_step,
+                )
+            });
+            if let Err(err) = &ran {
+                eprintln!("[graph] capture token failed: {err}");
+                self.ctx.abort_decode_capture();
+                ok = false;
+                break;
+            }
+            if let Err(err) = self.ctx.end_decode_capture(parity) {
+                eprintln!("[graph] end capture failed: {err}");
+                self.ctx.abort_decode_capture();
+                ok = false;
+                break;
+            }
+        }
+        self.pos = saved;
+        self.return_token_sync = true;
+        if !ok {
+            self.graph_failed = true;
+        }
+        Ok(ok && self.ctx.decode_graphs_ready())
+    }
+
+    /// One upload plus a scatter, instead of one host copy per layer.
+    fn publish_prefill_meta(&mut self, pos0: usize, max_seq: usize) -> Result<()> {
+        let n = self.cfg.n_layers;
+        let window = self.cfg.sliding_window;
+        let mut words = vec![0f32; n * 4];
+        for layer in 0..n {
+            let win = if self.cfg.is_swa(layer) {
+                window as u32
+            } else {
+                max_seq as u32
+            };
+            let base = layer * 4;
+            words[base] = (pos0 + 1) as f32;
+            words[base + 1] = 0.0;
+            words[base + 2] = win as f32;
+        }
+        if self.ctx.backend() == Backend::Cuda {
+            self.ensure_meta_table()?;
+            self.ctx.write_buffer(&self.meta_stage, &words);
+            self.ctx.scatter_meta(&self.meta_ptrs, &self.meta_stage, n as u32)?;
+        } else {
+            for layer in 0..n {
+                let b = layer * 4;
+                self.write_meta_win(layer, words[b] as u32, 0, words[b + 2] as u32);
+            }
+        }
+        Ok(())
     }
 
 
@@ -963,6 +1320,7 @@ impl GemmaPrimModel {
         let max_seq = self.max_seq;
         let window = self.cfg.sliding_window;
         let ple_dim = self.cfg.ple_dim;
+        self.publish_decode_meta()?;
         let mut ms_attn = 0.0f64;
         let mut ms_mlp = 0.0f64;
         let mut ms_ple_l = 0.0f64;
@@ -979,13 +1337,11 @@ impl GemmaPrimModel {
                 (lw.q_rows, lw.kv_rows, lw.o_in, lw.ffn_inter, lw.hd)
             };
             let is_swa = self.cfg.is_swa(layer);
-            let rope_hd = if is_swa { self.hd_swa } else { self.hd_full };
             let rope_buf = if is_swa {
                 self.rope_swa.clone()
             } else {
                 self.rope_full.clone()
             };
-            let rope_off = self.pos * rope_hd;
             let pref = format!("blk.{layer}.");
             let owns_kv = self.cfg.owns_kv(layer);
             let kv_src = self.cfg.kv_source(layer);
@@ -1021,8 +1377,7 @@ impl GemmaPrimModel {
                 }
 
             if owns_kv {
-                let kv_off = self.pos * self.cfg.n_kv * q40_row_bytes(hd);
-                self.eng.rmsnorm_per_head_qkv_q40_off(
+                self.eng.rmsnorm_per_head_qkv_q40_pos(
                     &self.ctx,
                     n_heads,
                     self.cfg.n_kv,
@@ -1031,17 +1386,16 @@ impl GemmaPrimModel {
                     &self.tmp_q,
                     &self.layer_norms[layer].q_norm,
                     &rope_buf,
-                    rope_off,
                     &self.tmp_k,
                     &self.layer_norms[layer].k_norm,
                     &self.tmp_v,
+                    &self.decode_pos,
                     &self.tmp_q,
                     &self.kv_k[kv_src],
                     &self.kv_v[kv_src],
-                    kv_off,
                 )?;
             } else {
-                self.eng.rmsnorm_per_head_rope_off(
+                self.eng.rmsnorm_per_head_rope_pos(
                     &self.ctx,
                     n_heads,
                     hd,
@@ -1049,20 +1403,18 @@ impl GemmaPrimModel {
                     &self.tmp_q,
                     &self.layer_norms[layer].q_norm,
                     &rope_buf,
-                    rope_off,
+                    &self.decode_pos,
                     &self.tmp_q,
-                    0,
                 )?;
             }
 
             let kv_len = self.pos + 1;
-            let (attn_t, attn_start) = if is_swa {
+            let attn_t = if is_swa {
                 let start = kv_len.saturating_sub(window);
-                ((kv_len - start) as u32, start as u32)
+                (kv_len - start) as u32
             } else {
-                (kv_len as u32, 0u32)
+                kv_len as u32
             };
-            self.write_meta(layer, attn_t, attn_start);
             self.eng.sdpa_hybrid_kv(
                 &self.ctx,
                 n_heads,
@@ -1254,6 +1606,9 @@ impl GemmaPrimModel {
             self.ctx.phase_mark();
         }
         self.pos += 1;
+        if self.decode_pos_live {
+            self.ctx.inc_decode_pos(&self.decode_pos)?;
+        }
         if !want_logits {
             // Keep GPU pipeline full — host only syncs when reading argmax / generate end.
             if profile {
@@ -1615,6 +1970,7 @@ impl GemmaPrimModel {
 
     /// Seq-parallel prefill for `tokens` (any length). Remainder of 1 uses the decode kernel.
     pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
+        let wall = Instant::now();
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             if chunk.len() == 1 {
                 let _ = self.forward_token(chunk[0], false)?;
@@ -1623,6 +1979,9 @@ impl GemmaPrimModel {
             }
         }
         self.ctx.synchronize()?;
+        if self.mm_prof {
+            self.flush_mm_prof(wall.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(())
     }
 
@@ -1738,6 +2097,7 @@ impl GemmaPrimModel {
         let window = self.cfg.sliding_window;
         let ple_dim = self.cfg.ple_dim;
         let pos0 = self.pos;
+        self.publish_prefill_meta(pos0, max_seq)?;
 
         // Coarse phase syncs only (not per-layer): otherwise profile cost
         // dominates and numbers are useless for optimization.
@@ -1852,16 +2212,11 @@ impl GemmaPrimModel {
             }
 
             let last_tlen = pos0 + t;
-            let (attn_t, win) = if is_swa {
-                (
-                    last_tlen.min(window) as u32,
-                    window as u32,
-                )
+            let attn_t = if is_swa {
+                last_tlen.min(window) as u32
             } else {
-                (last_tlen as u32, max_seq as u32)
+                last_tlen as u32
             };
-            let tlen0 = (pos0 + 1) as u32;
-            self.write_meta_win(layer, tlen0, 0, win);
             self.eng.sdpa_hybrid_kv_batch(
                 &self.ctx,
                 n_heads,
@@ -2150,6 +2505,7 @@ impl GemmaPrimModel {
     pub fn reset(&mut self) {
         self.pos = 0;
         self.decode_src = 0;
+        self.decode_pos_live = false;
         self.return_token_sync = true;
         self.sample_temperature = 0.0;
         self.ctx.synchronize().ok();
@@ -2377,6 +2733,62 @@ impl GemmaPrimModel {
                 self.mtp_copy_hseed(0)?;
                 self.generate_mtp(next, n_new, verbose, eos_stop, &mut out)?;
             }
+        } else if gpu_pipe && !verbose && !eos_stop {
+            // Bench path: token ids stay on the device until the timed loop ends.
+            self.ctx.synchronize()?;
+            self.ctx
+                .write_buffer_nosync(&self.tok_idx[0], &[tok as f32]);
+            if !self.decode_pos_live {
+                self.ctx
+                    .write_f32_at(&self.decode_pos, 0, &[self.pos as f32]);
+                self.decode_pos_live = true;
+            }
+            self.ensure_meta_table()?;
+            self.return_token_sync = false;
+            let replay = self.capture_decode_graphs(tok)?;
+            if replay {
+                self.ctx.write_u32(&self.decode_step, 0)?;
+                let start = self.pos;
+                // Device-event bracket: pure GPU time of the replayed tokens,
+                // free of host enqueue cost (KSEARCH_CUDA_EVENTS=0 to skip).
+                let ev0 = self.ctx.phase_event_mark(true).ok();
+                for i in 0..n_new {
+                    self.ctx.launch_decode_graph(i & 1)?;
+                }
+                if let Some(a) = ev0 {
+                    if let Ok(b) = self.ctx.phase_event_mark(true) {
+                        if let Ok(ms) = self.ctx.phase_event_elapsed_ms(a, b) {
+                            eprintln!(
+                                "[gputime] decode replay: {n_new} tokens in {ms:.2} ms -> {:.3} ms/token (device events)",
+                                ms / n_new.max(1) as f64
+                            );
+                        }
+                        self.ctx.phase_event_destroy(b);
+                    }
+                    self.ctx.phase_event_destroy(a);
+                }
+                // The graphs ran on the capture stream; drain everything
+                // before the host reads `decode_ids` back.
+                self.ctx.synchronize()?;
+                self.pos = start + n_new;
+            } else {
+                for i in 0..n_new {
+                    self.decode_src = i & 1;
+                    let _ = self.forward_token(tok, true)?;
+                    let slot = self.decode_src ^ 1;
+                    self.ctx
+                        .stash_f32(&self.tok_idx[slot], &self.decode_ids, i as u32)?;
+                }
+            }
+            if n_new > 0 {
+                out.extend(
+                    self.ctx
+                        .read_f32(&self.decode_ids, n_new)
+                        .into_iter()
+                        .map(|v| v as u32),
+                );
+            }
+            self.return_token_sync = true;
         } else if gpu_pipe {
             self.ctx.synchronize()?;
             self.ctx

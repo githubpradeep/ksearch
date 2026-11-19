@@ -133,9 +133,15 @@ fn sk_from_hint(
             x,
             w,
             cos_sin,
-        } => ScheduledKernel {
+            pos,
+        } => {
+            let mut inputs = vec![*x, *w, *cos_sin];
+            if let Some(p) = pos {
+                inputs.push(*p);
+            }
+            ScheduledKernel {
             name: format!("k_rms_ph_rope_{}", out.0),
-            inputs: vec![*x, *w, *cos_sin],
+            inputs,
             output: out,
             kind: KernelKind::RmsNormPerHeadRope {
                 n_heads: *n_heads,
@@ -146,8 +152,10 @@ fn sk_from_hint(
                 x: *x,
                 w: *w,
                 cos_sin: *cos_sin,
+                device_pos: pos.is_some(),
             },
-        },
+        }
+        }
         FuseHint::RmsNormPerHeadRopeQ40 {
             n_heads,
             hd,
@@ -202,9 +210,15 @@ fn sk_from_hint(
             k,
             kw,
             v,
-        } => ScheduledKernel {
+            pos,
+        } => {
+            let mut inputs = vec![*q, *qw, *cos_sin, *k, *kw, *v];
+            if let Some(p) = pos {
+                inputs.push(*p);
+            }
+            ScheduledKernel {
             name: format!("k_rms_ph_qkv_q40_{}", out.0),
-            inputs: vec![*q, *qw, *cos_sin, *k, *kw, *v],
+            inputs,
             output: out,
             kind: KernelKind::RmsNormPerHeadQkvQ40 {
                 n_q: *n_q,
@@ -218,8 +232,10 @@ fn sk_from_hint(
                 k: *k,
                 kw: *kw,
                 v: *v,
+                device_pos: pos.is_some(),
             },
-        },
+        }
+        }
         FuseHint::Rope {
             n_heads,
             hd,
@@ -316,6 +332,26 @@ fn sk_from_hint(
                 },
             }
         }
+        FuseHint::MulMmF16Split {
+            rows,
+            cols,
+            batch,
+            split,
+            w,
+            x,
+        } => ScheduledKernel {
+            name: format!("k_mm_f16_split_{split}_{}", out.0),
+            inputs: vec![*w, *x],
+            output: out,
+            kind: KernelKind::MulMmF16Split {
+                rows: *rows,
+                cols: *cols,
+                batch: *batch,
+                split: *split,
+                matrix: *w,
+                vector: *x,
+            },
+        },
         FuseHint::RmsNormRows { n, rows, eps, x, w } => ScheduledKernel {
             name: format!("k_rms_rows_{}", out.0),
             inputs: vec![*x, *w],

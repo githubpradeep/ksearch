@@ -145,17 +145,133 @@ generated kernels can be validated in CI without a CUDA toolchain.
 - **Launches**: `launch_config(&LaunchHint, tg)` maps each IR launch kind to
   `(grid, block, smem)`; `LaunchHint::MulMm` carries the tile and shared-memory
   size, everything else derives from the element/row count and `KSEARCH_TG`.
-- **Telemetry**: there are no GPU counters here. `Context::phase_mark` /
-  `resolve_phase_times_ms` record host-side phase times instead, and
-  `take_telemetry()` reports dispatches with a host-measured enqueue time. Do
-  not compare those numbers against Metal's GPU timings.
+- **Telemetry**: `Context::phase_mark` / `resolve_phase_times_ms` record
+  **device events** on CUDA (`cuEventRecord` on the stream the bracketed work
+  was enqueued on), so `KSEARCH_PHASE_GPUTIME` reports real GPU milliseconds
+  — one event per mark, freed at resolve. `KSEARCH_CUDA_EVENTS=0` falls back
+  to host instants. `take_telemetry()` stays host-side enqueue accounting.
+  Replayed decode graphs cannot be phase-marked from inside `forward_token`;
+  the bench path brackets the whole replay loop instead and prints
+  `[gputime] decode replay: N tokens in X ms -> Y ms/token (device events)`.
+
+## Prefill: the dequant-once F16 weight cache
+
+The Q4_K/Q6_K prefill tile dequantizes every weight **inside the K-loop** —
+per chunk, per repeat. llama.cpp's pp path does not: since the MMQ work its
+default GEMM keeps quantized loads out of the critical path, and the older
+dequant-to-F16-plus-cuBLAS route cached the dequantized copy once. ksearch
+now does the same, compiler-style:
+
+- `matvec_w_batch` (batch > 8, CUDA) dequantizes each packed weight tensor
+  **once** with a standalone runtime kernel (`ks_dequant_q4k_f16` /
+  `ks_dequant_q6k_f16` — the exact `ksearch_load_*` recipes as plain CUDA)
+  and caches the F16 copy (`GemmaPrimModel::f16_bufs`).
+- Every later chunk runs `KirStmt::MulMmF16`: the same `m16n16k16` WMMA core
+  as the Q4_K tile, on a **64×128 output tile with BK=32 and a two-stage
+  `cp.async` double buffer on both tiles** — no dequant in the loop, so the
+  weight tile streams exactly like the activation tile.
+- Both tile dimensions are A10 measurements, not defaults from a table:
+  - **BN=128**: a 64-wide column tile runs two column blocks at a 128-token
+    pass and streams **every weight byte twice**. Removing the dequant alone
+    (64×64 tile) bought only +8.6% — the kernel was traffic-bound, not
+    dequant-bound. BN=128 reads each cached weight once.
+  - **BM=64, two stages (30.7 KB smem)**: the 128×128 variant (61.4 KB, one
+    block per SM) collapsed the grid — a `rows=256` GEMM was 2 blocks on
+    72 SMs — and prefill regressed 4,164 → 2,486 tok/s. BM=64 restores 4× the
+    blocks and the two-resident-blocks-per-SM overlap.
+  - **32×32 register-blocked warp tile** (2×2 accumulator fragments in a
+    2×4 warp grid): with the aspect-ratio problem fixed by split-K, every big
+    shape measured a uniform ~30 TFLOPS. That is the shared-memory bandwidth
+    ceiling of a 16-row warp tile — 2.5 KB of `ldmatrix` traffic per 4 MMAs.
+    The 32×32 warp tile cuts bytes per MAC by 5× and moves the limit toward
+    the tensor cores. The first attempt used 32×64 warp tiles, which
+    **over-cover** the 64×128 block (8 warps for 4 slots): the extra four
+    warps read columns 128–255 of a 128-column B stage and faulted the
+    context — the async error then surfaced as
+    `cuModuleLoadData: ILLEGAL_ADDRESS` at the next kernel compile. The
+    `static_assert`s in the helper now make "the warp grid must tile the
+    block" a compile-time contract, checked by nvcc and by the headless
+    clang parse.
+
+**Where the tile search stopped (five variants, one winner).** The
+64×128 / 30.7 KB / two-resident-blocks-per-SM configuration is the measured
+optimum of this WMMA family on the A10, at a uniform ~30 TFLOPS — close to
+the weight-stream fill rate, not the tensor peak. Every configuration that
+spent more shared memory lost: 128×128 at 61.4 KB (−40%), the 128-row tall
+tile at 41 KB (−12% end-to-end, tall shapes 1.26–2.07× per call), even
+though both halved the activation re-reads the byte model blamed. Those
+re-reads were L2 hits all along (the 384 KB X strip is resident); what
+actually hides the per-block fill latency is the **second resident block**,
+and 30.7 KB is the budget that keeps two. Treat smem > 30 KB on this kernel
+family as an occupancy regression until measured otherwise
+(`KSEARCH_MM_TALL=1` re-enables the tall tile for A/B on other parts).
+Beyond this point the prefill gap lives in attention (4.3 ms by phase
+split, untouched) and small-GEMM latency floors — not the tile.
+- Kernels with ≥ 24 KB dynamic smem request a max carveout hint
+  (`CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT`).
+- **Split-K for wide-K / short-M shapes** (`rows <= 2048 && cols >= 2048`,
+  `KSEARCH_MM_SPLIT` overrides, default 4): the down-projections. A10
+  per-shape profiling showed the aspect-ratio signature — tall-M shapes
+  reached 33–57 TFLOPS while `1536×12288` ran at 13.7, because `M = 1536` is
+  only 24 blocks on 72 SMs with a 384-step K-loop. `grid.z = split` gives
+  each block a K-slice into F32 partials `[split, batch, rows]`, and the
+  runtime `ks_f16_mm_reduce` sums the planes into the F16 result. The graph
+  op is `Graph::mul_mm_f16_split` (CUDA-only; MSL render refuses it).
+- Numerics: the dequant tile already rounded weights to half in shared memory,
+  so the cache stores the same values the WMMA path consumed. The `"Hi"`
+  gate is unchanged.
+- Cost: ~2.6 B of VRAM per weight element (E2B ≈ +1.6 GB, E4B ≈ +3.6 GB on
+  top of the packed weights) and a few ms of one-time dequant per tensor,
+  paid on the first large prefill. Opt out with `KSEARCH_PREFILL_F16=0`.
+
+Decode is untouched by design: a gemv must read the packed 4.5-bit form
+(3.5× fewer bytes than F16), so the cache is built lazily and only the
+batch > 8 GEMM path consults it.
+
+## Attribution on device (`KSEARCH_MM_PROF`)
+
+The A10 answered the plateau question. `KSEARCH_MM_PROF=1` brackets every
+prefill GEMM with device events and prints calls / total ms / ms-per-call /
+effective TFLOPS per shape, sorted by time. The measured table was not a
+uniform ceiling: tall-M shapes ran at 33–57 TFLOPS while their transposes
+(the down-projections, `1536×12288` at 13.7) collapsed — 24 blocks on 72 SMs
+with a 384-step K-loop. That finding became the split-K path above. What
+remains after split-K lands is judged the same way:
+
+- still-slow big shapes → the WMMA tile itself (`mma.sync` / `ldmatrix`
+  route),
+- small shapes at per-call floors (k/v at 2.4 TFLOPS × 59 calls, PLE) →
+  fusing q/k/v at dequant-cache time.
+
+Related knobs: `KSEARCH_PREFILL_PROF=1` prints the coarse per-phase split
+(qkv / attn / o / ffn / ple), and `KSEARCH_PHASE_GPUTIME=1` reports decode
+phases from device events. The A10 also showed ~10% run-to-run clock variance
+and refuses `nvidia-smi -lgc` without root — treat cross-run deltas under
+~10% as noise and prefer same-run A/Bs (`KSEARCH_MM_SPLIT`,
+`KSEARCH_PREFILL_F16`).
+
+## Attention knobs
+
+The partitioned MWG SDPA (pass 1 + reduce) takes **two independent** KV-slice
+counts, because the A10 measured them pulling in opposite directions at a
+128-256-token context:
+
+| Path | Knob | Default |
+|---|---|---|
+| decode (`sdpa_mwg_kv`) | `KSEARCH_SDPA_NWG` | 16 |
+| prefill batch (`sdpa_mwg_kv_batch`) | `KSEARCH_SDPA_NWG_PREFILL` | 8 |
+
+Prefill at NWG=8 measured +11% pp128 over 16; decode at 16 measured +4% over
+8. Both clamp to 1..=64; the shared partials buffer is sized for the larger
+of the two. Callers that size `tmp` read `Eng::sdpa_mwg_nwg()` /
+`Eng::sdpa_mwg_nwg_prefill()`, not the const.
 
 ## What is verified, and where
 
 Headless (any machine, including this repo's Apple dev box):
 
 ```bash
-cargo test --workspace                              # 56 tests, no GPU required
+cargo test --workspace                              # 61 tests, no GPU required
 cargo test -p ksearch_codegen --test cuda_codegen   # dialect, host C++ parse, determinism
 cargo test -p ksearch_cuda                          # launch mapping, nvcc -arch targeting
 cargo run -p ksearch_cli --release -- cuda --out /tmp/cu
@@ -180,13 +296,18 @@ ksearch serve    --backend cuda --gguf model.gguf --slots 4   # then curl the en
 
 Honest limits:
 
-- The generated GEMM is a tiled FMA kernel, not a tensor-core (MMA) kernel; the
-  Metal path uses `simdgroup_matrix` where the CUDA path cannot.
-- CUDA has no GPU-side timers in this stack, so `KSEARCH_PROFILE` numbers are
-  host-side.
+- The prefill tensor-core tiles (Q4_K/Q6_K dequant-in-loop and the F16 cache
+  tile) are WMMA `m16n16k16`, not hand-tuned `mma.sync` with `ldmatrix` and a
+  swizzled shared-memory layout — llama.cpp's MMQ and cuBLAS still hold a
+  per-GEMM edge there. That is the next prefill lever if the F16 cache is not
+  enough.
+- `KSEARCH_PROFILE` numbers are host-side; `KSEARCH_PHASE_GPUTIME` is the
+  GPU-side one (device events on CUDA, counters on Metal).
 - This repository's CI/dev machine is an Apple GPU host: CUDA correctness is
   covered by codegen, launch mapping and the `nvcc` targeting tests above, but
-  the driver round-trips only run on an NVIDIA box.
+  the driver round-trips only run on an NVIDIA box. The F16 cache path follows
+  the same rule — it is verified by the clang++ type-check of the rendered
+  translation unit here, and by the A10 run where the numbers live.
 
 ## Checkpoint
 

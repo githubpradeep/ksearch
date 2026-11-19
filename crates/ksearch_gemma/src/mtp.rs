@@ -310,7 +310,7 @@ impl MtpDraft {
 
         let full_angles = ((hd_full as f32) * cfg.partial_rotary) as usize / 2;
         let swa_angles = hd_swa / 2;
-        let nwg = Eng::SDPA_MWG_NWG;
+        let nwg = Eng::sdpa_mwg_nwg();
         eprintln!(
             "[mtp] layers={} hh={} hb={} n_kv={} swa_pattern={:?} rope_full_angles={} rope_freqs={}",
             layers.len(),

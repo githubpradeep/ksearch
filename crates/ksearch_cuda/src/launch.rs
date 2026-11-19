@@ -82,14 +82,15 @@ pub fn launch_config(hint: &LaunchHint, tg_size: u64) -> LaunchConfig {
         LaunchHint::MulMm {
             tg_x,
             tg_y,
+            tg_z,
             tw,
             nsg,
             smem,
-        } => LaunchConfig::new(
-            (u32c(*tg_x), u32c(*tg_y)),
-            (u32c(*tw), u32c(*nsg)),
-            (*smem).min(u32::MAX as u64) as u32,
-        ),
+        } => LaunchConfig {
+            grid: (u32c(*tg_x), u32c(*tg_y), u32c(*tg_z)),
+            block: (u32c(*tw), u32c(*nsg), 1),
+            smem: (*smem).min(u32::MAX as u64) as u32,
+        },
     }
 }
 
@@ -132,13 +133,15 @@ mod tests {
             &LaunchHint::MulMm {
                 tg_x: 3,
                 tg_y: 2,
+                tg_z: 4,
                 tw: 256,
                 nsg: 1,
                 smem: 8192,
             },
             128,
         );
-        assert_eq!(c.grid, (3, 2, 1));
+        // Split-K rides the grid depth.
+        assert_eq!(c.grid, (3, 2, 4));
         assert_eq!(c.block, (256, 1, 1));
         assert_eq!(c.smem, 8192);
     }

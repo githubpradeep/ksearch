@@ -668,6 +668,39 @@ impl Eng {
         )
     }
 
+    /// Decode RoPE. The cosine row is `pos[0] * hd` from the base of `cos_sin`.
+    pub fn rmsnorm_per_head_rope_pos(
+        &mut self,
+        ctx: &Context,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        x: &Buffer,
+        w: &Buffer,
+        cos_sin: &Buffer,
+        pos: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let key = format!("rms_f16_ph_rope_pos_{n_heads}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let xi = g.input(Shape(vec![n_heads * hd]), DType::F16);
+            let wi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
+            let pi = g.input(Shape(vec![1]), DType::F32);
+            let out = g.rmsnorm_per_head_rope_pos(xi, wi, ci, pi, n_heads, hd, eps, true)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
+        }
+        self.run_offsets(
+            ctx,
+            &key,
+            &[x, w, cos_sin, pos],
+            &[0, 0, 0, 0],
+            y,
+            0,
+        )
+    }
+
     pub fn rmsnorm_noweight(
         &mut self,
         ctx: &Context,
@@ -1176,6 +1209,85 @@ impl Eng {
     pub const SDPA_MWG_NWG: usize = 16;
     pub const SDPA_MWG_THRESHOLD: u32 = 128;
 
+    /// KV-slice count for the partitioned MWG SDPA (pass 1 + reduce).
+    ///
+    /// `KSEARCH_SDPA_NWG` (1..=64) A/Bs the partition on device: at short
+    /// decode contexts fewer, wider slices can beat 16 narrow ones (each
+    /// slice is one block, so NWG also sets the attention grid). Callers that
+    /// size `tmp` must read this, not the const.
+    pub fn sdpa_mwg_nwg() -> usize {
+        std::env::var("KSEARCH_SDPA_NWG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| (1..=64).contains(&n))
+            .unwrap_or(Self::SDPA_MWG_NWG)
+    }
+
+    /// KV-slice count for the **prefill batch** SDPA. Measured on the A10:
+    /// 8 slices beat 16 at a 128-256-token context (+11% pp128), while the
+    /// decode path prefers 16 — so the batch kernel takes its own knob,
+    /// `KSEARCH_SDPA_NWG_PREFILL`, defaulting to 8.
+    pub fn sdpa_mwg_nwg_prefill() -> usize {
+        std::env::var("KSEARCH_SDPA_NWG_PREFILL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| (1..=64).contains(&n))
+            .unwrap_or(8)
+    }
+
+    /// Split-K decision for F16 prefill GEMMs on the dequant-once cache.
+    ///
+    /// A10 per-shape profiling: wide-K / short-M shapes (the down-projections)
+    /// ran at ~14 TFLOPS while tall-M shapes reached 33-57 — `M = 1536` gives
+    /// only 24 blocks on 72 SMs with a 384-step K-loop. Splitting K by 4
+    /// fills the machine. Tall-M and narrow-K shapes keep `1`.
+    pub fn matvec_split_k(rows: usize, cols: usize) -> usize {
+        const SPLIT_ROWS_MAX: usize = 2048;
+        const SPLIT_COLS_MIN: usize = 2048;
+        let want = std::env::var("KSEARCH_MM_SPLIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s: &usize| (1..=16).contains(&s))
+            .unwrap_or(4);
+        if rows > SPLIT_ROWS_MAX || cols < SPLIT_COLS_MIN || want == 1 {
+            return 1;
+        }
+        want
+    }
+
+    /// Split-K F16 prefill GEMM: F32 `parts` (sized `[split, batch, rows]`)
+    /// is written by the kernel, then reduced into the F16 `y`.
+    ///
+    /// CUDA-only; the caller checks [`Self::matvec_split_k`] and sizes
+    /// `parts` for the largest split shape it launches.
+    pub fn matvec_batch_split(
+        &mut self,
+        ctx: &Context,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        a: &Buffer,
+        x: &Buffer,
+        parts: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let split = Self::matvec_split_k(rows, cols);
+        if split == 1 {
+            // Not a split shape after all — plain tile path.
+            return self.matvec_batch(ctx, rows, cols, batch, DType::F16, a, x, y);
+        }
+        let key = format!("mm_f16_split_{rows}x{cols}_b{batch}_s{split}");
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let w = g.input(Shape(vec![rows, cols]), DType::F16);
+            let v = g.input(Shape(vec![batch * cols]), DType::F16);
+            let out = g.mul_mm_f16_split(w, v, batch, split)?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
+        }
+        self.run(ctx, &key, &[a, x], parts)?;
+        ctx.f16_mm_reduce(parts, y, batch * rows, split)
+    }
+
     /// Partitioned MWG SDPA (pass1 + reduce). `tmp` is F32 `[n_q * NWG * (hd + 2)]`.
     pub fn sdpa_mwg_kv(
         &mut self,
@@ -1192,7 +1304,7 @@ impl Eng {
         tmp: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
-        let nwg = Self::SDPA_MWG_NWG;
+        let nwg = Self::sdpa_mwg_nwg();
         let part_key = format!("sdpa_mwg_part_{n_q}_{n_kv}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
         if !self.cache.contains_key(&part_key) {
             let mut g = Graph::new();
@@ -1354,6 +1466,50 @@ impl Eng {
             &[0, 0, cos_sin_off_elems as u64 * b32, 0, 0, 0],
             &[q_out, kv_k, kv_v],
             &[0, kv_byte_off as u64, kv_byte_off as u64],
+        )
+    }
+
+    /// Decode Q/K/V norm. RoPE and the KV append read `pos[0]` on the device.
+    pub fn rmsnorm_per_head_qkv_q40_pos(
+        &mut self,
+        ctx: &Context,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+        q: &Buffer,
+        qw: &Buffer,
+        cos_sin: &Buffer,
+        k: &Buffer,
+        kw: &Buffer,
+        v: &Buffer,
+        pos: &Buffer,
+        q_out: &Buffer,
+        kv_k: &Buffer,
+        kv_v: &Buffer,
+    ) -> Result<()> {
+        let key = format!("rms_ph_qkv_q40_pos_{n_q}_{n_kv}_{hd}_{}", eps.to_bits());
+        if !self.cache.contains_key(&key) {
+            let mut g = Graph::new();
+            let qi = g.input(Shape(vec![n_q * hd]), DType::F16);
+            let qwi = g.input(Shape(vec![hd]), DType::F16);
+            let ci = g.input(Shape(vec![hd]), DType::F32);
+            let ki = g.input(Shape(vec![n_kv * hd]), DType::F16);
+            let kwi = g.input(Shape(vec![hd]), DType::F16);
+            let vi = g.input(Shape(vec![n_kv * hd]), DType::F16);
+            let pi = g.input(Shape(vec![1]), DType::F32);
+            let out = g.rmsnorm_per_head_qkv_q40_pos(
+                qi, qwi, ci, ki, kwi, vi, pi, n_q, n_kv, hd, eps,
+            )?;
+            self.ensure(ctx, &key, ctx.lower(&g, out)?)?;
+        }
+        self.run_offsets_multi(
+            ctx,
+            &key,
+            &[q, qw, cos_sin, k, kw, v, pos],
+            &[0, 0, 0, 0, 0, 0, 0],
+            &[q_out, kv_k, kv_v],
+            &[0, 0, 0],
         )
     }
 
@@ -1745,7 +1901,9 @@ impl Eng {
         tmp: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
-        let nwg = Self::SDPA_MWG_NWG;
+        // Prefill batch partition: its own knob (A10: 8 slices beat 16 at
+        // 128-256-token contexts; decode prefers 16).
+        let nwg = Self::sdpa_mwg_nwg_prefill();
         let part_key =
             format!("sdpa_mwg_part_b{n_tok}_{n_q}_{n_kv}_{hd}_{max_t}_{nwg}_{kv_dtype:?}");
         let red_key = format!("sdpa_mwg_red_b{n_tok}_{n_q}_{hd}_{nwg}");

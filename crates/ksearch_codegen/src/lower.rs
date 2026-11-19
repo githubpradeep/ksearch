@@ -348,6 +348,7 @@ pub fn lower_to_kir(
             eps,
             with_weight,
             n_tok,
+            device_pos,
             ..
         } => (
             KirLaunch::RowsParallel {
@@ -365,6 +366,7 @@ pub fn lower_to_kir(
                 1,
                 2,
                 3,
+                *device_pos,
                 &mut next,
             ),
             1,
@@ -393,6 +395,7 @@ pub fn lower_to_kir(
                 1,
                 gid(),
                 None,
+                None,
                 &mut next,
             ),
             1,
@@ -418,6 +421,7 @@ pub fn lower_to_kir(
                 2,
                 0,
                 gid(),
+                None,
                 &mut next,
             ),
             1,
@@ -428,13 +432,23 @@ pub fn lower_to_kir(
             hd,
             eps,
             n_tok,
+            device_pos,
             ..
         } => (
             KirLaunch::RowsParallel {
                 rows: (*n_q).saturating_mul((*n_tok).max(1)),
                 tg: 32,
             },
-            lower_rmsnorm_per_head_qkv_q40(*n_q, *n_kv, *n_tok, *hd, *eps, out_dtype, &mut next),
+            lower_rmsnorm_per_head_qkv_q40(
+                *n_q,
+                *n_kv,
+                *n_tok,
+                *hd,
+                *eps,
+                out_dtype,
+                *device_pos,
+                &mut next,
+            ),
             3,
         ),
         KernelKind::Rope { n_heads, hd, .. } => (
@@ -497,8 +511,8 @@ pub fn lower_to_kir(
                 ));
             }
             if matvec_gemm_batch(*batch)
-                && matches!(*weight_dtype, DType::Q4K | DType::Q6K)
-                && *cols % 256 == 0
+                && matches!(*weight_dtype, DType::Q4K | DType::Q6K | DType::F16)
+                && (*cols % 256 == 0 || (*weight_dtype == DType::F16 && *cols % 8 == 0))
             {
                 (
                     mul_mm_launch(*rows, *batch),
@@ -542,6 +556,46 @@ pub fn lower_to_kir(
             lower_rmsnorm(*n, *eps, false, None, 2, out_dtype, 256, *rows, &mut next),
             1,
         ),
+        KernelKind::MulMmF16Split {
+            rows,
+            cols,
+            batch,
+            split,
+            ..
+        } => {
+            // Grid depth = split: each z-block owns a K-slice of the loop.
+            let launch = KirLaunch::MulMm {
+                tg_x: 1,
+                tg_y: (rows).div_ceil(64).max(1) as u64,
+                tg_z: *split as u64,
+                tw: crate::cuda_prelude::CUDA_F16_MUL_MM_THREADS,
+                nsg: 1,
+                smem: crate::cuda_prelude::CUDA_F16_MUL_MM_SMEM_BYTES,
+            };
+            let dims = (
+                *rows as u32,
+                *cols as u32,
+                *batch as u32,
+                *split as u32,
+                0u32,
+                1u32,
+                2u32,
+            );
+            let (rows, cols, batch, split, w_buf, x_buf, out_buf) = dims;
+            (
+                launch,
+                vec![KirStmt::MulMmF16 {
+                    rows,
+                    cols,
+                    batch,
+                    split,
+                    w_buf,
+                    x_buf,
+                    out_buf,
+                }],
+                1,
+            )
+        }
         KernelKind::RmsNormAddRows {
             n,
             rows,
@@ -928,6 +982,7 @@ fn mul_mv_ext_launch(rows: usize, batch: usize) -> KirLaunch {
     KirLaunch::MulMm {
         tg_x: (rows as u64).div_ceil(r0ptg as u64).max(1),
         tg_y: (batch as u64).div_ceil(r1ptg as u64).max(1),
+        tg_z: 1,
         tw: 32,
         nsg: nsg as u64,
         smem: 32, // unused by ext helper; Metal wants a non-zero TG binding
@@ -966,6 +1021,7 @@ fn mul_mm_launch(rows: usize, batch: usize) -> KirLaunch {
     KirLaunch::MulMm {
         tg_x: (batch as u64).div_ceil(32).max(1),
         tg_y: (rows as u64).div_ceil(64).max(1),
+        tg_z: 1,
         tw: 32,
         nsg: 4,
         smem: 8192,
@@ -973,23 +1029,44 @@ fn mul_mm_launch(rows: usize, batch: usize) -> KirLaunch {
 }
 
 fn lower_mul_mm(rows: usize, cols: usize, batch: usize, dtype: DType) -> Vec<KirStmt> {
+    let dims = (rows as u32, cols as u32, batch as u32, 0u32, 1u32, 2u32);
     match dtype {
-        DType::Q4K => vec![KirStmt::Q4kMulMm {
-            rows: rows as u32,
-            cols: cols as u32,
-            batch: batch as u32,
-            w_buf: 0,
-            x_buf: 1,
-            out_buf: 2,
-        }],
-        DType::Q6K => vec![KirStmt::Q6kMulMm {
-            rows: rows as u32,
-            cols: cols as u32,
-            batch: batch as u32,
-            w_buf: 0,
-            x_buf: 1,
-            out_buf: 2,
-        }],
+        DType::Q4K => {
+            let (rows, cols, batch, w_buf, x_buf, out_buf) = dims;
+            vec![KirStmt::Q4kMulMm {
+                rows,
+                cols,
+                batch,
+                w_buf,
+                x_buf,
+                out_buf,
+            }]
+        }
+        DType::Q6K => {
+            let (rows, cols, batch, w_buf, x_buf, out_buf) = dims;
+            vec![KirStmt::Q6kMulMm {
+                rows,
+                cols,
+                batch,
+                w_buf,
+                x_buf,
+                out_buf,
+            }]
+        }
+        // F16 weights come from the dequant-once prefill cache: no in-loop
+        // dequant, both tiles stream into shared memory.
+        DType::F16 => {
+            let (rows, cols, batch, w_buf, x_buf, out_buf) = dims;
+            vec![KirStmt::MulMmF16 {
+                rows,
+                cols,
+                batch,
+                split: 1,
+                w_buf,
+                x_buf,
+                out_buf,
+            }]
+        }
         _ => vec![],
     }
 }
@@ -4459,6 +4536,7 @@ fn lower_rmsnorm_per_head_rope(
     w_buf: u32,
     rope_buf: u32,
     out_buf: u32,
+    device_pos: bool,
     next: &mut u32,
 ) -> Vec<KirStmt> {
     if n_tok > 1 {
@@ -4480,6 +4558,26 @@ fn lower_rmsnorm_per_head_rope(
             Some(bin(BinOp::Mul, uv(tok), cu(hd as u32))),
             next,
         ));
+        return body;
+    }
+    if device_pos {
+        let pos_buf = out_buf;
+        let out_buf = out_buf + 1;
+        let (pos_stmt, pos) = load_pos_f32(pos_buf, next);
+        let mut body = vec![pos_stmt];
+        body.extend(lower_rmsnorm_per_head_rope_at(
+            hd,
+            eps,
+            with_weight,
+            dt,
+            x_buf,
+            w_buf,
+            rope_buf,
+            out_buf,
+            gid(),
+            Some(bin(BinOp::Mul, uv(pos), cu(hd as u32))),
+            next,
+        ));
         body
     } else {
         lower_rmsnorm_per_head_rope_at(
@@ -4495,6 +4593,24 @@ fn lower_rmsnorm_per_head_rope(
             None,
             next,
         )
+    }
+}
+
+fn load_pos_f32(buf: u32, next: &mut u32) -> (KirStmt, u32) {
+    let id = fresh(next);
+    (
+        KirStmt::LetU32 {
+            id,
+            expr: KirExpr::CastF32ToU32(Box::new(ld(buf, cu(0), DType::F32))),
+        },
+        id,
+    )
+}
+
+fn with_block_off(off: &Option<KirExpr>, block: KirExpr) -> KirExpr {
+    match off {
+        Some(o) => bin(BinOp::Add, o.clone(), block),
+        None => block,
     }
 }
 
@@ -4593,6 +4709,7 @@ fn lower_rmsnorm_per_head_rope_q40(
     th_hi: u32,
     row: KirExpr,
     rope_off: Option<KirExpr>,
+    block_off: Option<KirExpr>,
     next: &mut u32,
 ) -> Vec<KirStmt> {
     // Pair 32-elem Q40 blocks across RoPE halves so thread mem is 64 floats, not hd.
@@ -4678,20 +4795,26 @@ fn lower_rmsnorm_per_head_rope_q40(
             },
             KirStmt::Q40PackFromThread {
                 dst_buf: out_buf,
-                block: bin(
-                    BinOp::Add,
-                    bin(BinOp::Mul, row.clone(), cu(n_blk as u32)),
-                    uv(pb),
+                block: with_block_off(
+                    &block_off,
+                    bin(
+                        BinOp::Add,
+                        bin(BinOp::Mul, row.clone(), cu(n_blk as u32)),
+                        uv(pb),
+                    ),
                 ),
                 th_id: th_lo,
                 th_off: cu(0),
             },
             KirStmt::Q40PackFromThread {
                 dst_buf: out_buf,
-                block: bin(
-                    BinOp::Add,
-                    bin(BinOp::Mul, row.clone(), cu(n_blk as u32)),
-                    bin(BinOp::Add, uv(pb), cu(n_pair as u32)),
+                block: with_block_off(
+                    &block_off,
+                    bin(
+                        BinOp::Add,
+                        bin(BinOp::Mul, row.clone(), cu(n_blk as u32)),
+                        bin(BinOp::Add, uv(pb), cu(n_pair as u32)),
+                    ),
                 ),
                 th_id: th_hi,
                 th_off: cu(0),
@@ -4711,6 +4834,7 @@ fn lower_rmsnorm_per_head_q40(
     out_buf: u32,
     th: u32,
     row: KirExpr,
+    block_off: Option<KirExpr>,
     next: &mut u32,
 ) -> Vec<KirStmt> {
     assert!(hd % 32 == 0);
@@ -4744,10 +4868,13 @@ fn lower_rmsnorm_per_head_q40(
             },
             KirStmt::Q40PackFromThread {
                 dst_buf: out_buf,
-                block: bin(
-                    BinOp::Add,
-                    bin(BinOp::Mul, row.clone(), cu(n_blk as u32)),
-                    uv(b),
+                block: with_block_off(
+                    &block_off,
+                    bin(
+                        BinOp::Add,
+                        bin(BinOp::Mul, row.clone(), cu(n_blk as u32)),
+                        uv(b),
+                    ),
                 ),
                 th_id: th,
                 th_off: cu(0),
@@ -4759,6 +4886,7 @@ fn lower_rmsnorm_per_head_q40(
 
 /// Q F16 rms+RoPE, then (head < n_kv) K Q40 rms+RoPE and V Q40 rms.
 /// Buffers: q=0, qw=1, rope=2, k=3, kw=4, v=5; outs q=6, k=7, v=8.
+/// With `device_pos`, input 6 is the f32 position and the outputs shift to 7, 8, 9.
 fn lower_rmsnorm_per_head_qkv_q40(
     n_q: usize,
     n_kv: usize,
@@ -4766,13 +4894,61 @@ fn lower_rmsnorm_per_head_qkv_q40(
     hd: usize,
     eps: f32,
     dt: DType,
+    device_pos: bool,
     next: &mut u32,
 ) -> Vec<KirStmt> {
     if n_tok <= 1 {
-        let mut body =
-            lower_rmsnorm_per_head_rope_at(hd, eps, true, dt, 0, 1, 2, 6, gid(), None, next);
-        let mut kv =
-            lower_rmsnorm_per_head_rope_q40(hd, eps, true, dt, 3, 4, 2, 7, 0, 1, gid(), None, next);
+        let (q_out, k_out, v_out, rope_off, block_off, pos_stmt) = if device_pos {
+            let (pos_stmt, pos) = load_pos_f32(6, next);
+            let n_blk = (hd / 32) as u32;
+            (
+                7u32,
+                8u32,
+                9u32,
+                Some(bin(BinOp::Mul, uv(pos), cu(hd as u32))),
+                Some(bin(
+                    BinOp::Mul,
+                    uv(pos),
+                    cu(n_kv as u32 * n_blk),
+                )),
+                Some(pos_stmt),
+            )
+        } else {
+            (6, 7, 8, None, None, None)
+        };
+        let mut body = Vec::new();
+        if let Some(stmt) = pos_stmt {
+            body.push(stmt);
+        }
+        body.extend(lower_rmsnorm_per_head_rope_at(
+            hd,
+            eps,
+            true,
+            dt,
+            0,
+            1,
+            2,
+            q_out,
+            gid(),
+            rope_off.clone(),
+            next,
+        ));
+        let mut kv = lower_rmsnorm_per_head_rope_q40(
+            hd,
+            eps,
+            true,
+            dt,
+            3,
+            4,
+            2,
+            k_out,
+            0,
+            1,
+            gid(),
+            rope_off,
+            block_off.clone(),
+            next,
+        );
         kv.extend(lower_rmsnorm_per_head_q40(
             hd,
             eps,
@@ -4780,9 +4956,10 @@ fn lower_rmsnorm_per_head_qkv_q40(
             dt,
             5,
             5,
-            8,
+            v_out,
             2,
             gid(),
+            block_off,
             next,
         ));
         body.push(KirStmt::If {
@@ -4839,6 +5016,7 @@ fn lower_rmsnorm_per_head_qkv_q40(
         1,
         uv(kv_row),
         Some(rope_off),
+        None,
         next,
     );
     kv.extend(lower_rmsnorm_per_head_q40(
@@ -4851,6 +5029,7 @@ fn lower_rmsnorm_per_head_qkv_q40(
         8,
         2,
         uv(kv_row),
+        None,
         next,
     ));
     body.push(KirStmt::If {

@@ -117,6 +117,7 @@ pub fn smoke_kernels() -> Vec<KernelIr> {
             KirLaunch::MulMm {
                 tg_x: 2,
                 tg_y: 1,
+                tg_z: 1,
                 tw: 256,
                 nsg: 1,
                 smem: 8192,
@@ -137,6 +138,7 @@ pub fn smoke_kernels() -> Vec<KernelIr> {
             KirLaunch::MulMm {
                 tg_x: 1,
                 tg_y: 1,
+                tg_z: 1,
                 tw: 256,
                 nsg: 1,
                 smem: 8192,
@@ -150,6 +152,73 @@ pub fn smoke_kernels() -> Vec<KernelIr> {
                 out_buf: 2,
             }],
         ),
+        // Prefill F16 GEMM on the dequant-once weight cache.
+        kir(
+            "k_f16_mul_mm",
+            2,
+            KirLaunch::MulMm {
+                tg_x: 1,
+                tg_y: 1,
+                tg_z: 1,
+                tw: 256,
+                nsg: 1,
+                smem: 30720,
+            },
+            vec![KirStmt::MulMmF16 {
+                rows: 128,
+                cols: 512,
+                batch: 128,
+                split: 1,
+                w_buf: 0,
+                x_buf: 1,
+                out_buf: 2,
+            }],
+        ),
+        // Split-K F16 GEMM: wide-K / short-M shapes, F32 partials out.
+        kir(
+            "k_f16_mul_mm_split",
+            2,
+            KirLaunch::MulMm {
+                tg_x: 1,
+                tg_y: 24,
+                tg_z: 4,
+                tw: 256,
+                nsg: 1,
+                smem: 30720,
+            },
+            vec![KirStmt::MulMmF16 {
+                rows: 1536,
+                cols: 12288,
+                batch: 128,
+                split: 4,
+                w_buf: 0,
+                x_buf: 1,
+                out_buf: 2,
+            }],
+        ),
+        // Tall F16 GEMM (rows >= 2048): 128-row blocks, halved activation
+        // re-reads.
+        kir(
+            "k_f16_mul_mm_tall",
+            2,
+            KirLaunch::MulMm {
+                tg_x: 1,
+                tg_y: 48,
+                tg_z: 1,
+                tw: 256,
+                nsg: 1,
+                smem: 40960,
+            },
+            vec![KirStmt::MulMmF16 {
+                rows: 6144,
+                cols: 1536,
+                batch: 128,
+                split: 1,
+                w_buf: 0,
+                x_buf: 1,
+                out_buf: 2,
+            }],
+        ),
         // Small-batch matvec (`mul_mv_ext`): warp-lane layout, no shared memory.
         kir(
             "k_q4k_mul_mv_ext",
@@ -157,6 +226,7 @@ pub fn smoke_kernels() -> Vec<KernelIr> {
             KirLaunch::MulMm {
                 tg_x: 1,
                 tg_y: 8,
+                tg_z: 1,
                 tw: 32,
                 nsg: 4,
                 smem: 32,

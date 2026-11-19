@@ -102,6 +102,8 @@ pub enum FuseHint {
         x: TensorId,
         w: TensorId,
         cos_sin: TensorId,
+        /// When set, RoPE indexes `pos[0] * hd` from the base of `cos_sin`.
+        pos: Option<TensorId>,
     },
     /// Per-head RMSNorm (+ optional RoPE) then pack Q4_0 into KV (one CALL).
     RmsNormPerHeadRopeQ40 {
@@ -135,6 +137,8 @@ pub enum FuseHint {
         k: TensorId,
         kw: TensorId,
         v: TensorId,
+        /// When set, RoPE and the KV append index from this device `f32` position.
+        pos: Option<TensorId>,
     },
     Rope {
         n_heads: usize,
@@ -173,6 +177,15 @@ pub enum FuseHint {
         rows: usize,
         cols: usize,
         batch: usize,
+        w: TensorId,
+        x: TensorId,
+    },
+    /// Split-K F16 prefill GEMM (dequant-once cache): F32 partials out.
+    MulMmF16Split {
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        split: usize,
         w: TensorId,
         x: TensorId,
     },
@@ -497,6 +510,7 @@ pub enum KernelKind {
         x: TensorId,
         w: TensorId,
         cos_sin: TensorId,
+        device_pos: bool,
     },
     RmsNormPerHeadRopeQ40 {
         n_heads: usize,
@@ -528,6 +542,7 @@ pub enum KernelKind {
         k: TensorId,
         kw: TensorId,
         v: TensorId,
+        device_pos: bool,
     },
     Rope {
         n_heads: usize,
@@ -566,6 +581,16 @@ pub enum KernelKind {
         matrix: TensorId,
         vector: TensorId,
         weight_dtype: DType,
+    },
+    /// Split-K F16 prefill GEMM (dequant-once cache, CUDA): `grid.z = split`,
+    /// F32 partials out; the caller reduces them into the F16 result.
+    MulMmF16Split {
+        rows: usize,
+        cols: usize,
+        batch: usize,
+        split: usize,
+        matrix: TensorId,
+        vector: TensorId,
     },
     RmsNormRows {
         n: usize,
@@ -773,6 +798,8 @@ pub enum KirLaunch {
     MulMm {
         tg_x: u64,
         tg_y: u64,
+        /// Grid depth — `1` except for split-K F16 GEMMs.
+        tg_z: u64,
         tw: u64,
         nsg: u64,
         smem: u64,
@@ -1005,6 +1032,24 @@ pub enum KirStmt {
         rows: u32,
         cols: u32,
         batch: u32,
+        w_buf: u32,
+        x_buf: u32,
+        out_buf: u32,
+    },
+    /// Prefill F16 GEMM on the dequant-once weight cache: both tiles stream
+    /// straight into shared memory, no in-loop dequant. `W` is `[M, K]` F16,
+    /// `X` is `[N, K]` F16, out is `[N, M]` F16.
+    ///
+    /// `split > 1` is the split-K regime for wide-K / short-M shapes
+    /// (`rows <= 2048`, `cols >= 2048`): `grid.z = split`, each block
+    /// accumulates a K-slice into F32 **partials** `[split, N, M]` (the out
+    /// buffer is F32 in that case), and a runtime reduce sums the slices into
+    /// the real F16 output. CUDA-only.
+    MulMmF16 {
+        rows: u32,
+        cols: u32,
+        batch: u32,
+        split: u32,
         w_buf: u32,
         x_buf: u32,
         out_buf: u32,

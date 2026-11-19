@@ -15,6 +15,9 @@ pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
+pub type CUevent = *mut c_void;
 
 pub const CUDA_SUCCESS: CUresult = 0;
 
@@ -30,6 +33,12 @@ pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`
 pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
+/// `CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT`
+///
+/// Percentage of the L1/shared split the driver should reserve for shared
+/// memory (0-100). Requested for large-tile GEMM kernels so two blocks fit
+/// per SM.
+pub const CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: c_int = 9;
 
 const RTLD_NOW: c_int = 2;
 
@@ -113,6 +122,20 @@ pub struct Driver {
     pub cuMemcpyHtoD: unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult,
     pub cuMemcpyDtoH: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
     pub cuMemcpyDtoD: unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
+    pub cuStreamCreate: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
+    pub cuStreamDestroy: unsafe extern "C" fn(CUstream) -> CUresult,
+    pub cuStreamBeginCapture: unsafe extern "C" fn(CUstream, c_int) -> CUresult,
+    pub cuStreamEndCapture: unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult,
+    pub cuGraphDestroy: unsafe extern "C" fn(CUgraph) -> CUresult,
+    pub cuGraphInstantiateWithFlags:
+        unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult,
+    pub cuGraphLaunch: unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult,
+    pub cuGraphExecDestroy: unsafe extern "C" fn(CUgraphExec) -> CUresult,
+    pub cuEventCreate: unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult,
+    pub cuEventRecord: unsafe extern "C" fn(CUevent, CUstream) -> CUresult,
+    pub cuEventSynchronize: unsafe extern "C" fn(CUevent) -> CUresult,
+    pub cuEventElapsedTime: unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult,
+    pub cuEventDestroy: unsafe extern "C" fn(CUevent) -> CUresult,
 }
 
 /// Names to try, Linux first (H100 / RTX 50-series), then Windows / macOS.
@@ -243,6 +266,55 @@ impl Driver {
                 "cuMemcpyDtoD_v2",
                 unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult
             ),
+            cuStreamCreate: sym!(
+                "cuStreamCreate",
+                unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult
+            ),
+            cuStreamDestroy: sym!(
+                "cuStreamDestroy_v2",
+                unsafe extern "C" fn(CUstream) -> CUresult
+            ),
+            cuStreamBeginCapture: sym!(
+                "cuStreamBeginCapture",
+                unsafe extern "C" fn(CUstream, c_int) -> CUresult
+            ),
+            cuStreamEndCapture: sym!(
+                "cuStreamEndCapture",
+                unsafe extern "C" fn(CUstream, *mut CUgraph) -> CUresult
+            ),
+            cuGraphDestroy: sym!(
+                "cuGraphDestroy",
+                unsafe extern "C" fn(CUgraph) -> CUresult
+            ),
+            cuGraphInstantiateWithFlags: sym!(
+                "cuGraphInstantiateWithFlags",
+                unsafe extern "C" fn(*mut CUgraphExec, CUgraph, u64) -> CUresult
+            ),
+            cuGraphLaunch: sym!(
+                "cuGraphLaunch",
+                unsafe extern "C" fn(CUgraphExec, CUstream) -> CUresult
+            ),
+            cuGraphExecDestroy: sym!(
+                "cuGraphExecDestroy",
+                unsafe extern "C" fn(CUgraphExec) -> CUresult
+            ),
+            cuEventCreate: sym!(
+                "cuEventCreate",
+                unsafe extern "C" fn(*mut CUevent, c_uint) -> CUresult
+            ),
+            cuEventRecord: sym!(
+                "cuEventRecord",
+                unsafe extern "C" fn(CUevent, CUstream) -> CUresult
+            ),
+            cuEventSynchronize: sym!(
+                "cuEventSynchronize",
+                unsafe extern "C" fn(CUevent) -> CUresult
+            ),
+            cuEventElapsedTime: sym!(
+                "cuEventElapsedTime",
+                unsafe extern "C" fn(*mut f32, CUevent, CUevent) -> CUresult
+            ),
+            cuEventDestroy: sym!("cuEventDestroy", unsafe extern "C" fn(CUevent) -> CUresult),
         })
     }
 

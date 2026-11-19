@@ -498,6 +498,41 @@ impl Graph {
                 x,
                 w,
                 cos_sin,
+                pos: None,
+            },
+        ))
+    }
+
+    /// Decode RoPE that reads the position from a device `f32` instead of a pointer offset.
+    pub fn rmsnorm_per_head_rope_pos(
+        &mut self,
+        x: TensorId,
+        w: TensorId,
+        cos_sin: TensorId,
+        pos: TensorId,
+        n_heads: usize,
+        hd: usize,
+        eps: f32,
+        with_weight: bool,
+    ) -> Result<TensorId, IrError> {
+        let (sx, dx) = self.shape_dtype(x)?;
+        if !dx.is_float() || sx.numel() != n_heads * hd {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![x, w, cos_sin, pos],
+            Shape(vec![n_heads * hd]),
+            dx,
+            FuseHint::RmsNormPerHeadRope {
+                n_heads,
+                hd,
+                eps,
+                with_weight,
+                n_tok: 1,
+                x,
+                w,
+                cos_sin,
+                pos: Some(pos),
             },
         ))
     }
@@ -608,6 +643,61 @@ impl Graph {
                 k,
                 kw,
                 v,
+                pos: None,
+            },
+        ))
+    }
+
+    /// Decode Q/K/V norm that reads the position from a device `f32`.
+    ///
+    /// RoPE and the KV append use the base of `cos_sin` / the KV caches, plus
+    /// `pos[0]`. The captured CUDA graph keeps those pointers fixed.
+    pub fn rmsnorm_per_head_qkv_q40_pos(
+        &mut self,
+        q: TensorId,
+        qw: TensorId,
+        cos_sin: TensorId,
+        k: TensorId,
+        kw: TensorId,
+        v: TensorId,
+        pos: TensorId,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        eps: f32,
+    ) -> Result<TensorId, IrError> {
+        let (sq, dq) = self.shape_dtype(q)?;
+        let (sk, dk) = self.shape_dtype(k)?;
+        let (sv, dv) = self.shape_dtype(v)?;
+        if !dq.is_float()
+            || dq != dk
+            || dq != dv
+            || sq.numel() != n_q * hd
+            || sk.numel() != n_kv * hd
+            || sv.numel() != n_kv * hd
+            || hd % 32 != 0
+            || n_kv == 0
+            || n_q < n_kv
+        {
+            return Err(IrError::ShapeMismatch);
+        }
+        Ok(self.call(
+            vec![q, qw, cos_sin, k, kw, v, pos],
+            Shape(vec![n_q * hd]),
+            dq,
+            FuseHint::RmsNormPerHeadQkvQ40 {
+                n_q,
+                n_kv,
+                hd,
+                eps,
+                n_tok: 1,
+                q,
+                qw,
+                cos_sin,
+                k,
+                kw,
+                v,
+                pos: Some(pos),
             },
         ))
     }
@@ -659,6 +749,7 @@ impl Graph {
                 k,
                 kw,
                 v,
+                pos: None,
             },
         ))
     }
@@ -692,6 +783,7 @@ impl Graph {
                 x,
                 w,
                 cos_sin,
+                pos: None,
             },
         ))
     }
@@ -827,6 +919,53 @@ impl Graph {
                 rows,
                 cols,
                 batch,
+                w,
+                x,
+            },
+        ))
+    }
+
+    /// Split-K F16 prefill GEMM (dequant-once cache, CUDA-only).
+    ///
+    /// `W` is `[rows, cols]` F16, `X` is `[batch, cols]` F16. The kernel
+    /// writes **F32 partials** `[split, batch, rows]`; the caller reduces them
+    /// into the F16 `[batch, rows]` result. Wide-K / short-M shapes
+    /// (`rows <= 2048`) run too few blocks otherwise: a 1536x12288 down-proj
+    /// is 24 blocks on 72 SMs at a 384-step K-loop.
+    ///
+    /// `split` must divide `cols` into `BK=32`-aligned slices; the builder
+    /// clamps it to the largest valid value at most `want`.
+    pub fn mul_mm_f16_split(
+        &mut self,
+        w: TensorId,
+        x: TensorId,
+        batch: usize,
+        want: usize,
+    ) -> Result<TensorId, IrError> {
+        const BK: usize = 32;
+        let (sw, dw) = self.shape_dtype(w)?;
+        let (sx, dx) = self.shape_dtype(x)?;
+        if sw.rank() != 2 || batch == 0 || dw != DType::F16 || dx != DType::F16 {
+            return Err(IrError::ShapeMismatch);
+        }
+        let rows = sw.0[0];
+        let cols = sw.0[1];
+        if sx.numel() < batch * cols {
+            return Err(IrError::ShapeMismatch);
+        }
+        let mut split = want.clamp(1, 16);
+        while split > 1 && cols % (split * BK) != 0 {
+            split -= 1;
+        }
+        Ok(self.call(
+            vec![w, x],
+            Shape(vec![split * batch * rows]),
+            DType::F32,
+            FuseHint::MulMmF16Split {
+                rows,
+                cols,
+                batch,
+                split,
                 w,
                 x,
             },
