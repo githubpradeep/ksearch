@@ -270,12 +270,12 @@ counts, because the A10 measured them pulling in opposite directions at a
 | Path | Knob | Default |
 |---|---|---|
 | decode (`sdpa_mwg_kv`) | `KSEARCH_SDPA_NWG` | 16 |
-| prefill batch (`sdpa_mwg_kv_batch`) | `KSEARCH_SDPA_NWG_PREFILL` | 8 |
+| prefill batch (`sdpa_mwg_kv_batch`) | `KSEARCH_SDPA_NWG_PREFILL` | 4 |
+| prefill MWG cutover | `KSEARCH_SDPA_MWG_THRESH` | 512 |
+| prefill force naive/MWG | `KSEARCH_SDPA_PREFILL_NAIVE=1\|0` | auto |
 
-Prefill at NWG=8 measured +11% pp128 over 16; decode at 16 measured +4% over
-8. Both clamp to 1..=64; the shared partials buffer is sized for the larger
-of the two. Callers that size `tmp` read `Eng::sdpa_mwg_nwg()` /
-`Eng::sdpa_mwg_nwg_prefill()`, not the const.
+A10 (cuBLAS): **naive SDPA pp128 ~8.68k** (llama.cpp parity); MWG@NWG4 ~7.9k;
+NWG2 ~8.3k. Prefill uses naive while `attn_t < 512`, then MWG. Decode NWG=16.
 
 ## What is verified, and where
 
@@ -318,9 +318,10 @@ Q4_K × Q8_1 kernels in `crates/ksearch_cuda/src/hand_mm.rs` (MIT, see
 | `KSEARCH_CUBLAS` | on (omit or ≠`0`) | Prefill F16 GEMM via `cublasGemmEx` (dlopen libcublas). Set `0` for hand WMMA. |
 | `KSEARCH_HAND_MMQ=1` | off | Prefill packed Q4_K MMQ-lite (slower than F16 until tensor-core MMQ). |
 
-A10 (unlocked, measured): hand decode + F16/cuBLAS prefill **pp128 7.74k / tg128 185**;
-`KSEARCH_CUBLAS=0` (WMMA) **pp 5.2k**; `HAND_MM=0` **pp 7.7k / tg 148**. llama.cpp ~8.7k pp /
-~180 tg — remaining pp gap is mostly non-GEMM (attn / norms).
+A10 (unlocked, measured): hand decode + F16/cuBLAS + naive SDPA prefill
+**pp128 8.66k / tg128 175** (llama.cpp ~8.7k / ~180). Phase @128:
+`qkv 1.5 / attn 4.7 / o 1.1 / ffn 10.3 / ple 1.1` ms. `KSEARCH_CUBLAS=0`
+(WMMA) **pp 5.2k**. Packed `HAND_MMQ` (~1.4k) still loses until int8 TC MMQ.
 - `KSEARCH_PROFILE` numbers are host-side; `KSEARCH_PHASE_GPUTIME` is the
   GPU-side one (device events on CUDA, counters on Metal).
 - This repository's CI/dev machine is an Apple GPU host: CUDA correctness is

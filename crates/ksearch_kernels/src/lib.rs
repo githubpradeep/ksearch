@@ -1277,7 +1277,19 @@ impl Eng {
 
     /// Oracle-shaped hybrid: shared-head online for short KV; partitioned MWG for long.
     pub const SDPA_MWG_NWG: usize = 16;
+    /// Decode / long-context MWG cutover. Prefill batch uses
+    /// [`Self::sdpa_mwg_threshold_prefill`] (A10: naive wins through ~512).
     pub const SDPA_MWG_THRESHOLD: u32 = 128;
+
+    /// Prefill batch MWG cutover. A10 cuBLAS era: naive SDPA at pp128 hit
+    /// **~8.7k** vs MWG@NWG4 ~7.9k. Override with `KSEARCH_SDPA_MWG_THRESH`.
+    pub fn sdpa_mwg_threshold_prefill() -> u32 {
+        std::env::var("KSEARCH_SDPA_MWG_THRESH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &u32| (1..=16384).contains(&n))
+            .unwrap_or(512)
+    }
 
     /// KV-slice count for the partitioned MWG SDPA (pass 1 + reduce).
     ///
@@ -1293,16 +1305,15 @@ impl Eng {
             .unwrap_or(Self::SDPA_MWG_NWG)
     }
 
-    /// KV-slice count for the **prefill batch** SDPA. Measured on the A10:
-    /// 8 slices beat 16 at a 128-256-token context (+11% pp128), while the
-    /// decode path prefers 16 — so the batch kernel takes its own knob,
-    /// `KSEARCH_SDPA_NWG_PREFILL`, defaulting to 8.
+    /// KV-slice count for the **prefill batch** SDPA. Measured on the A10
+    /// (cuBLAS prefill): 4 slices beat 8 (+5.6% pp128); 16/32 regress. Decode
+    /// still prefers 16 via `KSEARCH_SDPA_NWG`.
     pub fn sdpa_mwg_nwg_prefill() -> usize {
         std::env::var("KSEARCH_SDPA_NWG_PREFILL")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &usize| (1..=64).contains(&n))
-            .unwrap_or(8)
+            .unwrap_or(4)
     }
 
     /// Split-K decision for F16 prefill GEMMs on the dequant-once cache.
@@ -1939,13 +1950,21 @@ impl Eng {
                 ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, out,
             );
         }
-        if attn_t >= Self::SDPA_MWG_THRESHOLD {
-            self.sdpa_mwg_kv_batch(
-                ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, tmp, out,
-            )
-        } else {
+        // Prefill: naive through `sdpa_mwg_threshold_prefill` (default 512).
+        // `KSEARCH_SDPA_PREFILL_NAIVE=1` forces naive; `=0` forces MWG.
+        let force = std::env::var("KSEARCH_SDPA_PREFILL_NAIVE").ok();
+        let use_naive = match force.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => attn_t < Self::sdpa_mwg_threshold_prefill(),
+        };
+        if use_naive {
             self.sdpa_naive_kv_batch(
                 ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, out,
+            )
+        } else {
+            self.sdpa_mwg_kv_batch(
+                ctx, n_q, n_kv, n_tok, hd, max_t, kv_dtype, q, k, v, meta, tmp, out,
             )
         }
     }

@@ -181,68 +181,87 @@ extern "C" __global__ void ks_mmvq_q4k(
   if (threadIdx.x == 0) dst[row] = __float2half(tmp);
 }
 
-// Prefill MMQ-lite: one CUDA block per output row; K is streamed once while
-// token groups of 8 reuse the same weight loads (L1/regs hot). Much less HBM
-// traffic than a (nrows × nbatch/8) grid. Grid (nrows), block (32,4).
-#define KS_MMQ_BN 8
+// Prefill MMQ tile (dp4a): 2D grid over (rows, tokens). Stages Q8_1 Y and
+// Q4_K X tiles in shared so each weight block is read once per BN tokens.
+// Int8 tensor-core MMQ (llama.cpp mma path) is the next step; this replaces
+// the old per-row BN=8 lite kernel. Grid (ceil(M/BM), ceil(N/BN)), block (32,8).
+#define KS_MMQ_BM 64
+#define KS_MMQ_BN 32
 
 extern "C" __global__ void ks_mmq_q4k(
     const void *__restrict__ vx, const block_q8_1 *__restrict__ vy,
     half *__restrict__ dst, unsigned ncols, unsigned nrows, unsigned nbatch) {
-  constexpr int nwarps = 4;
+  constexpr int nwarps = 8;
   constexpr int warp_size = 32;
   constexpr int vdr = VDR_Q4_K_Q8_1_MMVQ;
   constexpr int qi = QI4_K;
   constexpr int qk = QK_K;
-  constexpr int blocks_per_iter = vdr * nwarps * warp_size / qi;
+  constexpr int bm = KS_MMQ_BM;
   constexpr int bn = KS_MMQ_BN;
+  constexpr int q8_per_q4 = qk / QK8_1; // 8
 
-  const unsigned row = blockIdx.x;
-  if (row >= nrows) return;
+  const int row0 = (int)blockIdx.x * bm;
+  const int col0 = (int)blockIdx.y * bn;
+  if (row0 >= (int)nrows || col0 >= (int)nbatch) return;
 
   const int tid = warp_size * threadIdx.y + threadIdx.x;
+  const int nthreads = nwarps * warp_size;
   const int blocks_per_row = (int)(ncols / qk);
   const int y_row_stride = (int)(ncols / QK8_1);
-  const int row_kb = (int)row * blocks_per_row;
+  const int rows_tile = min(bm, (int)nrows - row0);
+  const int cols_tile = min(bn, (int)nbatch - col0);
 
-  for (unsigned col0 = 0; col0 < nbatch; col0 += bn) {
-    float tmp[bn];
+  // Accumulators: each thread owns a strip of the BM×BN tile.
+  // 256 threads → 2048 cells / 256 = 8 results per thread.
+  constexpr int nres = (bm * bn) / (nwarps * warp_size); // 8
+  float acc[nres];
 #pragma unroll
-    for (int j = 0; j < bn; ++j) tmp[j] = 0.0f;
+  for (int r = 0; r < nres; ++r) acc[r] = 0.0f;
 
-    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
-      const int kby = kbx * (qk / QK8_1);
-      const int kqs = vdr * (tid % (qi / vdr));
+  __shared__ block_q4_K x_sm[bm];
+  __shared__ block_q8_1 y_sm[bn * q8_per_q4];
+
+  for (int kbx = 0; kbx < blocks_per_row; ++kbx) {
+    // Stage BM weight blocks for this K-slice.
+    for (int i = tid; i < rows_tile; i += nthreads) {
+      x_sm[i] = ((const block_q4_K *)vx)[(size_t)(row0 + i) * blocks_per_row + kbx];
+    }
+    // Stage BN × 8 Q8_1 blocks (one K=256 slice of activations).
+    const int y_elems = cols_tile * q8_per_q4;
+    const int kby = kbx * q8_per_q4;
+    for (int i = tid; i < y_elems; i += nthreads) {
+      const int tok = i / q8_per_q4;
+      const int qi8 = i % q8_per_q4;
+      y_sm[i] = vy[(size_t)(col0 + tok) * y_row_stride + kby + qi8];
+    }
+    __syncthreads();
+
+    // Each thread accumulates nres (row,col) pairs via vec_dot fragments.
+    for (int r = 0; r < nres; ++r) {
+      const int cell = tid + r * nthreads;
+      const int ri = cell / bn;
+      const int cj = cell % bn;
+      if (ri < rows_tile && cj < cols_tile) {
+        float sum = 0.0f;
+        // 16 fragments cover QI4_K with vdr=2 (same walk as mmvq).
 #pragma unroll
-      for (int j = 0; j < bn; ++j) {
-        const unsigned tok = col0 + (unsigned)j;
-        if (tok < nbatch) {
-          tmp[j] += vec_dot_q4_K_q8_1(
-              vx, vy + (size_t)tok * y_row_stride + kby, row_kb + kbx, kqs);
+        for (int iqs = 0; iqs < qi; iqs += vdr) {
+          sum += vec_dot_q4_K_q8_1(
+              (const void *)x_sm, y_sm + (size_t)cj * q8_per_q4, ri, iqs);
         }
+        acc[r] += sum;
       }
     }
+    __syncthreads();
+  }
 
-    __shared__ float tmp_shared[nwarps - 1][bn][warp_size];
-    if (threadIdx.y > 0) {
-#pragma unroll
-      for (int j = 0; j < bn; ++j)
-        tmp_shared[threadIdx.y - 1][j][threadIdx.x] = tmp[j];
+  for (int r = 0; r < nres; ++r) {
+    const int cell = tid + r * nthreads;
+    const int ri = cell / bn;
+    const int cj = cell % bn;
+    if (ri < rows_tile && cj < cols_tile) {
+      dst[(size_t)(col0 + cj) * nrows + (row0 + ri)] = __float2half(acc[r]);
     }
-    __syncthreads();
-    if (threadIdx.y == 0) {
-#pragma unroll
-      for (int j = 0; j < bn; ++j) {
-#pragma unroll
-        for (int l = 0; l < nwarps - 1; ++l)
-          tmp[j] += tmp_shared[l][j][threadIdx.x];
-        tmp[j] = warp_sum_f(tmp[j]);
-        const unsigned tok = col0 + (unsigned)j;
-        if (threadIdx.x == 0 && tok < nbatch)
-          dst[(size_t)tok * nrows + row] = __float2half(tmp[j]);
-      }
-    }
-    __syncthreads();
   }
 }
 
@@ -340,9 +359,14 @@ impl super::CudaContext {
             .u32(ncols)
             .u32(nrows)
             .u32(nbatch);
+        // 2D tile: BM=64 rows × BN=32 tokens, block (32,8).
+        const bm: u32 = 64;
+        const bn: u32 = 32;
+        let gx = (nrows + bm - 1) / bm;
+        let gy = (nbatch + bn - 1) / bn;
         self.launch_with(
             k.mmq_q4k,
-            LaunchConfig::new((nrows.max(1), 1), (32, 4), 0),
+            LaunchConfig::new((gx.max(1), gy.max(1)), (32, 8), 0),
             &mut args,
         )
     }
