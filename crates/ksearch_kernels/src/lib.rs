@@ -13,6 +13,10 @@ pub struct Eng {
     cache: HashMap<String, (MetalKernelSource, ComputePipelineState)>,
     /// Scratch for sequenced fuses (matvec → rmsnorm) when out aliases residual.
     fuse_scratch: HashMap<usize, Buffer>,
+    /// Q8_1 scratch for hand mmvq/mmq (keyed by byte size).
+    q8_scratch: HashMap<usize, Buffer>,
+    /// F16 scratch for gate/up before gelu_mul on the hand path.
+    hand_f16_scratch: HashMap<usize, Buffer>,
 }
 
 impl Eng {
@@ -20,6 +24,8 @@ impl Eng {
         Self {
             cache: HashMap::new(),
             fuse_scratch: HashMap::new(),
+            q8_scratch: HashMap::new(),
+            hand_f16_scratch: HashMap::new(),
         }
     }
 
@@ -28,6 +34,36 @@ impl Eng {
             .entry(n)
             .or_insert_with(|| ctx.buffer_empty_f16(n))
             .clone()
+    }
+
+    fn scratch_q8(&mut self, ctx: &Context, cols: usize) -> Buffer {
+        // block_q8_1 = 36 B, one per 32 activations.
+        let bytes = (cols / 32) * 36;
+        self.q8_scratch
+            .entry(bytes)
+            .or_insert_with(|| ctx.buffer_empty_bytes(bytes))
+            .clone()
+    }
+
+    fn scratch_hand_f16(&mut self, ctx: &Context, n: usize) -> Buffer {
+        self.hand_f16_scratch
+            .entry(n)
+            .or_insert_with(|| ctx.buffer_empty_f16(n))
+            .clone()
+    }
+
+    fn hand_mmvq(
+        &mut self,
+        ctx: &Context,
+        rows: usize,
+        cols: usize,
+        w: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+    ) -> Result<()> {
+        let q8 = self.scratch_q8(ctx, cols);
+        ctx.quantize_q8_1_f16(x, &q8, cols)?;
+        ctx.mmvq_q4k(w, &q8, y, rows, cols)
     }
 
     fn ensure(&mut self, ctx: &Context, key: &str, src: MetalKernelSource) -> Result<()> {
@@ -134,6 +170,13 @@ impl Eng {
         x: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
+        if ctx.hand_mm_enabled()
+            && weight_dtype == DType::Q4K
+            && cols % 256 == 0
+            && cols >= 256
+        {
+            return self.hand_mmvq(ctx, rows, cols, a, x, y);
+        }
         let tag = weight_cache_tag(weight_dtype);
         let key = format!("mv_{tag}_{rows}x{cols}");
         if !self.cache.contains_key(&key) {
@@ -231,6 +274,20 @@ impl Eng {
         k: &Buffer,
         v: &Buffer,
     ) -> Result<()> {
+        if ctx.hand_mm_enabled()
+            && wq_dtype == DType::Q4K
+            && wk_dtype == DType::Q4K
+            && wv_dtype == DType::Q4K
+            && cols % 256 == 0
+            && cols >= 256
+        {
+            let q8 = self.scratch_q8(ctx, cols);
+            ctx.quantize_q8_1_f16(x, &q8, cols)?;
+            ctx.mmvq_q4k(wq, &q8, q, q_rows, cols)?;
+            ctx.mmvq_q4k(wk, &q8, k, kv_rows, cols)?;
+            ctx.mmvq_q4k(wv, &q8, v, kv_rows, cols)?;
+            return Ok(());
+        }
         let tag = format!(
             "{}_{}_{}",
             weight_cache_tag(wq_dtype),
@@ -1022,6 +1079,19 @@ impl Eng {
         x: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
+        if ctx.hand_mm_enabled()
+            && weight_dtype == DType::Q4K
+            && cols % 256 == 0
+            && cols >= 256
+        {
+            let q8 = self.scratch_q8(ctx, cols);
+            ctx.quantize_q8_1_f16(x, &q8, cols)?;
+            let g_out = self.scratch_hand_f16(ctx, rows);
+            let u_out = self.scratch_f16(ctx, rows);
+            ctx.mmvq_q4k(gate, &q8, &g_out, rows, cols)?;
+            ctx.mmvq_q4k(up, &q8, &u_out, rows, cols)?;
+            return ctx.gelu_mul_f16(&g_out, &u_out, y, rows);
+        }
         let tag = weight_cache_tag(weight_dtype);
         let key = format!("mv_gate_up_gelu_{tag}_{rows}x{cols}");
         if !self.cache.contains_key(&key) {
@@ -1271,6 +1341,10 @@ impl Eng {
         parts: &Buffer,
         y: &Buffer,
     ) -> Result<()> {
+        // cuBLAS beats hand WMMA + split-K on A10; prefer it for F16 prefill.
+        if ctx.cublas_gemm_enabled() && batch > 1 {
+            return ctx.gemm_f16_cublas(a, x, y, rows, cols, batch);
+        }
         let split = Self::matvec_split_k(rows, cols);
         if split == 1 {
             // Not a split shape after all — plain tile path.
@@ -1650,6 +1724,25 @@ impl Eng {
     ) -> Result<()> {
         if batch == 1 {
             return self.matvec_wd(ctx, rows, cols, weight_dtype, a, x, y);
+        }
+        if weight_dtype == DType::F16 && ctx.cublas_gemm_enabled() && batch > 1 {
+            return ctx.gemm_f16_cublas(a, x, y, rows, cols, batch);
+        }
+        if ctx.hand_mm_enabled()
+            && weight_dtype == DType::Q4K
+            && batch > 8
+            && cols % 256 == 0
+            && cols >= 256
+        {
+            // Quantize each token row of X (F16 `[batch, cols]`) into Q8_1.
+            let q8_bytes = batch * (cols / 32) * 36;
+            let q8 = self
+                .q8_scratch
+                .entry(q8_bytes)
+                .or_insert_with(|| ctx.buffer_empty_bytes(q8_bytes))
+                .clone();
+            ctx.quantize_q8_1_f16(x, &q8, batch * cols)?;
+            return ctx.mmq_q4k(a, &q8, y, rows, cols, batch);
         }
         let tag = weight_cache_tag(weight_dtype);
         let nsg = std::env::var("KSEARCH_MV_EXT_NSG")

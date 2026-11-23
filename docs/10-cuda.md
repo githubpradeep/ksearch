@@ -305,13 +305,22 @@ ksearch generate --backend cuda --gguf model.gguf --prompt "Hi" --n-predict 8
 ksearch serve    --backend cuda --gguf model.gguf --slots 4   # then curl the endpoint
 ```
 
-Honest limits:
+## Hand CUDA mmvq / MMQ (`KSEARCH_HAND_MM`)
 
-- The prefill tensor-core tiles (Q4_K/Q6_K dequant-in-loop and the F16 cache
-  tile) are WMMA `m16n16k16`, not hand-tuned `mma.sync` with `ldmatrix` and a
-  swizzled shared-memory layout — llama.cpp's MMQ and cuBLAS still hold a
-  per-GEMM edge there. That is the next prefill lever if the F16 cache is not
-  enough.
+Scoreboard path (Thesis A suspended for these ops only): llama.cpp-adapted
+Q4_K × Q8_1 kernels in `crates/ksearch_cuda/src/hand_mm.rs` (MIT, see
+`NOTICE`, pinned to llama.cpp b12283).
+
+| Env | Default | Effect |
+|---|---|---|
+| `KSEARCH_HAND_MM` | on (omit or ≠`0`) | Decode: F16→Q8_1 + `ks_mmvq_q4k`. Prefill: F16 cache + cuBLAS. |
+| `KSEARCH_HAND_MM=0` | — | AST coop matvec + F16 cuBLAS / WMMA fallback. |
+| `KSEARCH_CUBLAS` | on (omit or ≠`0`) | Prefill F16 GEMM via `cublasGemmEx` (dlopen libcublas). Set `0` for hand WMMA. |
+| `KSEARCH_HAND_MMQ=1` | off | Prefill packed Q4_K MMQ-lite (slower than F16 until tensor-core MMQ). |
+
+A10 (unlocked, measured): hand decode + F16/cuBLAS prefill **pp128 7.74k / tg128 185**;
+`KSEARCH_CUBLAS=0` (WMMA) **pp 5.2k**; `HAND_MM=0` **pp 7.7k / tg 148**. llama.cpp ~8.7k pp /
+~180 tg — remaining pp gap is mostly non-GEMM (attn / norms).
 - `KSEARCH_PROFILE` numbers are host-side; `KSEARCH_PHASE_GPUTIME` is the
   GPU-side one (device events on CUDA, counters on Metal).
 - This repository's CI/dev machine is an Apple GPU host: CUDA correctness is

@@ -679,6 +679,141 @@ impl Context {
         }
     }
 
+    /// `KSEARCH_HAND_MM!=0` (default on CUDA): use llama.cpp-adapted Q4_K×Q8_1 kernels.
+    pub fn hand_mm_enabled(&self) -> bool {
+        self.backend == Backend::Cuda
+            && std::env::var("KSEARCH_HAND_MM")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+    }
+
+    /// `KSEARCH_CUBLAS!=0` (default on): F16 prefill GEMM via cuBLAS when available.
+    pub fn cublas_gemm_enabled(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            if self.backend != Backend::Cuda {
+                return false;
+            }
+            if std::env::var("KSEARCH_CUBLAS")
+                .map(|v| v == "0")
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            return ksearch_cuda::CudaContext::cublas_available();
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            false
+        }
+    }
+
+    /// F16 GEMM `Y[n,m] = sum_k W[m,k] * X[n,k]` via cuBLAS (prefill).
+    pub fn gemm_f16_cublas(
+        &self,
+        w: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
+        rows: usize,
+        cols: usize,
+        batch: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let w = Self::cuda_buf(w)?;
+                let x = Self::cuda_buf(x)?;
+                let y = Self::cuda_buf(y)?;
+                self.cuda_ctx_mut()
+                    .gemm_f16_cublas(w, x, y, rows as u32, cols as u32, batch as u32)
+                    .map_err(|e| anyhow!("gemm_f16_cublas: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("gemm_f16_cublas is a CUDA path"),
+        }
+    }
+
+    /// F16 activations → Q8_1 packed blocks (hand mmvq/mmq path).
+    pub fn quantize_q8_1_f16(&self, x: &Buffer, y: &Buffer, ne: usize) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let x = Self::cuda_buf(x)?;
+                let y = Self::cuda_buf(y)?;
+                self.cuda_ctx_mut()
+                    .quantize_q8_1_f16(x, y, ne as u32)
+                    .map_err(|e| anyhow!("quantize_q8_1_f16: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("quantize_q8_1_f16 is a CUDA path"),
+        }
+    }
+
+    /// Hand Q4_K × Q8_1 GEMV → F16.
+    pub fn mmvq_q4k(
+        &self,
+        w: &Buffer,
+        x_q8: &Buffer,
+        y: &Buffer,
+        nrows: usize,
+        ncols: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let w = Self::cuda_buf(w)?;
+                let x_q8 = Self::cuda_buf(x_q8)?;
+                let y = Self::cuda_buf(y)?;
+                self.cuda_ctx_mut()
+                    .mmvq_q4k(w, x_q8, y, nrows as u32, ncols as u32)
+                    .map_err(|e| anyhow!("mmvq_q4k: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("mmvq_q4k is a CUDA path"),
+        }
+    }
+
+    /// Hand Q4_K × Q8_1 batched GEMM (mmvq ncols_dst=8 tiles) → F16 `[batch, rows]`.
+    pub fn mmq_q4k(
+        &self,
+        w: &Buffer,
+        x_q8: &Buffer,
+        y: &Buffer,
+        nrows: usize,
+        ncols: usize,
+        nbatch: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let w = Self::cuda_buf(w)?;
+                let x_q8 = Self::cuda_buf(x_q8)?;
+                let y = Self::cuda_buf(y)?;
+                self.cuda_ctx_mut()
+                    .mmq_q4k(w, x_q8, y, nrows as u32, ncols as u32, nbatch as u32)
+                    .map_err(|e| anyhow!("mmq_q4k: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("mmq_q4k is a CUDA path"),
+        }
+    }
+
+    pub fn gelu_mul_f16(&self, gate: &Buffer, up: &Buffer, y: &Buffer, n: usize) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let gate = Self::cuda_buf(gate)?;
+                let up = Self::cuda_buf(up)?;
+                let y = Self::cuda_buf(y)?;
+                self.cuda_ctx_mut()
+                    .gelu_mul_f16(gate, up, y, n as u32)
+                    .map_err(|e| anyhow!("gelu_mul_f16: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("gelu_mul_f16 is a CUDA path"),
+        }
+    }
+
     /// Sum `splits` F32 partial planes into the F16 GEMM output.
     ///
     /// The tail of the split-K prefill GEMM; see [`Graph::mul_mm_f16_split`].

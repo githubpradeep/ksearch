@@ -31,7 +31,9 @@
 //! `KSEARCH_CUDA_DEVICE=<n>`, `KSEARCH_TG=<threads/block>`, and `KSEARCH_NVCC`
 //! when `nvcc` is not on `PATH`.
 
+pub mod cublas;
 pub mod ffi;
+pub mod hand_mm;
 pub mod launch;
 
 use std::collections::HashMap;
@@ -104,6 +106,10 @@ pub struct CudaContext {
     modules: HashMap<u64, ffi::CUmodule>,
     /// Fill / increment / stash kernels for GPU-resident decode state.
     runtime: Option<RuntimeKernels>,
+    /// Hand Q4_K×Q8_1 mmvq / mmq (llama.cpp-adapted). See [`hand_mm`].
+    hand_mm: Option<hand_mm::HandMmKernels>,
+    /// Lazy cuBLAS handle for F16 prefill GEMM. See [`cublas`].
+    cublas: Option<cublas::Cublas>,
     /// Non-default stream used to capture and replay a decode token.
     stream: ffi::CUstream,
     capturing: bool,
@@ -210,6 +216,8 @@ impl CudaContext {
             }),
             modules: HashMap::new(),
             runtime: None,
+            hand_mm: None,
+            cublas: None,
             stream: std::ptr::null_mut(),
             capturing: false,
             decode_exec: [None, None],
@@ -855,6 +863,8 @@ impl Drop for CudaContext {
         unsafe {
             let drv = &self.shared.drv;
             let _ = drv.check("cuCtxSetCurrent", (drv.cuCtxSetCurrent)(self.shared.ctx));
+            // Destroy cuBLAS while the driver context is still current.
+            self.cublas = None;
             for slot in &mut self.decode_exec {
                 if let Some(exec) = slot.take() {
                     (drv.cuGraphExecDestroy)(exec);

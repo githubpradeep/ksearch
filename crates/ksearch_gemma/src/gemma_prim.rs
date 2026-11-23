@@ -636,31 +636,52 @@ impl GemmaPrimModel {
         } else {
             None
         };
-        let ran = if self.prefill_f16 && batch > 8 {
-            if let Some(f16) = self.ensure_f16_weight(name, rows, cols)? {
-                if Eng::matvec_split_k(rows, cols) > 1 {
-                    // Wide-K / short-M shape: split the K loop across blocks.
-                    Some(self.eng.matvec_batch_split(
-                        &self.ctx,
-                        rows,
-                        cols,
-                        batch,
-                        &f16,
-                        &x,
-                        &self.mm_parts,
-                        &y,
-                    ))
+        // Prefill: F16 cache + cuBLAS (or WMMA fallback). Packed MMQ-lite is
+        // opt-in (KSEARCH_HAND_MMQ=1) until a tensor-core MMQ clears the board.
+        let hand_mmq = self.ctx.hand_mm_enabled()
+            && std::env::var("KSEARCH_HAND_MMQ")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+        let ran = {
+            let w = self.weight_bufs.get(name).unwrap();
+            let wd = w.dtype();
+            let wbuf = w.buf().clone();
+            if hand_mmq && wd == DType::Q4K && batch > 8 {
+                Some(
+                    self.eng
+                        .matvec_batch(&self.ctx, rows, cols, batch, wd, &wbuf, &x, &y),
+                )
+            } else if self.prefill_f16 && batch > 8 {
+                if let Some(f16) = self.ensure_f16_weight(name, rows, cols)? {
+                    if Eng::matvec_split_k(rows, cols) > 1 {
+                        Some(self.eng.matvec_batch_split(
+                            &self.ctx,
+                            rows,
+                            cols,
+                            batch,
+                            &f16,
+                            &x,
+                            &self.mm_parts,
+                            &y,
+                        ))
+                    } else {
+                        Some(self.eng.matvec_batch(
+                            &self.ctx,
+                            rows,
+                            cols,
+                            batch,
+                            DType::F16,
+                            &f16,
+                            &x,
+                            &y,
+                        ))
+                    }
                 } else {
-                    Some(
-                        self.eng
-                            .matvec_batch(&self.ctx, rows, cols, batch, DType::F16, &f16, &x, &y),
-                    )
+                    None
                 }
             } else {
                 None
             }
-        } else {
-            None
         };
         let ran = match ran {
             Some(r) => r?,
