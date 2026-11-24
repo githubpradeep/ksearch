@@ -603,6 +603,7 @@ impl MtpDraft {
                     layer.hd,
                     cap,
                     tlen as u32,
+                    seq_len.max(1),
                     DType::Q40,
                     &self.att,
                     &base_k[kv_idx],

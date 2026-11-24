@@ -687,6 +687,64 @@ impl Context {
                 .unwrap_or(true)
     }
 
+    /// `KSEARCH_FLASH_ATTN=1`: hand fattn-vec over Q4_0 KV (opt-in).
+    pub fn flash_attn_enabled(&self) -> bool {
+        self.backend == Backend::Cuda
+            && std::env::var("KSEARCH_FLASH_ATTN")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+    }
+
+    /// FlashAttention-style SDPA: Q F16, K/V Q4_0, meta f32[4] → O F16.
+    /// `tmp` holds `[n_tok][n_q][n_parts][hd+2]` F32 when `n_parts > 1`.
+    pub fn flash_attn_q40(
+        &self,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+        n_tok: usize,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        max_t: usize,
+        n_parts: usize,
+        kv_len: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let q = Self::cuda_buf(q)?;
+                let k = Self::cuda_buf(k)?;
+                let v = Self::cuda_buf(v)?;
+                let meta = Self::cuda_buf(meta)?;
+                let tmp = Self::cuda_buf(tmp)?;
+                let out = Self::cuda_buf(out)?;
+                self.cuda_ctx_mut()
+                    .flash_attn_q40(
+                        q,
+                        k,
+                        v,
+                        meta,
+                        tmp,
+                        out,
+                        n_tok as u32,
+                        n_q as u32,
+                        n_kv as u32,
+                        hd as u32,
+                        max_t as u32,
+                        n_parts.max(1) as u32,
+                        kv_len.max(1) as u32,
+                    )
+                    .map_err(|e| anyhow!("flash_attn_q40: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("flash_attn_q40 is a CUDA path"),
+        }
+    }
+
     /// `KSEARCH_CUBLAS!=0` (default on): F16 prefill GEMM via cuBLAS when available.
     pub fn cublas_gemm_enabled(&self) -> bool {
         #[cfg(feature = "cuda")]

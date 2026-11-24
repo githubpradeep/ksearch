@@ -33,6 +33,8 @@
 
 pub mod cublas;
 pub mod ffi;
+pub mod hand_fa;
+pub mod hand_fa_mma;
 pub mod hand_mm;
 pub mod launch;
 
@@ -108,6 +110,13 @@ pub struct CudaContext {
     runtime: Option<RuntimeKernels>,
     /// Hand Q4_K×Q8_1 mmvq / mmq (llama.cpp-adapted). See [`hand_mm`].
     hand_mm: Option<hand_mm::HandMmKernels>,
+    /// Hand FlashAttention over Q4_0 KV. See [`hand_fa`].
+    hand_fa: Option<hand_fa::HandFaKernels>,
+    /// WMMA / tensor-core FlashAttention. See [`hand_fa_mma`].
+    hand_fa_mma: Option<hand_fa_mma::HandFaMmaKernels>,
+    /// Scratch F16 K/V for FA-MMA (llama.cpp converts Q4→F16 once before MMA).
+    /// `(K_f16, V_f16, capacity_bytes)`.
+    fa_kv_f16: Option<(Buffer, Buffer, usize)>,
     /// Lazy cuBLAS handle for F16 prefill GEMM. See [`cublas`].
     cublas: Option<cublas::Cublas>,
     /// Non-default stream used to capture and replay a decode token.
@@ -217,6 +226,9 @@ impl CudaContext {
             modules: HashMap::new(),
             runtime: None,
             hand_mm: None,
+            hand_fa: None,
+            hand_fa_mma: None,
+            fa_kv_f16: None,
             cublas: None,
             stream: std::ptr::null_mut(),
             capturing: false,

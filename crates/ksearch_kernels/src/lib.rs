@@ -1412,7 +1412,9 @@ impl Eng {
         self.run(ctx, &red_key, &[tmp], out)
     }
 
-    /// Hybrid SDPA: online shared-head if `attn_t < THRESHOLD`, else MWG.
+    /// Hybrid SDPA: hand FlashAttention (CUDA Q4_0) when enabled, else
+    /// online naive / partitioned MWG by `attn_t`.
+    /// `kv_len` = absolute filled KV positions (for FA Q4→F16 convert; ≠ SWA window).
     pub fn sdpa_hybrid_kv(
         &mut self,
         ctx: &Context,
@@ -1421,6 +1423,7 @@ impl Eng {
         hd: usize,
         max_t: usize,
         attn_t: u32,
+        kv_len: usize,
         kv_dtype: DType,
         q: &Buffer,
         k: &Buffer,
@@ -1429,6 +1432,26 @@ impl Eng {
         tmp: &Buffer,
         out: &Buffer,
     ) -> Result<()> {
+        if ctx.flash_attn_enabled() && kv_dtype == DType::Q40 {
+            // Match MWG occupancy: up to 16 KV slices (fattn parallel_blocks).
+            // ceil(attn_t/32) so short decode still multi-blocks; never under-fill.
+            let n_parts = ((attn_t as usize).div_ceil(32)).clamp(1, Self::sdpa_mwg_nwg());
+            return ctx.flash_attn_q40(
+                q,
+                k,
+                v,
+                meta,
+                tmp,
+                out,
+                1,
+                n_q,
+                n_kv,
+                hd,
+                max_t,
+                n_parts,
+                kv_len.clamp(1, max_t),
+            );
+        }
         if attn_t >= Self::SDPA_MWG_THRESHOLD {
             self.sdpa_mwg_kv(ctx, n_q, n_kv, hd, max_t, kv_dtype, q, k, v, meta, tmp, out)
         } else {
@@ -1930,6 +1953,7 @@ impl Eng {
         hd: usize,
         max_t: usize,
         attn_t: u32,
+        kv_len: usize,
         kv_dtype: DType,
         q: &Buffer,
         k: &Buffer,
@@ -1940,7 +1964,25 @@ impl Eng {
     ) -> Result<()> {
         if n_tok == 1 {
             return self.sdpa_hybrid_kv(
-                ctx, n_q, n_kv, hd, max_t, attn_t, kv_dtype, q, k, v, meta, tmp, out,
+                ctx, n_q, n_kv, hd, max_t, attn_t, kv_len, kv_dtype, q, k, v, meta, tmp, out,
+            );
+        }
+        if ctx.flash_attn_enabled() && kv_dtype == DType::Q40 {
+            let n_parts = ((attn_t as usize).div_ceil(32)).clamp(1, Self::sdpa_mwg_nwg());
+            return ctx.flash_attn_q40(
+                q,
+                k,
+                v,
+                meta,
+                tmp,
+                out,
+                n_tok,
+                n_q,
+                n_kv,
+                hd,
+                max_t,
+                n_parts,
+                kv_len.clamp(1, max_t),
             );
         }
         // Small verify batches: prefer naive over MWG×n_tok (re-reads KV per row).

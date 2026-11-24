@@ -49,13 +49,13 @@ fn main() -> Result<()> {
     let last = (pos0 + n_tok) as u32;
     // warmup
     for _ in 0..5 {
-        eng.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
+        eng.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), last.min(max_t as u32) as usize, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
         ctx.synchronize()?;
     }
     let n = 50;
     let t0 = Instant::now();
     for _ in 0..n {
-        eng.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
+        eng.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), last.min(max_t as u32) as usize, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
         ctx.synchronize()?;
     }
     println!("sdpa batch=2 shared: {:.3} ms", t0.elapsed().as_secs_f64()*1e3/n as f64);
@@ -64,12 +64,12 @@ fn main() -> Result<()> {
     // force new key by using different eng cache - need new Eng
     let mut eng2 = Eng::new();
     for _ in 0..5 {
-        eng2.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
+        eng2.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), last.min(max_t as u32) as usize, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
         ctx.synchronize()?;
     }
     let t0 = Instant::now();
     for _ in 0..n {
-        eng2.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
+        eng2.sdpa_hybrid_kv_batch(&ctx, n_q, 1, n_tok, hd, max_t, last.min(max_t as u32), last.min(max_t as u32) as usize, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o)?;
         ctx.synchronize()?;
     }
     println!("sdpa batch=2 noshare: {:.3} ms", t0.elapsed().as_secs_f64()*1e3/n as f64);
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
             let abs = (pos0 + t + 1) as u32;
             write_meta(&ctx, &meta, abs.min(max_t as u32), abs.saturating_sub(max_t as u32), 0);
             eng3.copy_slice(&ctx, n_q*hd, &bq, t*n_q*hd, &q1, 0)?;
-            eng3.sdpa_hybrid_kv(&ctx, n_q, 1, hd, max_t, abs.min(max_t as u32), DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1)?;
+            eng3.sdpa_hybrid_kv(&ctx, n_q, 1, hd, max_t, abs.min(max_t as u32), abs.min(max_t as u32) as usize, DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1)?;
         }
         ctx.synchronize()?;
     }
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
             let abs = (pos0 + t + 1) as u32;
             write_meta(&ctx, &meta, abs.min(max_t as u32), abs.saturating_sub(max_t as u32), 0);
             eng3.copy_slice(&ctx, n_q*hd, &bq, t*n_q*hd, &q1, 0)?;
-            eng3.sdpa_hybrid_kv(&ctx, n_q, 1, hd, max_t, abs.min(max_t as u32), DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1)?;
+            eng3.sdpa_hybrid_kv(&ctx, n_q, 1, hd, max_t, abs.min(max_t as u32), abs.min(max_t as u32) as usize, DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1)?;
         }
         ctx.synchronize()?;
     }
