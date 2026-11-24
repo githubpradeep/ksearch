@@ -1,12 +1,12 @@
 //! Hand CUDA Flash Attention — WMMA / tensor-core path (llama.cpp fattn-mma-f16).
 //!
-//! llama.cpp does **not** run MMA on Q4_0 in-kernel. For MMA it:
-//! 1. converts K/V → F16 once (`to_fp16`), then
-//! 2. runs F16 tensor-core FlashAttention.
+//! llama.cpp MMA path: convert K/V → F16 once, then F16 tensor-core FA.
+//! We do the same. Tuning targets A10 Gemma E2B (MQA, D∈{256,512}):
+//! - D=256: BC=64, 128 threads (llama nbatch_fa=64 / ncols=8 shape)
+//! - D=512: BC=32, 256 threads (smem cap)
+//! - Prefill uses n_parts=1 (no combine tax); decode partitions for SM fill.
 //!
-//! We mirror that: a vectorized Q4_0→F16 pass over the used KV rows, then
-//! WMMA Q·Kᵀ / P·V over F16 tiles. Thesis A suspended (same class as
-//! [`crate::hand_fa`]). MIT NOTICE: patterns from llama.cpp fattn-mma-f16.
+//! Thesis A suspended (same class as [`crate::hand_fa`]). MIT NOTICE.
 
 use crate::ffi::CudaError;
 use crate::launch::LaunchConfig;
@@ -21,16 +21,16 @@ pub struct HandFaMmaKernels {
 }
 
 pub const BR: u32 = 16;
-/// KV tile rows. 32 keeps D=512 smem under A10's ~99 KiB/block cap.
-pub const BC: u32 = 32;
+pub const BC_D256: u32 = 64;
+pub const BC_D512: u32 = 32;
 
 pub fn mma_smem_bytes(hd: u32) -> u32 {
-    // Q half[BR*D] + K half[BC*D] + S float[BR*BC] + O float[BR*D] + P half[BR*BC]
+    let bc = if hd <= 256 { BC_D256 } else { BC_D512 };
     let q = BR * hd * 2;
-    let k = BC * hd * 2;
-    let s = BR * BC * 4;
+    let k = bc * hd * 2;
+    let s = BR * bc * 4;
     let o = BR * hd * 4;
-    let p = BR * BC * 2;
+    let p = BR * bc * 2;
     q + k + s + o + p
 }
 
@@ -43,15 +43,12 @@ using namespace nvcuda;
 #define QK4_0 32
 #define WARP_SIZE 32
 #define BR 16
-#define BC 32
 
 struct alignas(2) block_q4_0 {
   half d;
   uint8_t qs[QK4_0 / 2];
 };
 static_assert(sizeof(block_q4_0) == 18, "block_q4_0");
-
-// ---- one-shot Q4_0 → F16 (llama.cpp to_fp16 before fattn-mma) ----------------
 
 extern "C" __global__ void ks_q40_rows_to_f16(
     const uint8_t *__restrict__ src, half *__restrict__ dst, unsigned n_rows,
@@ -63,7 +60,6 @@ extern "C" __global__ void ks_q40_rows_to_f16(
       (const block_q4_0 *)(src + (size_t)row * (size_t)row_blocks *
                                     (size_t)sizeof(block_q4_0));
   half *out = dst + (size_t)row * (size_t)hd;
-  // 32 threads × 1 Q4 block apiece per step; vectorize within a block.
   for (int ib = threadIdx.x; ib < row_blocks; ib += (int)blockDim.x) {
     const block_q4_0 &b = brow[ib];
     const float d = __half2float(b.d);
@@ -76,8 +72,6 @@ extern "C" __global__ void ks_q40_rows_to_f16(
     }
   }
 }
-
-// ---- F16 WMMA flash attn ----------------------------------------------------
 
 static __device__ __forceinline__ float block_max(float v, int tid, int nthreads,
                                                    float *red) {
@@ -119,7 +113,7 @@ static __device__ __forceinline__ float block_sum(float v, int tid, int nthreads
   return red[0];
 }
 
-template <int D>
+template <int D, int BC>
 static __device__ __forceinline__ void load_kv_tile_f16(
     const half *__restrict__ src, half *__restrict__ dst, int row0, int n_kv,
     int kv_head, int tile_n, int tid, int nthreads) {
@@ -128,10 +122,8 @@ static __device__ __forceinline__ void load_kv_tile_f16(
     if (t < tile_n) {
       const half *row_src =
           src + ((size_t)(row0 + t) * (size_t)n_kv + (size_t)kv_head) * (size_t)D;
-      // vectorized 8-half (16B) moves when D%8==0 (always here).
-      for (int d = tid * 8; d < D; d += nthreads * 8) {
+      for (int d = tid * 8; d < D; d += nthreads * 8)
         *((uint4 *)(row_dst + d)) = *((const uint4 *)(row_src + d));
-      }
     } else {
       for (int d = tid; d < D; d += nthreads)
         row_dst[d] = __float2half(0.0f);
@@ -139,7 +131,7 @@ static __device__ __forceinline__ void load_kv_tile_f16(
   }
 }
 
-template <int D>
+template <int D, int BC>
 static __device__ void flash_attn_mma_f16_impl(
     const half *__restrict__ Q, const half *__restrict__ K,
     const half *__restrict__ V, const float *__restrict__ meta,
@@ -213,14 +205,11 @@ static __device__ void flash_attn_mma_f16_impl(
   for (int t0 = part * BC; t0 < tlen; t0 += (int)n_parts * BC) {
     const int tile_n = min(BC, tlen - t0);
 
-    load_kv_tile_f16<D>(K, K_s, start + t0, (int)n_kv, kv_head, tile_n, tid,
-                        nthreads);
+    load_kv_tile_f16<D, BC>(K, K_s, start + t0, (int)n_kv, kv_head, tile_n, tid,
+                            nthreads);
     __syncthreads();
 
-    for (int i = tid; i < BR * BC; i += nthreads)
-      S_s[i] = 0.0f;
-    __syncthreads();
-
+    // QK WMMA — S = Q · Kᵀ
     {
       const int warp = tid / WARP_SIZE;
       const int nwarps = nthreads / WARP_SIZE;
@@ -245,7 +234,7 @@ static __device__ void flash_attn_mma_f16_impl(
     }
     __syncthreads();
 
-    // Softmax over valid KV; OOB → 0 before P·V (llama.cpp fattn-mma).
+    // Softmax: llama.cpp zeros OOB before P·V.
     for (int r = 0; r < nrows; ++r) {
       float row_max = m_i[r];
       for (int c = tid; c < tile_n; c += nthreads)
@@ -275,14 +264,15 @@ static __device__ void flash_attn_mma_f16_impl(
     }
     __syncthreads();
 
-    load_kv_tile_f16<D>(V, K_s, start + t0, (int)n_kv, kv_head, tile_n, tid,
-                        nthreads);
+    load_kv_tile_f16<D, BC>(V, K_s, start + t0, (int)n_kv, kv_head, tile_n, tid,
+                            nthreads);
     __syncthreads();
 
     for (int i = tid; i < BR * BC; i += nthreads)
       P_h[i] = __float2half(S_s[i]);
     __syncthreads();
 
+    // PV WMMA — O += P · V
     {
       const int warp = tid / WARP_SIZE;
       const int nwarps = nthreads / WARP_SIZE;
@@ -337,8 +327,8 @@ extern "C" __global__ void ks_flash_attn_f16_mma_d256(
     const half *__restrict__ V, const float *__restrict__ meta,
     float *__restrict__ tmp, half *__restrict__ O, unsigned n_tok,
     unsigned n_q, unsigned n_kv, unsigned max_t, unsigned n_parts) {
-  flash_attn_mma_f16_impl<256>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
-                               n_parts);
+  flash_attn_mma_f16_impl<256, 64>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv,
+                                   max_t, n_parts);
 }
 
 extern "C" __global__ void ks_flash_attn_f16_mma_d512(
@@ -346,8 +336,8 @@ extern "C" __global__ void ks_flash_attn_f16_mma_d512(
     const half *__restrict__ V, const float *__restrict__ meta,
     float *__restrict__ tmp, half *__restrict__ O, unsigned n_tok,
     unsigned n_q, unsigned n_kv, unsigned max_t, unsigned n_parts) {
-  flash_attn_mma_f16_impl<512>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
-                               n_parts);
+  flash_attn_mma_f16_impl<512, 32>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv,
+                                   max_t, n_parts);
 }
 
 extern "C" __global__ void ks_flash_attn_q40_mma_combine(
@@ -398,13 +388,40 @@ impl super::CudaContext {
         Ok(k)
     }
 
-    /// WMMA FlashAttention: Q4_0 KV → F16 once, then F16 tensor-core FA.
-    /// `kv_len` = absolute filled KV positions (not the SWA window).
-    pub fn flash_attn_q40_mma(
+    /// Convert `n_rows` Q4_0 rows (`hd` elems each) starting at row `row0` into F16.
+    pub fn q40_rows_to_f16(
+        &mut self,
+        src: &Buffer,
+        dst: &Buffer,
+        row0: u32,
+        n_rows: u32,
+        hd: u32,
+    ) -> Result<(), CudaError> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let kern = self.hand_fa_mma_kernels()?;
+        let row_bytes = (hd / 32) * 18;
+        let src_off = row0 as u64 * row_bytes as u64;
+        let dst_off = row0 as u64 * hd as u64 * 2;
+        let mut args = KernelArgs::new();
+        args.ptr(src.as_ptr() + src_off)
+            .ptr(dst.as_ptr() + dst_off)
+            .u32(n_rows)
+            .u32(hd);
+        self.launch_with(
+            kern.dequant,
+            LaunchConfig::new((n_rows.max(1), 1), (64, 1), 0),
+            &mut args,
+        )
+    }
+
+    /// F16-KV WMMA FlashAttention (no Q4 convert).
+    pub fn flash_attn_f16_mma(
         &mut self,
         q: &Buffer,
-        k: &Buffer,
-        v: &Buffer,
+        k_f16: &Buffer,
+        v_f16: &Buffer,
         meta: &Buffer,
         tmp: &Buffer,
         out: &Buffer,
@@ -414,87 +431,42 @@ impl super::CudaContext {
         hd: u32,
         max_t: u32,
         n_parts: u32,
-        kv_len: u32,
     ) -> Result<(), CudaError> {
         if n_kv == 0 || n_q % n_kv != 0 || (n_q / n_kv) > 16 {
             return Err(CudaError::Other(format!(
-                "flash_attn_q40_mma: n_q={n_q} n_kv={n_kv} unsupported"
+                "flash_attn_f16_mma: n_q={n_q} n_kv={n_kv} unsupported"
             )));
         }
         let n_parts = n_parts.max(1);
-        let kv_len = kv_len.min(max_t).max(1);
         let kern = self.hand_fa_mma_kernels()?;
-        let entry = match hd {
-            256 => kern.mma_d256,
-            512 => kern.mma_d512,
+        let (entry, nwarps) = match hd {
+            256 => (kern.mma_d256, 4u32), // 128 thr — llama ncols=8 shape
+            512 => (kern.mma_d512, 8u32),
             _ => {
                 return Err(CudaError::Other(format!(
-                    "flash_attn_q40_mma: hd={hd} need 256|512"
+                    "flash_attn_f16_mma: hd={hd} need 256|512"
                 )))
             }
         };
-
-        let n_rows = kv_len.saturating_mul(n_kv);
-        let elems = n_rows as usize * hd as usize;
-        // Dequant into workspace, then MMA reads F16.
-        {
-            let (k_f16, v_f16) = {
-                let bytes = elems.max(1) * 2;
-                let need = match &self.fa_kv_f16 {
-                    Some((_, _, cap)) => *cap < bytes,
-                    None => true,
-                };
-                if need {
-                    let kf = self.alloc(bytes)?;
-                    let vf = self.alloc(bytes)?;
-                    self.fa_kv_f16 = Some((kf, vf, bytes));
-                }
-                let (kf, vf, _) = self.fa_kv_f16.as_ref().unwrap();
-                (kf.clone(), vf.clone())
-            };
-            let mut dargs = KernelArgs::new();
-            dargs
-                .ptr(k.as_ptr())
-                .ptr(k_f16.as_ptr())
-                .u32(n_rows)
-                .u32(hd);
-            self.launch_with(
-                kern.dequant,
-                LaunchConfig::new((n_rows.max(1), 1), (64, 1), 0),
-                &mut dargs,
-            )?;
-            let mut dargs = KernelArgs::new();
-            dargs
-                .ptr(v.as_ptr())
-                .ptr(v_f16.as_ptr())
-                .u32(n_rows)
-                .u32(hd);
-            self.launch_with(
-                kern.dequant,
-                LaunchConfig::new((n_rows.max(1), 1), (64, 1), 0),
-                &mut dargs,
-            )?;
-
-            let smem = mma_smem_bytes(hd);
-            let mut args = KernelArgs::new();
-            args.ptr(q.as_ptr())
-                .ptr(k_f16.as_ptr())
-                .ptr(v_f16.as_ptr())
-                .ptr(meta.as_ptr())
-                .ptr(tmp.as_ptr())
-                .ptr(out.as_ptr())
-                .u32(n_tok)
-                .u32(n_q)
-                .u32(n_kv)
-                .u32(max_t)
-                .u32(n_parts);
-            let grid = n_tok.saturating_mul(n_kv).saturating_mul(n_parts).max(1);
-            self.launch_with(
-                entry,
-                LaunchConfig::new((grid, 1), (32, 8), smem),
-                &mut args,
-            )?;
-        }
+        let smem = mma_smem_bytes(hd);
+        let mut args = KernelArgs::new();
+        args.ptr(q.as_ptr())
+            .ptr(k_f16.as_ptr())
+            .ptr(v_f16.as_ptr())
+            .ptr(meta.as_ptr())
+            .ptr(tmp.as_ptr())
+            .ptr(out.as_ptr())
+            .u32(n_tok)
+            .u32(n_q)
+            .u32(n_kv)
+            .u32(max_t)
+            .u32(n_parts);
+        let grid = n_tok.saturating_mul(n_kv).saturating_mul(n_parts).max(1);
+        self.launch_with(
+            entry,
+            LaunchConfig::new((grid, 1), (32, nwarps), smem),
+            &mut args,
+        )?;
         if n_parts > 1 {
             let mut cargs = KernelArgs::new();
             cargs
@@ -512,5 +484,47 @@ impl super::CudaContext {
             )?;
         }
         Ok(())
+    }
+
+    /// WMMA FlashAttention: Q4_0 KV → F16 once (workspace), then F16 TC FA.
+    /// `kv_len` = absolute filled KV positions (not the SWA window).
+    pub fn flash_attn_q40_mma(
+        &mut self,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+        n_tok: u32,
+        n_q: u32,
+        n_kv: u32,
+        hd: u32,
+        max_t: u32,
+        n_parts: u32,
+        kv_len: u32,
+    ) -> Result<(), CudaError> {
+        let kv_len = kv_len.min(max_t).max(1);
+        let n_rows = kv_len.saturating_mul(n_kv);
+        let elems = n_rows as usize * hd as usize;
+        let (k_f16, v_f16) = {
+            let bytes = elems.max(1) * 2;
+            let need = match &self.fa_kv_f16 {
+                Some((_, _, cap)) => *cap < bytes,
+                None => true,
+            };
+            if need {
+                let kf = self.alloc(bytes)?;
+                let vf = self.alloc(bytes)?;
+                self.fa_kv_f16 = Some((kf, vf, bytes));
+            }
+            let (kf, vf, _) = self.fa_kv_f16.as_ref().unwrap();
+            (kf.clone(), vf.clone())
+        };
+        self.q40_rows_to_f16(k, &k_f16, 0, n_rows, hd)?;
+        self.q40_rows_to_f16(v, &v_f16, 0, n_rows, hd)?;
+        self.flash_attn_f16_mma(
+            q, &k_f16, &v_f16, meta, tmp, out, n_tok, n_q, n_kv, hd, max_t, n_parts,
+        )
     }
 }

@@ -176,6 +176,9 @@ pub struct GemmaPrimModel {
     /// Device Q4_0 KV [max_seq × hd] per owning layer (Load(Q40) expand in SDPA).
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
+    /// Persistent F16 KV mirror for FA-MMA (skip per-call Q4→F16). Empty unless FA on.
+    kv_k_f16: Vec<Buffer>,
+    kv_v_f16: Vec<Buffer>,
     eng: Eng,
     weight_bufs: HashMap<String, WeightBuf>,
     /// Dequant-once F16 prefill cache (CUDA), keyed like `weight_bufs`.
@@ -283,13 +286,35 @@ impl GemmaPrimModel {
         let ple_total = cfg.ple_total();
 
         let n_kv_owners = cfg.n_layers - cfg.shared_kv_layers;
+        let fa_kv = ctx.flash_attn_enabled();
         let mut kv_k = Vec::new();
         let mut kv_v = Vec::new();
+        let mut kv_k_f16 = Vec::new();
+        let mut kv_v_f16 = Vec::new();
+        let mut n_f16_owners = 0usize;
         for i in 0..n_kv_owners {
             let hd = cfg.head_dim(i);
             // Q4_0 packed KV (Thesis A Load(Q40) expand in SDPA).
             kv_k.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq * cfg.n_kv, hd)));
             kv_v.push(ctx.buffer_empty_bytes(q40_nbytes(max_seq * cfg.n_kv, hd)));
+            // Persistent F16 only when this layer will take the MMA path.
+            if fa_kv && Self::fa_wants_mma(hd) {
+                let n = max_seq * cfg.n_kv * hd;
+                kv_k_f16.push(ctx.buffer_empty_f16(n));
+                kv_v_f16.push(ctx.buffer_empty_f16(n));
+                n_f16_owners += 1;
+            } else if fa_kv {
+                // Keep index-aligned placeholders (empty) so kv_src still maps 1:1.
+                kv_k_f16.push(ctx.buffer_empty_f16(0));
+                kv_v_f16.push(ctx.buffer_empty_f16(0));
+            }
+        }
+        if fa_kv && n_f16_owners > 0 {
+            eprintln!(
+                "[prim] FA persistent F16 KV mirror enabled ({n_f16_owners}/{n_kv_owners} MMA owners)"
+            );
+        } else if fa_kv {
+            eprintln!("[prim] FA vec path (no F16 KV mirror)");
         }
 
         let mut meta = Vec::with_capacity(cfg.n_layers);
@@ -442,6 +467,8 @@ impl GemmaPrimModel {
             hd_full: cfg.head_dim_full,
             kv_k,
             kv_v,
+            kv_k_f16,
+            kv_v_f16,
             eng,
             weight_bufs: HashMap::new(),
             f16_bufs: HashMap::new(),
@@ -921,6 +948,52 @@ impl GemmaPrimModel {
         // f32: integers stay exact through max_seq (F16 ULP is 2+ past 2048).
         self.ctx
             .write_f32_at(&self.meta[layer], 0, &[tlen as f32, start as f32, window as f32]);
+    }
+
+    /// llama.cpp A10 policy: MMA for D=512; vec for ≤256.
+    /// `KSEARCH_FLASH_ATTN_MMA=1` forces MMA on 256|512; `=0` forces vec.
+    fn fa_wants_mma(hd: usize) -> bool {
+        match std::env::var("KSEARCH_FLASH_ATTN_MMA").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => hd == 256 || hd == 512,
+            _ => hd == 512,
+        }
+    }
+
+    /// Mirror newly packed Q4_0 KV rows into the persistent F16 FA cache (MMA only).
+    fn sync_kv_f16(&self, kv_src: usize, hd: usize, pos0: usize, n_tok: usize) -> Result<()> {
+        if self.kv_k_f16.is_empty() || n_tok == 0 || !Self::fa_wants_mma(hd) {
+            return Ok(());
+        }
+        let n_kv = self.cfg.n_kv;
+        let row0 = pos0 * n_kv;
+        let nrows = n_tok * n_kv;
+        self.ctx.q40_rows_to_f16(
+            &self.kv_k[kv_src],
+            &self.kv_k_f16[kv_src],
+            row0,
+            nrows,
+            hd,
+        )?;
+        self.ctx.q40_rows_to_f16(
+            &self.kv_v[kv_src],
+            &self.kv_v_f16[kv_src],
+            row0,
+            nrows,
+            hd,
+        )?;
+        Ok(())
+    }
+
+    fn fa_kv_pair(&self, kv_src: usize, hd: usize) -> (Option<Buffer>, Option<Buffer>) {
+        if self.kv_k_f16.is_empty() || !Self::fa_wants_mma(hd) {
+            (None, None)
+        } else {
+            (
+                Some(self.kv_k_f16[kv_src].clone()),
+                Some(self.kv_v_f16[kv_src].clone()),
+            )
+        }
     }
 
     fn ensure_meta_table(&mut self) -> Result<()> {
@@ -1415,6 +1488,7 @@ impl GemmaPrimModel {
                     &self.kv_k[kv_src],
                     &self.kv_v[kv_src],
                 )?;
+                self.sync_kv_f16(kv_src, hd, self.pos, 1)?;
             } else {
                 self.eng.rmsnorm_per_head_rope_pos(
                     &self.ctx,
@@ -1436,6 +1510,7 @@ impl GemmaPrimModel {
             } else {
                 kv_len as u32
             };
+            let (kf, vf) = self.fa_kv_pair(kv_src, hd);
             self.eng.sdpa_hybrid_kv(
                 &self.ctx,
                 n_heads,
@@ -1451,6 +1526,8 @@ impl GemmaPrimModel {
                 &self.meta[layer],
                 &self.tmp_attn_mwg,
                 &self.tmp_o,
+                kf.as_ref(),
+                vf.as_ref(),
             )?;
 
             self.matvec_w(h, o_in, &format!("{pref}attn_output.weight"), self.tmp_o.clone(), self.x2.clone())?;
@@ -2217,6 +2294,7 @@ impl GemmaPrimModel {
                     &self.kv_v[kv_src],
                     kv_off,
                 )?;
+                self.sync_kv_f16(kv_src, hd, pos0, t)?;
             } else {
                 let rope_off = pos0 * rope_hd;
                 self.eng.rmsnorm_per_head_rope_batch(
@@ -2239,6 +2317,7 @@ impl GemmaPrimModel {
             } else {
                 last_tlen as u32
             };
+            let (kf, vf) = self.fa_kv_pair(kv_src, hd);
             self.eng.sdpa_hybrid_kv_batch(
                 &self.ctx,
                 n_heads,
@@ -2255,6 +2334,8 @@ impl GemmaPrimModel {
                 &self.meta[layer],
                 &self.tmp_attn_mwg,
                 &self.tmp_o,
+                kf.as_ref(),
+                vf.as_ref(),
             )?;
             if pprof {
                 self.ctx.synchronize()?;

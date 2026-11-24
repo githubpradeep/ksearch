@@ -215,6 +215,7 @@ fn check_sdpa(
     let last_tlen = (pos0 + n_tok) as u32;
     eng.sdpa_hybrid_kv_batch(
         ctx, n_q, 1, n_tok, hd, max_t, last_tlen.min(win), last_tlen as usize, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o_b,
+        None, None,
     )?;
 
     for t in 0..n_tok {
@@ -226,6 +227,7 @@ fn check_sdpa(
         eng.copy_slice(ctx, n_q * hd, &bq, t * n_q * hd, &q1, 0)?;
         eng.sdpa_hybrid_kv(
             ctx, n_q, 1, hd, max_t, tlen, abs as usize, DType::Q40, &q1, &bk, &bv, &meta, &tmp, &o1,
+            None, None,
         )?;
         eng.copy_slice(ctx, n_q * hd, &o1, 0, &o_s, t * n_q * hd)?;
     }
@@ -277,6 +279,7 @@ fn check_needle(
     let o = ctx.buffer_empty_f16(qn);
     eng.sdpa_hybrid_kv(
         ctx, n_q, 1, hd, tlen, tlen as u32, tlen, DType::Q40, &bq, &bk, &bv, &meta, &tmp, &o,
+        None, None,
     )?;
     ctx.synchronize()?;
     let out = read_f16(ctx, &o, qn);

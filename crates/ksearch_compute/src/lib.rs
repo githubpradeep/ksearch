@@ -745,6 +745,76 @@ impl Context {
         }
     }
 
+    /// FlashAttention over already-F16 K/V (persistent FA cache).
+    pub fn flash_attn_f16(
+        &self,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        meta: &Buffer,
+        tmp: &Buffer,
+        out: &Buffer,
+        n_tok: usize,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+        max_t: usize,
+        n_parts: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let q = Self::cuda_buf(q)?;
+                let k = Self::cuda_buf(k)?;
+                let v = Self::cuda_buf(v)?;
+                let meta = Self::cuda_buf(meta)?;
+                let tmp = Self::cuda_buf(tmp)?;
+                let out = Self::cuda_buf(out)?;
+                self.cuda_ctx_mut()
+                    .flash_attn_f16_mma(
+                        q,
+                        k,
+                        v,
+                        meta,
+                        tmp,
+                        out,
+                        n_tok as u32,
+                        n_q as u32,
+                        n_kv as u32,
+                        hd as u32,
+                        max_t as u32,
+                        n_parts.max(1) as u32,
+                    )
+                    .map_err(|e| anyhow!("flash_attn_f16: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("flash_attn_f16 is a CUDA path"),
+        }
+    }
+
+    /// Q4_0 → F16 row convert for the persistent FA KV cache.
+    pub fn q40_rows_to_f16(
+        &self,
+        src: &Buffer,
+        dst: &Buffer,
+        row0: usize,
+        n_rows: usize,
+        hd: usize,
+    ) -> Result<()> {
+        match self.backend {
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let src = Self::cuda_buf(src)?;
+                let dst = Self::cuda_buf(dst)?;
+                self.cuda_ctx_mut()
+                    .q40_rows_to_f16(src, dst, row0 as u32, n_rows as u32, hd as u32)
+                    .map_err(|e| anyhow!("q40_rows_to_f16: {e}"))
+            }
+            #[allow(unreachable_patterns)]
+            _ => bail!("q40_rows_to_f16 is a CUDA path"),
+        }
+    }
+
     /// `KSEARCH_CUBLAS!=0` (default on): F16 prefill GEMM via cuBLAS when available.
     pub fn cublas_gemm_enabled(&self) -> bool {
         #[cfg(feature = "cuda")]

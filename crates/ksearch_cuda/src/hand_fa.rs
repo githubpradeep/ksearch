@@ -1,16 +1,14 @@
-//! Hand CUDA Flash Attention over Q4_0 KV — llama.cpp fattn-vec shaped.
+//! Hand CUDA Flash Attention — llama.cpp `fattn-vec` port (Q4_0×Q4_0).
 //!
-//! Adapted from [llama.cpp](https://github.com/ggml-org/llama.cpp) `fattn-vec.cuh` /
-//! `fattn-common.cuh` (MIT; see `NOTICE`). Thesis A suspended (same class as
-//! [`crate::hand_mm`]).
+//! Adapted from llama.cpp `fattn-vec.cuh` / `fattn-common.cuh` (MIT; see `NOTICE`).
+//! Thesis A suspended (same class as [`crate::hand_mm`]).
 //!
-//! - block = (32, 4) → 128 threads / 128 KV per tile
-//! - Q → Q8_1 + dp4a against Q4_0 K
-//! - V: vectorized Q4_0 dequant (4-wide), warp-local KV slice + cross-warp reduce
-//! - `n_parts` parallel KV slices + online-softmax combine
-//! - one block per `(tok, kv_head, part)`; GQA/MQA shares K/V in-block
+//! Matches llama.cpp dispatch on A10 for quantized KV:
+//! - D≤256 → fattn-vec (this file)
+//! - D=512 → fattn-mma-f16 ([`crate::hand_fa_mma`]; no vec instance for 512)
 //!
-//! Math matches AST SDPA: score = Q·K (no 1/√d).
+//! Launch shape matches llama decode (ncols=1): **one block per Q head**,
+//! `grid = n_tok * n_q * n_parts`, GQA via `kv_head = q_head / gqa_ratio`.
 
 use crate::ffi::CudaError;
 use crate::launch::LaunchConfig;
@@ -18,8 +16,19 @@ use crate::{Buffer, Kernel, KernelArgs};
 
 #[derive(Clone, Copy)]
 pub struct HandFaKernels {
+    pub flash_q40_vec_d256: Kernel,
     pub flash_q40_vec: Kernel,
     pub flash_q40_combine: Kernel,
+}
+
+/// llama.cpp A10 quantized-KV policy: MMA for D=512 (no Q4 vec); vec for ≤256.
+/// `KSEARCH_FLASH_ATTN_MMA=1` forces MMA on 256|512; `=0` forces vec.
+pub fn prefer_fa_mma(hd: u32) -> bool {
+    match std::env::var("KSEARCH_FLASH_ATTN_MMA").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => hd == 256 || hd == 512,
+        _ => hd == 512,
+    }
 }
 
 pub const HAND_FA_SRC: &str = r#"
@@ -33,11 +42,7 @@ pub const HAND_FA_SRC: &str = r#"
 #define WARP_SIZE 32
 #define NWARPS 4
 #define NTHREADS (WARP_SIZE * NWARPS)
-#define MAX_GROUP 16
-#define MAX_D 512
 #define V_ROWS 4
-#define MAX_NE (MAX_D / WARP_SIZE)           // floats per lane (D/32)
-#define MAX_QPACK (MAX_D / (4 * WARP_SIZE))  // int32 packs per lane for K-dot
 
 struct alignas(2) block_q4_0 {
   half d;
@@ -96,13 +101,14 @@ static __device__ __forceinline__ void quantize_q8_1_to_shared(
     yds[threadIdx.x / QI8_1] = make_float2(d, sum);
 }
 
+template <int D>
 static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     const block_q4_0 *__restrict__ K_row, const int *__restrict__ Q_q8,
-    const float2 *__restrict__ Q_ds, int n_qpack) {
+    const float2 *__restrict__ Q_ds) {
+  constexpr int n_qpack = D / (4 * WARP_SIZE);
   float sum = 0.0f;
 #pragma unroll
-  for (int i0 = 0; i0 < MAX_QPACK; ++i0) {
-    if (i0 >= n_qpack) break;
+  for (int i0 = 0; i0 < n_qpack; ++i0) {
     const int k = i0 * WARP_SIZE + threadIdx.x;
     const int ib = k / QI8_1;
     const int iqs4 = k % QI4_0;
@@ -119,7 +125,6 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
   return sum;
 }
 
-// llama.cpp dequantize_V_q4_0: load `V_ROWS` consecutive elems starting at i0.
 static __device__ __forceinline__ void dequant_v_q4_0(
     const block_q4_0 *__restrict__ row, int i0, float *dst) {
   const int ib = i0 / QK4_0;
@@ -127,7 +132,6 @@ static __device__ __forceinline__ void dequant_v_q4_0(
   const int shift = (i0 % QK4_0) / (QK4_0 / 2);
   int q;
   const uint8_t *p = row[ib].qs + iqs;
-  // V_ROWS==4 → read 4 packed nibbles as one int (low or high nibble plane).
   q = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
   q >>= 4 * shift;
   q &= 0x0F0F0F0F;
@@ -138,28 +142,25 @@ static __device__ __forceinline__ void dequant_v_q4_0(
     dst[l] = d * (float)(q8[l] - 8);
 }
 
-// Lane tx owns dims c*128 + tx*4 + 0..3  (c = chunk). o_reg index = c*4 + j.
-static __device__ __forceinline__ int o_dim(int c, int j) {
-  return c * (WARP_SIZE * V_ROWS) + threadIdx.x * V_ROWS + j;
-}
-
-extern "C" __global__ void ks_flash_attn_q40_vec(
+// One Q head per block (llama fattn-vec ncols=1).
+template <int D>
+static __device__ void flash_attn_vec_impl(
     const half *__restrict__ Q, const uint8_t *__restrict__ K,
     const uint8_t *__restrict__ V, const float *__restrict__ meta,
     float *__restrict__ tmp, half *__restrict__ O, unsigned n_tok,
-    unsigned n_q, unsigned n_kv, unsigned hd, unsigned max_t,
-    unsigned n_parts) {
+    unsigned n_q, unsigned n_kv, unsigned max_t, unsigned n_parts) {
+  constexpr int n_qpack = D / (4 * WARP_SIZE);
+  constexpr int ne = D / WARP_SIZE;
+  constexpr int n_chunks = D / (WARP_SIZE * V_ROWS);
+
   const int part = (int)(blockIdx.x % n_parts);
-  const int kv_head = (int)((blockIdx.x / n_parts) % n_kv);
-  const int tok = (int)(blockIdx.x / (n_parts * n_kv));
+  const int q_head = (int)((blockIdx.x / n_parts) % n_q);
+  const int tok = (int)(blockIdx.x / (n_parts * n_q));
   if (tok >= (int)n_tok) return;
 
-  const int n_groups = (int)(n_q / max(n_kv, 1u));
-  const int q_head0 = kv_head * n_groups;
-  const int row_bytes = (int)(hd / QK4_0) * (int)sizeof(block_q4_0);
-  const int n_qpack = (int)hd / (4 * WARP_SIZE);
-  const int ne = (int)hd / WARP_SIZE; // floats per lane
-  const int n_chunks = (int)hd / (WARP_SIZE * V_ROWS);
+  const int gqa = (int)(n_q / max(n_kv, 1u));
+  const int kv_head = q_head / max(gqa, 1);
+  const int row_bytes = (D / QK4_0) * (int)sizeof(block_q4_0);
   const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
 
   int tlen, start;
@@ -173,45 +174,34 @@ extern "C" __global__ void ks_flash_attn_q40_vec(
     start = abs_t - tlen;
   }
 
-  __shared__ float q_f32[MAX_D];
-  __shared__ int q_i32_sh[MAX_D / 4];
-  __shared__ float2 q_ds_sh[MAX_D / QK8_1];
-  __shared__ float KQ[MAX_GROUP * NTHREADS];
-  __shared__ float tile_max[MAX_GROUP];
-  __shared__ float l_warp[MAX_GROUP][NWARPS];
-  __shared__ float l_bcast[MAX_GROUP];
-  __shared__ float a_bcast[MAX_GROUP];
-  // Per-lane cross-warp O reduce: [warp][lane][ne]
-  __shared__ float o_red[NWARPS][WARP_SIZE][MAX_NE];
+  __shared__ float q_f32[D];
+  __shared__ int q_i32_sh[D / 4];
+  __shared__ float2 q_ds_sh[D / QK8_1];
+  __shared__ float KQ[NTHREADS];
+  __shared__ float tile_max;
+  __shared__ float l_warp[NWARPS];
+  __shared__ float l_bcast;
+  __shared__ float a_bcast;
+  __shared__ float o_red[NWARPS][WARP_SIZE][D / WARP_SIZE];
 
-  int Q_i32[MAX_GROUP][MAX_QPACK];
-  float2 Q_ds[MAX_GROUP][MAX_QPACK];
-  float o_reg[MAX_GROUP][MAX_NE];
-  float m_i[MAX_GROUP];
-  float l_i[MAX_GROUP];
+  int Q_i32[n_qpack];
+  float2 Q_ds[n_qpack];
+  float o_reg[ne];
+  float m_i = -1.0e30f;
+  float l_i = 0.0f;
 
 #pragma unroll
-  for (int g = 0; g < MAX_GROUP; ++g) {
-    m_i[g] = -1.0e30f;
-    l_i[g] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < MAX_NE; ++i)
-      o_reg[g][i] = 0.0f;
-#pragma unroll
-    for (int i = 0; i < MAX_QPACK; ++i) {
-      Q_i32[g][i] = 0;
-      Q_ds[g][i] = make_float2(0.0f, 0.0f);
-    }
-  }
+  for (int i = 0; i < ne; ++i)
+    o_reg[i] = 0.0f;
 
-  for (int g = 0; g < n_groups; ++g) {
-    const int q_off = (tok * (int)n_q + q_head0 + g) * (int)hd;
-    for (int i = tid; i < (int)hd; i += NTHREADS)
+  {
+    const int q_off = (tok * (int)n_q + q_head) * D;
+    for (int i = tid; i < D; i += NTHREADS)
       q_f32[i] = __half2float(Q[q_off + i]);
     __syncthreads();
 
     if (threadIdx.y == 0) {
-      const int n_ints = (int)hd / 4;
+      const int n_ints = D / 4;
       for (int i0 = 0; i0 < n_ints; i0 += WARP_SIZE) {
         quantize_q8_1_to_shared<WARP_SIZE>(q_f32 + i0 * 4, q_i32_sh + i0,
                                            q_ds_sh + i0 / QI8_1);
@@ -220,107 +210,85 @@ extern "C" __global__ void ks_flash_attn_q40_vec(
     __syncthreads();
 
 #pragma unroll
-    for (int i0 = 0; i0 < MAX_QPACK; ++i0) {
-      if (i0 >= n_qpack) break;
+    for (int i0 = 0; i0 < n_qpack; ++i0) {
       const int i = i0 * WARP_SIZE + threadIdx.x;
-      Q_i32[g][i0] = q_i32_sh[i];
-      Q_ds[g][i0] = q_ds_sh[i / QI8_1];
+      Q_i32[i0] = q_i32_sh[i];
+      Q_ds[i0] = q_ds_sh[i / QI8_1];
     }
-    __syncthreads();
   }
 
   if (tlen <= 0) {
     if (n_parts == 1 && threadIdx.y == 0) {
-      for (int g = 0; g < n_groups; ++g) {
-        const int o_off = (tok * (int)n_q + q_head0 + g) * (int)hd;
+      const int o_off = (tok * (int)n_q + q_head) * D;
 #pragma unroll
-        for (int c = 0; c < MAX_D / (WARP_SIZE * V_ROWS); ++c) {
-          if (c >= n_chunks) break;
+      for (int c = 0; c < n_chunks; ++c)
 #pragma unroll
-          for (int j = 0; j < V_ROWS; ++j)
-            O[o_off + o_dim(c, j)] = __float2half(0.0f);
-        }
-      }
+        for (int j = 0; j < V_ROWS; ++j)
+          O[o_off + c * (WARP_SIZE * V_ROWS) + threadIdx.x * V_ROWS + j] =
+              __float2half(0.0f);
     }
     return;
   }
 
   for (int t0 = part * NTHREADS; t0 < tlen; t0 += (int)n_parts * NTHREADS) {
-    // --- KQ tile ---
 #pragma unroll
     for (int i_KQ = 0; i_KQ < WARP_SIZE; ++i_KQ) {
       const int kv_idx = t0 + threadIdx.y * WARP_SIZE + i_KQ;
       const bool valid = kv_idx < tlen;
-      const block_q4_0 *k_row = nullptr;
+      float score = -1.0e30f;
       if (valid) {
         const int row = (start + kv_idx) * (int)n_kv + kv_head;
-        k_row = (const block_q4_0 *)(K + (size_t)row * (size_t)row_bytes);
-      }
-#pragma unroll
-      for (int g = 0; g < MAX_GROUP; ++g) {
-        if (g >= n_groups) break;
-        float score = -1.0e30f;
-        if (valid)
-          score = vec_dot_q4_0_q8_1(k_row, Q_i32[g], Q_ds[g], n_qpack);
+        const block_q4_0 *k_row =
+            (const block_q4_0 *)(K + (size_t)row * (size_t)row_bytes);
+        score = vec_dot_q4_0_q8_1<D>(k_row, Q_i32, Q_ds);
         score = warp_sum_f(score);
-        if (!valid) score = -1.0e30f;
-        if (threadIdx.x == i_KQ)
-          KQ[g * NTHREADS + threadIdx.y * WARP_SIZE + i_KQ] = score;
       }
+      if (!valid) score = -1.0e30f;
+      if (threadIdx.x == i_KQ)
+        KQ[threadIdx.y * WARP_SIZE + i_KQ] = score;
     }
     __syncthreads();
 
-    if (threadIdx.y == 0 && threadIdx.x < n_groups) {
-      float tm = m_i[threadIdx.x];
+    if (tid == 0) {
+      float tm = m_i;
 #pragma unroll
       for (int s = 0; s < NTHREADS; ++s)
-        tm = fmaxf(tm, KQ[threadIdx.x * NTHREADS + s]);
-      tile_max[threadIdx.x] = tm;
+        tm = fmaxf(tm, KQ[s]);
+      tile_max = tm;
     }
     __syncthreads();
 
-#pragma unroll
-    for (int g = 0; g < MAX_GROUP; ++g) {
-      if (g >= n_groups) break;
-      const float m2 = tile_max[g];
-      const float alpha = __expf(m_i[g] - m2);
-      a_bcast[g] = alpha;
-      m_i[g] = m2;
-      float s = (t0 + tid < tlen) ? __expf(KQ[g * NTHREADS + tid] - m2) : 0.0f;
-      KQ[g * NTHREADS + tid] = s;
+    {
+      const float m2 = tile_max;
+      const float alpha = __expf(m_i - m2);
+      if (tid == 0) a_bcast = alpha;
+      m_i = m2;
+      float s = (t0 + tid < tlen) ? __expf(KQ[tid] - m2) : 0.0f;
+      KQ[tid] = s;
       float l_add = warp_sum_f(s);
       if (threadIdx.x == 0)
-        l_warp[g][threadIdx.y] = l_add;
+        l_warp[threadIdx.y] = l_add;
 #pragma unroll
-      for (int i = 0; i < MAX_NE; ++i) {
-        if (i >= ne) break;
-        o_reg[g][i] *= alpha;
-      }
+      for (int i = 0; i < ne; ++i)
+        o_reg[i] *= alpha;
     }
     __syncthreads();
 
-    if (tid < n_groups) {
+    if (tid == 0) {
       float ls = 0.0f;
 #pragma unroll
       for (int w = 0; w < NWARPS; ++w)
-        ls += l_warp[tid][w];
-      l_i[tid] = l_i[tid] * a_bcast[tid] + ls;
-      l_bcast[tid] = l_i[tid];
+        ls += l_warp[w];
+      l_i = l_i * a_bcast + ls;
+      l_bcast = l_i;
     }
     __syncthreads();
-#pragma unroll
-    for (int g = 0; g < MAX_GROUP; ++g) {
-      if (g >= n_groups) break;
-      l_i[g] = l_bcast[g];
-    }
+    l_i = l_bcast;
 
-    // --- V: each warp accumulates its 32 KV slots into o_tile, then reduce ---
-    float o_tile[MAX_GROUP][MAX_NE];
+    float o_tile[ne];
 #pragma unroll
-    for (int g = 0; g < MAX_GROUP; ++g)
-#pragma unroll
-      for (int i = 0; i < MAX_NE; ++i)
-        o_tile[g][i] = 0.0f;
+    for (int i = 0; i < ne; ++i)
+      o_tile[i] = 0.0f;
 
 #pragma unroll
     for (int i_KQ = 0; i_KQ < WARP_SIZE; ++i_KQ) {
@@ -330,138 +298,120 @@ extern "C" __global__ void ks_flash_attn_q40_vec(
       const int row = (start + kv_idx) * (int)n_kv + kv_head;
       const block_q4_0 *v_row =
           (const block_q4_0 *)(V + (size_t)row * (size_t)row_bytes);
-
+      const float w = KQ[slot];
 #pragma unroll
-      for (int c = 0; c < MAX_D / (WARP_SIZE * V_ROWS); ++c) {
-        if (c >= n_chunks) break;
+      for (int c = 0; c < n_chunks; ++c) {
         float vv[V_ROWS];
         dequant_v_q4_0(v_row, c * (WARP_SIZE * V_ROWS) + threadIdx.x * V_ROWS,
                        vv);
 #pragma unroll
-        for (int g = 0; g < MAX_GROUP; ++g) {
-          if (g >= n_groups) break;
-          const float w = KQ[g * NTHREADS + slot];
-#pragma unroll
-          for (int j = 0; j < V_ROWS; ++j)
-            o_tile[g][c * V_ROWS + j] += w * vv[j];
-        }
+        for (int j = 0; j < V_ROWS; ++j)
+          o_tile[c * V_ROWS + j] += w * vv[j];
       }
     }
 
-    // Cross-warp reduce per lane.
 #pragma unroll
-    for (int g = 0; g < MAX_GROUP; ++g) {
-      if (g >= n_groups) break;
+    for (int i = 0; i < ne; ++i)
+      o_red[threadIdx.y][threadIdx.x][i] = o_tile[i];
+    __syncthreads();
 #pragma unroll
-      for (int i = 0; i < MAX_NE; ++i) {
-        if (i >= ne) break;
-        o_red[threadIdx.y][threadIdx.x][i] = o_tile[g][i];
-      }
-      __syncthreads();
+    for (int i = 0; i < ne; ++i) {
+      float sum = 0.0f;
 #pragma unroll
-      for (int i = 0; i < MAX_NE; ++i) {
-        if (i >= ne) break;
-        float sum = 0.0f;
-#pragma unroll
-        for (int w = 0; w < NWARPS; ++w)
-          sum += o_red[w][threadIdx.x][i];
-        o_reg[g][i] += sum;
-      }
-      __syncthreads();
+      for (int w = 0; w < NWARPS; ++w)
+        sum += o_red[w][threadIdx.x][i];
+      o_reg[i] += sum;
     }
+    __syncthreads();
   }
 
-  const int stride = (int)hd + 2;
+  const int stride = D + 2;
   if (n_parts == 1) {
     if (threadIdx.y == 0) {
+      const float inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+      const int o_off = (tok * (int)n_q + q_head) * D;
 #pragma unroll
-      for (int g = 0; g < MAX_GROUP; ++g) {
-        if (g >= n_groups) break;
-        const float inv = (l_i[g] > 0.0f) ? (1.0f / l_i[g]) : 0.0f;
-        const int o_off = (tok * (int)n_q + q_head0 + g) * (int)hd;
-#pragma unroll
-        for (int c = 0; c < MAX_D / (WARP_SIZE * V_ROWS); ++c) {
-          if (c >= n_chunks) break;
-#pragma unroll
-          for (int j = 0; j < V_ROWS; ++j)
-            O[o_off + o_dim(c, j)] =
-                __float2half(o_reg[g][c * V_ROWS + j] * inv);
-        }
-      }
-    }
-  } else if (threadIdx.y == 0) {
-#pragma unroll
-    for (int g = 0; g < MAX_GROUP; ++g) {
-      if (g >= n_groups) break;
-      float *dst = tmp + ((size_t)(tok * (int)n_q + q_head0 + g) * n_parts +
-                          (size_t)part) *
-                             (size_t)stride;
-#pragma unroll
-      for (int c = 0; c < MAX_D / (WARP_SIZE * V_ROWS); ++c) {
-        if (c >= n_chunks) break;
+      for (int c = 0; c < n_chunks; ++c)
 #pragma unroll
         for (int j = 0; j < V_ROWS; ++j)
-          dst[o_dim(c, j)] = o_reg[g][c * V_ROWS + j];
-      }
-      if (threadIdx.x == 0) {
-        dst[hd] = m_i[g];
-        dst[hd + 1] = l_i[g];
-      }
+          O[o_off + c * (WARP_SIZE * V_ROWS) + threadIdx.x * V_ROWS + j] =
+              __float2half(o_reg[c * V_ROWS + j] * inv);
     }
+  } else if (threadIdx.y == 0) {
+    float *dst =
+        tmp + ((size_t)(tok * (int)n_q + q_head) * n_parts + (size_t)part) *
+                  (size_t)stride;
+#pragma unroll
+    for (int c = 0; c < n_chunks; ++c)
+#pragma unroll
+      for (int j = 0; j < V_ROWS; ++j)
+        dst[c * (WARP_SIZE * V_ROWS) + threadIdx.x * V_ROWS + j] =
+            o_reg[c * V_ROWS + j];
+    if (threadIdx.x == 0) {
+      dst[D] = m_i;
+      dst[D + 1] = l_i;
+    }
+  }
+}
+
+extern "C" __global__ void ks_flash_attn_q40_vec_d256(
+    const half *__restrict__ Q, const uint8_t *__restrict__ K,
+    const uint8_t *__restrict__ V, const float *__restrict__ meta,
+    float *__restrict__ tmp, half *__restrict__ O, unsigned n_tok,
+    unsigned n_q, unsigned n_kv, unsigned max_t, unsigned n_parts) {
+  flash_attn_vec_impl<256>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
+                           n_parts);
+}
+
+extern "C" __global__ void ks_flash_attn_q40_vec(
+    const half *__restrict__ Q, const uint8_t *__restrict__ K,
+    const uint8_t *__restrict__ V, const float *__restrict__ meta,
+    float *__restrict__ tmp, half *__restrict__ O, unsigned n_tok,
+    unsigned n_q, unsigned n_kv, unsigned hd, unsigned max_t,
+    unsigned n_parts) {
+  if (hd == 256) {
+    flash_attn_vec_impl<256>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
+                             n_parts);
+  } else if (hd == 128) {
+    flash_attn_vec_impl<128>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
+                             n_parts);
+  } else if (hd == 384) {
+    flash_attn_vec_impl<384>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
+                             n_parts);
+  } else if (hd == 512) {
+    flash_attn_vec_impl<512>(Q, K, V, meta, tmp, O, n_tok, n_q, n_kv, max_t,
+                             n_parts);
   }
 }
 
 extern "C" __global__ void ks_flash_attn_q40_combine(
     const float *__restrict__ tmp, half *__restrict__ O, unsigned n_tok,
     unsigned n_q, unsigned hd, unsigned n_parts) {
-  const int q_head = (int)(blockIdx.x % n_q);
-  const int tok = (int)(blockIdx.x / n_q);
-  if (tok >= (int)n_tok) return;
-  const int tid = threadIdx.x;
-  const int ne = (int)hd / WARP_SIZE;
-  const int n_chunks = (int)hd / (WARP_SIZE * V_ROWS);
+  const int idx = (int)blockIdx.x;
+  const int n = (int)(n_tok * n_q);
+  if (idx >= n) return;
   const int stride = (int)hd + 2;
-
   float m = -1.0e30f;
   float l = 0.0f;
-  float o[MAX_NE];
-#pragma unroll
-  for (int i = 0; i < MAX_NE; ++i)
-    o[i] = 0.0f;
-
   for (int p = 0; p < (int)n_parts; ++p) {
-    const float *src =
-        tmp + ((size_t)(tok * (int)n_q + q_head) * n_parts + (size_t)p) *
-                  (size_t)stride;
+    const float *src = tmp + ((size_t)idx * n_parts + (size_t)p) * (size_t)stride;
     const float mp = src[hd];
     const float lp = src[hd + 1];
     const float m2 = fmaxf(m, mp);
-    const float a = __expf(m - m2);
-    const float b = __expf(mp - m2);
-    l = l * a + lp * b;
+    l = __expf(m - m2) * l + __expf(mp - m2) * lp;
     m = m2;
-#pragma unroll
-    for (int c = 0; c < MAX_D / (WARP_SIZE * V_ROWS); ++c) {
-      if (c >= n_chunks) break;
-#pragma unroll
-      for (int j = 0; j < V_ROWS; ++j) {
-        const int di = c * (WARP_SIZE * V_ROWS) + tid * V_ROWS + j;
-        o[c * V_ROWS + j] = o[c * V_ROWS + j] * a + src[di] * b;
-      }
-    }
   }
   const float inv = (l > 0.0f) ? (1.0f / l) : 0.0f;
-  const int o_off = (tok * (int)n_q + q_head) * (int)hd;
-#pragma unroll
-  for (int c = 0; c < MAX_D / (WARP_SIZE * V_ROWS); ++c) {
-    if (c >= n_chunks) break;
-#pragma unroll
-    for (int j = 0; j < V_ROWS; ++j) {
-      const int di = c * (WARP_SIZE * V_ROWS) + tid * V_ROWS + j;
-      O[o_off + di] = __float2half(o[c * V_ROWS + j] * inv);
+  half *out = O + (size_t)idx * hd;
+  for (int i = threadIdx.x; i < (int)hd; i += WARP_SIZE) {
+    float acc = 0.0f;
+    for (int p = 0; p < (int)n_parts; ++p) {
+      const float *src =
+          tmp + ((size_t)idx * n_parts + (size_t)p) * (size_t)stride;
+      acc += src[i] * __expf(src[hd] - m);
     }
+    out[i] = __float2half(acc * inv);
   }
-  (void)ne;
 }
 "#;
 
@@ -471,6 +421,7 @@ impl super::CudaContext {
             return Ok(k);
         }
         let k = HandFaKernels {
+            flash_q40_vec_d256: self.load_source("ks_flash_attn_q40_vec_d256", HAND_FA_SRC)?,
             flash_q40_vec: self.load_source("ks_flash_attn_q40_vec", HAND_FA_SRC)?,
             flash_q40_combine: self.load_source("ks_flash_attn_q40_combine", HAND_FA_SRC)?,
         };
@@ -478,10 +429,9 @@ impl super::CudaContext {
         Ok(k)
     }
 
-    /// FlashAttention over Q4_0 KV. Prefers WMMA (D=256|512); else warp-vec.
+    /// FlashAttention over Q4_0 KV.
     ///
-    /// `tmp` when `n_parts > 1`: `[n_tok][n_q][n_parts][hd+2]` F32 (partial O, m, l).
-    /// `KSEARCH_FLASH_ATTN_MMA=0` forces the vec path.
+    /// llama.cpp A10 quantized-KV policy: **vec for D≤256**, **MMA-F16 for D=512**.
     pub fn flash_attn_q40(
         &mut self,
         q: &Buffer,
@@ -498,13 +448,7 @@ impl super::CudaContext {
         n_parts: u32,
         kv_len: u32,
     ) -> Result<(), CudaError> {
-        // Prefer WMMA for D=256|512: Q4→F16 once then F16 TC (llama.cpp
-        // fattn-mma-f16). KSEARCH_FLASH_ATTN_MMA=0 forces the vec path.
-        let prefer_mma = (hd == 256 || hd == 512)
-            && std::env::var("KSEARCH_FLASH_ATTN_MMA")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-        if prefer_mma {
+        if prefer_fa_mma(hd) {
             match self.flash_attn_q40_mma(
                 q, k, v, meta, tmp, out, n_tok, n_q, n_kv, hd, max_t, n_parts, kv_len,
             ) {
@@ -519,32 +463,52 @@ impl super::CudaContext {
                 "flash_attn_q40: hd={hd} unsupported (need 128|256|384|512)"
             )));
         }
-        if n_kv == 0 || n_q % n_kv != 0 || (n_q / n_kv) > 16 {
+        if n_kv == 0 || n_q % n_kv != 0 {
             return Err(CudaError::Other(format!(
                 "flash_attn_q40: n_q={n_q} n_kv={n_kv} unsupported"
             )));
         }
         let n_parts = n_parts.max(1);
         let kern = self.hand_fa_kernels()?;
-        let mut args = KernelArgs::new();
-        args.ptr(q.as_ptr())
-            .ptr(k.as_ptr())
-            .ptr(v.as_ptr())
-            .ptr(meta.as_ptr())
-            .ptr(tmp.as_ptr())
-            .ptr(out.as_ptr())
-            .u32(n_tok)
-            .u32(n_q)
-            .u32(n_kv)
-            .u32(hd)
-            .u32(max_t)
-            .u32(n_parts);
-        let grid = n_tok.saturating_mul(n_kv).saturating_mul(n_parts).max(1);
-        self.launch_with(
-            kern.flash_q40_vec,
-            LaunchConfig::new((grid, 1), (32, 4), 0),
-            &mut args,
-        )?;
+        let grid = n_tok.saturating_mul(n_q).saturating_mul(n_parts).max(1);
+        if hd == 256 {
+            let mut args = KernelArgs::new();
+            args.ptr(q.as_ptr())
+                .ptr(k.as_ptr())
+                .ptr(v.as_ptr())
+                .ptr(meta.as_ptr())
+                .ptr(tmp.as_ptr())
+                .ptr(out.as_ptr())
+                .u32(n_tok)
+                .u32(n_q)
+                .u32(n_kv)
+                .u32(max_t)
+                .u32(n_parts);
+            self.launch_with(
+                kern.flash_q40_vec_d256,
+                LaunchConfig::new((grid, 1), (32, 4), 0),
+                &mut args,
+            )?;
+        } else {
+            let mut args = KernelArgs::new();
+            args.ptr(q.as_ptr())
+                .ptr(k.as_ptr())
+                .ptr(v.as_ptr())
+                .ptr(meta.as_ptr())
+                .ptr(tmp.as_ptr())
+                .ptr(out.as_ptr())
+                .u32(n_tok)
+                .u32(n_q)
+                .u32(n_kv)
+                .u32(hd)
+                .u32(max_t)
+                .u32(n_parts);
+            self.launch_with(
+                kern.flash_q40_vec,
+                LaunchConfig::new((grid, 1), (32, 4), 0),
+                &mut args,
+            )?;
+        }
         if n_parts > 1 {
             let mut cargs = KernelArgs::new();
             cargs

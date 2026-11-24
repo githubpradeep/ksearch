@@ -276,15 +276,13 @@ counts, because the A10 measured them pulling in opposite directions at a
 | prefill MWG cutover | `KSEARCH_SDPA_MWG_THRESH` | 512 |
 | prefill force naive/MWG | `KSEARCH_SDPA_PREFILL_NAIVE=1\|0` | auto |
 
-Hand FA (Thesis A suspended like `hand_mm`), opt-in `KSEARCH_FLASH_ATTN=1`:
-- **WMMA** (`hand_fa_mma.rs`, default when FA on, D=256|512): mirrors llama.cpp
-  fattn-mma-f16 — **Q4_0→F16 once**, then F16 `nvcuda::wmma` Q·Kᵀ/P·V. (In-kernel
-  per-tile Q4 dequant was the wrong shape and lost to AST.)
-- **vec** (`hand_fa.rs`): Q8_1+dp4a native Q4; force with `KSEARCH_FLASH_ATTN_MMA=0`.
-  llama.cpp uses vec for quantized KV decode when `hd≤256` (no D=512 vec).
-Default attn remains AST naive `<512` / MWG — already at llama.cpp scoreboard
-(~8.7k/175). FA only wins if it beats that; phase split shows attn ~4.7 ms vs
-ffn ~10 ms @128, so FA is not the first-order lever unless attn itself is slow.
+Hand FA (Thesis A suspended like `hand_mm`), opt-in `KSEARCH_FLASH_ATTN=1`.
+Matches llama.cpp A10 quantized-KV dispatch:
+- **vec** (`hand_fa.rs`, default for D≤256): fattn-vec Q4_0 — one block/Q-head,
+  Q8_1+dp4a, 128-thr tiles, warp-local VKQ regs (MIT from `fattn-vec.cuh`).
+- **WMMA** (`hand_fa_mma.rs`, default for D=512): persistent F16 KV mirror + WMMA
+  (no Q4 vec for 512). `KSEARCH_FLASH_ATTN_MMA=1` forces MMA on 256 too.
+Default attn remains AST naive `<512` / MWG until FA wins the A10 scoreboard.
 
 ## What is verified, and where
 

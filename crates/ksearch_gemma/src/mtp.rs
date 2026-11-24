@@ -611,6 +611,8 @@ impl MtpDraft {
                     meta,
                     tmp,
                     &self.att_out,
+                    None,
+                    None,
                 )?;
                 barrier(ctx);
             }

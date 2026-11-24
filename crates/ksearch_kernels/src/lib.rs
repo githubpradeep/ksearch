@@ -1415,6 +1415,7 @@ impl Eng {
     /// Hybrid SDPA: hand FlashAttention (CUDA Q4_0) when enabled, else
     /// online naive / partitioned MWG by `attn_t`.
     /// `kv_len` = absolute filled KV positions (for FA Q4→F16 convert; ≠ SWA window).
+    /// When `k_f16`/`v_f16` are set, MMA skips the Q4 convert (persistent cache).
     pub fn sdpa_hybrid_kv(
         &mut self,
         ctx: &Context,
@@ -1431,11 +1432,27 @@ impl Eng {
         meta: &Buffer,
         tmp: &Buffer,
         out: &Buffer,
+        k_f16: Option<&Buffer>,
+        v_f16: Option<&Buffer>,
     ) -> Result<()> {
         if ctx.flash_attn_enabled() && kv_dtype == DType::Q40 {
-            // Match MWG occupancy: up to 16 KV slices (fattn parallel_blocks).
-            // ceil(attn_t/32) so short decode still multi-blocks; never under-fill.
-            let n_parts = ((attn_t as usize).div_ceil(32)).clamp(1, Self::sdpa_mwg_nwg());
+            // Decode: partition KV across SMs (MQA⇒n_kv=1 needs parts to fill A10).
+            // Vec tile = 128 (fattn-vec); MMA tile = 64/32 by head dim.
+            let tile = if hd <= 256 { 128 } else { 32 };
+            let n_parts = ((attn_t as usize).div_ceil(tile)).clamp(1, Self::sdpa_mwg_nwg());
+            // llama: F16 MMA only for D=512 (or FLASH_ATTN_MMA=1). Else Q4 vec.
+            let use_mma = match std::env::var("KSEARCH_FLASH_ATTN_MMA").ok().as_deref() {
+                Some("0") => false,
+                Some("1") => hd == 256 || hd == 512,
+                _ => hd == 512,
+            };
+            if use_mma {
+                if let (Some(kf), Some(vf)) = (k_f16, v_f16) {
+                    return ctx.flash_attn_f16(
+                        q, kf, vf, meta, tmp, out, 1, n_q, n_kv, hd, max_t, n_parts,
+                    );
+                }
+            }
             return ctx.flash_attn_q40(
                 q,
                 k,
@@ -1961,14 +1978,35 @@ impl Eng {
         meta: &Buffer,
         tmp: &Buffer,
         out: &Buffer,
+        k_f16: Option<&Buffer>,
+        v_f16: Option<&Buffer>,
     ) -> Result<()> {
         if n_tok == 1 {
             return self.sdpa_hybrid_kv(
                 ctx, n_q, n_kv, hd, max_t, attn_t, kv_len, kv_dtype, q, k, v, meta, tmp, out,
+                k_f16, v_f16,
             );
         }
         if ctx.flash_attn_enabled() && kv_dtype == DType::Q40 {
-            let n_parts = ((attn_t as usize).div_ceil(32)).clamp(1, Self::sdpa_mwg_nwg());
+            // Prefill parts: short ctx → 1 (avoid combine tax vs AST naive).
+            // Long ctx → split KV so each block isn't stuck on O(T) serial tiles.
+            let n_parts = if (attn_t as usize) <= 256 {
+                1usize
+            } else {
+                ((attn_t as usize).div_ceil(256)).clamp(1, Self::sdpa_mwg_nwg())
+            };
+            let use_mma = match std::env::var("KSEARCH_FLASH_ATTN_MMA").ok().as_deref() {
+                Some("0") => false,
+                Some("1") => hd == 256 || hd == 512,
+                _ => hd == 512,
+            };
+            if use_mma {
+                if let (Some(kf), Some(vf)) = (k_f16, v_f16) {
+                    return ctx.flash_attn_f16(
+                        q, kf, vf, meta, tmp, out, n_tok, n_q, n_kv, hd, max_t, n_parts,
+                    );
+                }
+            }
             return ctx.flash_attn_q40(
                 q,
                 k,
